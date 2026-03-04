@@ -15,7 +15,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Application version
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 APP_NAME = "WhisperR"
 
 # --- 1. GLOBAL CRASH LOGGING ---
@@ -36,14 +36,35 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     LIB_DIR = BASE_DIR
 
-# Critical: Prevent torch from loading shared memory DLL in frozen mode
-# This fixes the "Invalid access to memory location" error
+# Critical: Prevent torch from loading problematic DLLs in frozen mode
+# This fixes the "Invalid access to memory location" error with shm.dll
 os.environ["PYTORCH_JIT"] = "0"
 os.environ["PYTORCH_JIT_USE_NNC_NOT_NVFUSER"] = "1"
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 os.environ["QT_PA_PLATFORM"] = "windows:dpiawareness=0"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["PYTORCH_NVFUSER_DISABLE"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+
+# Additional fix: Disable torch multiprocessing which uses shared memory
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
+# Prevent torch from trying to load shared memory module
+if getattr(sys, 'frozen', False):
+    # In frozen mode, prevent torch.multiprocessing from loading
+    import warnings
+    warnings.filterwarnings('ignore')
+    
+    # Monkey-patch sys.modules to prevent shm.dll loading
+    class DummySHM:
+        """Dummy module to replace torch shared memory"""
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+    
+    # Pre-load to prevent torch from importing it
+    sys.modules['torch.multiprocessing'] = DummySHM()
+    sys.modules['torch.multiprocessing.reductions'] = DummySHM()
 
 if os.name == 'nt':
     # Ensure dependencies like zlibwapi.dll and torch/ctranslate libs are found
@@ -83,7 +104,7 @@ from PyQt6.QtGui import QPainter, QColor, QFont, QIcon, QAction, QKeyEvent
 # --- 3. CONSTANTS ---
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 LANG_MAP = {"Auto": None, "English": "en", "Greek": "el", "German": "de", "French": "fr", "Spanish": "es"}
-HALLUCINATIONS = ["thank you.", "thanks for watching.", "god bless.", "god bless you.", "subtitles by", "Thank you for watching, and I'll see you in the next video"]
+HALLUCINATIONS = ["thank you.", "thanks for watching.", "god bless.", "god bless you.", "subtitles by", "Thank you for watching, and I'll see you in the next video", "Thank you for watching and see you in the next video."]
 
 DARK_STYLE = """
 QMainWindow, QDialog, QScrollArea, QTabWidget { background-color: #121212; }
@@ -144,6 +165,7 @@ class AppConfig:
             "clear_exit": False, "save_to_disk": False, "auto_space": True,
             "min_to_tray": False, "input_device_name": "", "paste_delay": 0.5, 
             "hotkey": "ctrl+alt+r", "ptt_key": "f8", 
+            "ptt_prolonged_hold": False, "ptt_hold_time": 0.5,
             "visibility_hotkey": "ctrl+shift+w", "live_mode": "Simple", 
             "dict_mode": "Continuous", "auto_pause_sec": 1.5, "noise_floor": 200, 
             "speech_vol": 1500, "commands": {"Launch Notepad": "notepad.exe"},
@@ -187,40 +209,96 @@ class CalibrationWorker(QThread):
     
     def run(self):
         p = pyaudio.PyAudio()
+        stream = None
+        
         try:
-            dev_info = p.get_device_info_by_index(self.dev_idx)
-            rate = int(dev_info['defaultSampleRate'])
-            app_logger.info(f"Calibration starting: device={dev_info['name']}, rate={rate}")
+            # Get device info safely
+            try:
+                dev_info = p.get_device_info_by_index(self.dev_idx)
+                rate = int(dev_info['defaultSampleRate'])
+                device_name = dev_info.get('name', f'Device {self.dev_idx}')
+                app_logger.info(f"Calibration starting: device={device_name}, rate={rate}")
+            except Exception as e:
+                app_logger.error(f"Failed to get device info for index {self.dev_idx}: {e}")
+                self.status_msg.emit(f"Error: Invalid device")
+                return
             
-            stream = p.open(format=pyaudio.paInt16, channels=1, rate=rate, input=True, 
-                          input_device_index=self.dev_idx, frames_per_buffer=1024)
+            # Verify device has input channels
+            if dev_info.get('maxInputChannels', 0) <= 0:
+                app_logger.error(f"Device {self.dev_idx} has no input channels")
+                self.status_msg.emit("Error: Device has no input")
+                return
+            
+            # Open stream
+            try:
+                stream = p.open(
+                    format=pyaudio.paInt16, 
+                    channels=1, 
+                    rate=rate, 
+                    input=True, 
+                    input_device_index=self.dev_idx,
+                    frames_per_buffer=1024
+                )
+            except Exception as e:
+                app_logger.error(f"Failed to open calibration stream: {e}")
+                self.status_msg.emit(f"Error opening device")
+                return
             
             n, s = [], []
+            
+            # Noise calibration phase
             self.status_msg.emit("Stay SILENT (Noise detection)...")
-            for i in range(100):
-                d = stream.read(1024, exception_on_overflow=False)
-                n.append(np.sqrt(np.mean(np.frombuffer(d, dtype=np.int16).astype(np.float64)**2)))
-                self.progress.emit(i+1)
-                time.sleep(0.04)
+            try:
+                for i in range(100):
+                    d = stream.read(1024, exception_on_overflow=False)
+                    n.append(np.sqrt(np.mean(np.frombuffer(d, dtype=np.int16).astype(np.float64)**2)))
+                    self.progress.emit(i+1)
+                    time.sleep(0.04)
+            except Exception as e:
+                app_logger.error(f"Error during noise calibration: {e}")
+                self.status_msg.emit("Error during calibration")
+                if stream:
+                    stream.stop_stream()
+                    stream.close()
+                return
             
             noise_level = int(np.percentile(n, 90))
             app_logger.info(f"Noise level calibrated: {noise_level}")
             
+            # Speech calibration phase
             self.status_msg.emit("SPEAK normally (Voice level)...")
-            for i in range(100):
-                d = stream.read(1024, exception_on_overflow=False)
-                s.append(np.sqrt(np.mean(np.frombuffer(d, dtype=np.int16).astype(np.float64)**2)))
-                self.progress.emit(i+101)
-                time.sleep(0.04)
+            try:
+                for i in range(100):
+                    d = stream.read(1024, exception_on_overflow=False)
+                    s.append(np.sqrt(np.mean(np.frombuffer(d, dtype=np.int16).astype(np.float64)**2)))
+                    self.progress.emit(i+101)
+                    time.sleep(0.04)
+            except Exception as e:
+                app_logger.error(f"Error during speech calibration: {e}")
+                self.status_msg.emit("Error during calibration")
+                if stream:
+                    stream.stop_stream()
+                    stream.close()
+                return
             
             speech_level = int(np.percentile(s, 90))
             app_logger.info(f"Speech level calibrated: {speech_level}")
             
             self.finished.emit(noise_level, speech_level)
-            stream.stop_stream()
-            stream.close()
+            
+            if stream:
+                stream.stop_stream()
+                stream.close()
+                
         except Exception as e:
             app_logger.error(f"Calibration error: {e}")
+            self.status_msg.emit(f"Calibration failed")
+            if stream:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except:
+                    pass
         finally:
             p.terminate()
 
@@ -300,7 +378,7 @@ class TranscriberWorker(QThread):
                 segs, _ = self.model.transcribe(
                     audio_data, 
                     language=lang_code, 
-                    vad_filter=True, 
+                    vad_filter=False, 
                     initial_prompt=self.config.settings["initial_prompt"],
                     task=task_type
                 )
@@ -334,30 +412,105 @@ class AudioRecorder(QThread):
         self.config = config
         self.active = False
         self.ptt_pressed = False
+        self.ptt_press_time = 0  # Track when PTT was pressed
+        self.ptt_sent_to_system = False  # Track if we sent the key to system
         app_logger.info("Audio recorder initialized")
     
     def run(self):
         p = pyaudio.PyAudio()
-        idx = 0
+        idx = None
         rate = 16000
         
-        # Find the selected device
-        for i in range(p.get_device_count()):
-            dev = p.get_device_info_by_index(i)
-            if dev["name"] == self.config.settings["input_device_name"]:
-                idx = i
-                rate = int(dev['defaultSampleRate'])
-                app_logger.info(f"Using audio device: {dev['name']} at {rate}Hz")
-                break
+        # Find the selected device with improved matching
+        saved_device_name = self.config.settings.get("input_device_name", "")
+        app_logger.info(f"Looking for audio device: '{saved_device_name}'")
         
         try:
-            stream = p.open(format=pyaudio.paInt16, channels=1, rate=rate, input=True, 
-                          input_device_index=idx, frames_per_buffer=2048)
-            app_logger.info("Audio stream opened successfully")
+            for i in range(p.get_device_count()):
+                try:
+                    dev = p.get_device_info_by_index(i)
+                    
+                    # Skip output-only devices
+                    if dev["maxInputChannels"] <= 0:
+                        continue
+                    
+                    # Build full device name
+                    try:
+                        host_api = p.get_host_api_info_by_index(dev["hostApi"])["name"]
+                        full_name = f"{dev['name']} ({host_api})"
+                    except:
+                        full_name = dev['name']
+                    
+                    # Match against saved device (exact or partial)
+                    if saved_device_name:
+                        if saved_device_name == full_name or dev['name'] in saved_device_name:
+                            idx = i
+                            rate = int(dev['defaultSampleRate'])
+                            app_logger.info(f"Matched device {i}: {full_name} at {rate}Hz")
+                            break
+                            
+                except Exception as e:
+                    app_logger.debug(f"Error checking device {i}: {e}")
+                    continue
+            
+            # If no match found, use default input device
+            if idx is None:
+                try:
+                    default_input = p.get_default_input_device_info()
+                    idx = default_input['index']
+                    rate = int(default_input['defaultSampleRate'])
+                    app_logger.warning(f"No saved device found, using default: {default_input['name']} at {rate}Hz")
+                except Exception as e:
+                    app_logger.error(f"Failed to get default device: {e}")
+                    # Last resort: try device 0
+                    idx = 0
+                    rate = 16000
+        
         except Exception as e:
-            app_logger.warning(f"Failed to open selected device: {e}. Using default.")
-            stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True)
+            app_logger.error(f"Device enumeration error: {e}")
+            idx = 0
             rate = 16000
+        
+        # Open audio stream with comprehensive error handling
+        stream = None
+        try:
+            app_logger.info(f"Opening audio stream: device={idx}, rate={rate}Hz")
+            stream = p.open(
+                format=pyaudio.paInt16, 
+                channels=1, 
+                rate=rate, 
+                input=True, 
+                input_device_index=idx, 
+                frames_per_buffer=2048
+            )
+            app_logger.info("Audio stream opened successfully")
+            
+        except Exception as e:
+            app_logger.error(f"Failed to open selected device {idx}: {e}")
+            
+            # Try default device as fallback
+            try:
+                app_logger.info("Attempting to open default audio device...")
+                stream = p.open(
+                    format=pyaudio.paInt16, 
+                    channels=1, 
+                    rate=16000, 
+                    input=True,
+                    frames_per_buffer=2048
+                )
+                rate = 16000
+                app_logger.info("Opened default audio device at 16000Hz")
+                
+            except Exception as e2:
+                app_logger.error(f"Failed to open default device: {e2}")
+                self.speech_active.emit(False)
+                p.terminate()
+                return
+        
+        if stream is None:
+            app_logger.error("No audio stream available, recorder cannot start")
+            p.terminate()
+            return
         
         frames = []
         last_speech = time.time()
@@ -367,6 +520,16 @@ class AudioRecorder(QThread):
         self.active = True
         
         while self.active:
+            # Check for prolonged hold PTT activation
+            if self.config.settings["ptt_prolonged_hold"] and self.ptt_press_time > 0:
+                hold_duration = time.time() - self.ptt_press_time
+                required_time = self.config.settings["ptt_hold_time"]
+                
+                # Activate PTT if held long enough
+                if hold_duration >= required_time and not self.ptt_pressed:
+                    self.ptt_pressed = True
+                    app_logger.debug(f"PTT activated after {hold_duration:.2f}s hold")
+            
             if self.config.settings["live_mode"] == "Push-To-Talk" and not self.ptt_pressed:
                 time.sleep(0.05)
                 continue
@@ -615,7 +778,7 @@ class WhisperRApp(QMainWindow):
 
     def setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v{__version__}")
-        self.resize(600, 500)
+        self.resize(820, 650)
         
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -734,6 +897,8 @@ class WhisperRApp(QMainWindow):
         
         self.cfg_mic = QComboBox()
         self.pop_mics()
+        # Connect signal to reset meter when device changes
+        self.cfg_mic.currentIndexChanged.connect(self.on_mic_changed)
         audio_layout.addRow("Microphone:", self.cfg_mic)
         
         self.cfg_dict_m = QComboBox()
@@ -797,6 +962,27 @@ class WhisperRApp(QMainWindow):
         self.btn_hk2 = QPushButton(self.config.settings["ptt_key"])
         self.btn_hk2.clicked.connect(lambda: self.cap_hk(self.btn_hk2, "ptt_key"))
         hotkey_layout.addRow("Push-to-Talk:", self.btn_hk2)
+        
+        # PTT Prolonged Hold feature
+        self.cfg_ptt_prolonged = QCheckBox("Enable Prolonged Hold (hold key to activate)")
+        self.cfg_ptt_prolonged.setChecked(self.config.settings["ptt_prolonged_hold"])
+        hotkey_layout.addRow(self.cfg_ptt_prolonged)
+        
+        self.cfg_ptt_hold_time = QDoubleSpinBox()
+        self.cfg_ptt_hold_time.setRange(0.1, 5.0)
+        self.cfg_ptt_hold_time.setValue(self.config.settings["ptt_hold_time"])
+        self.cfg_ptt_hold_time.setSuffix(" sec")
+        self.cfg_ptt_hold_time.setEnabled(self.config.settings["ptt_prolonged_hold"])
+        hotkey_layout.addRow("Hold Duration:", self.cfg_ptt_hold_time)
+        
+        # Connect the checkbox to enable/disable the hold time spinbox
+        self.cfg_ptt_prolonged.toggled.connect(self.cfg_ptt_hold_time.setEnabled)
+        
+        # Add explanatory label
+        ptt_info = QLabel("When enabled: Quick press sends key to system, hold activates PTT")
+        ptt_info.setStyleSheet("color: #888; font-size: 8pt; font-style: italic;")
+        ptt_info.setWordWrap(True)
+        hotkey_layout.addRow(ptt_info)
         
         self.btn_hk_vis = QPushButton(self.config.settings["visibility_hotkey"])
         self.btn_hk_vis.clicked.connect(lambda: self.cap_hk(self.btn_hk_vis, "visibility_hotkey"))
@@ -942,49 +1128,141 @@ class WhisperRApp(QMainWindow):
             QMessageBox.warning(self, "No Selection", "Please select a row to delete.")
 
     def pop_mics(self):
+        """Populate microphone dropdown with better device matching"""
         p = pyaudio.PyAudio()
         self.cfg_mic.clear()
         sel = 0
+        saved_device = self.config.settings.get("input_device_name", "")
         
         app_logger.debug("Scanning audio input devices:")
-        for i in range(p.get_device_count()):
-            info = p.get_device_info_by_index(i)
-            if info["maxInputChannels"] > 0:
-                h = p.get_host_api_info_by_index(info["hostApi"])["name"]
-                name = f"{info['name']} ({h})"
-                self.cfg_mic.addItem(name, i)
-                app_logger.debug(f"  Device {i}: {name}")
-                
-                if info["name"] in self.config.settings["input_device_name"]:
-                    sel = self.cfg_mic.count()-1
         
-        self.cfg_mic.setCurrentIndex(sel)
+        try:
+            device_count = p.get_device_count()
+        except Exception as e:
+            app_logger.error(f"Failed to get device count: {e}")
+            p.terminate()
+            return
+        
+        devices_added = []
+        
+        for i in range(device_count):
+            try:
+                info = p.get_device_info_by_index(i)
+                
+                # Only add input devices
+                if info["maxInputChannels"] <= 0:
+                    continue
+                
+                # Get host API name safely
+                try:
+                    h = p.get_host_api_info_by_index(info["hostApi"])["name"]
+                except:
+                    h = "Unknown"
+                
+                # Create device display name
+                device_name = info['name']
+                full_name = f"{device_name} ({h})"
+                
+                # Skip duplicate entries (prefer WASAPI/MME over DirectSound)
+                if any(device_name in d for d in devices_added):
+                    # If we already have this device with WASAPI, skip DirectSound
+                    if "DirectSound" in h:
+                        app_logger.debug(f"  Skipping duplicate DirectSound: {full_name}")
+                        continue
+                
+                self.cfg_mic.addItem(full_name, i)
+                devices_added.append(device_name)
+                app_logger.debug(f"  Device {i}: {full_name}")
+                
+                # Check if this matches the saved device (match by base name, not full string)
+                if saved_device:
+                    # Try exact match first
+                    if saved_device == full_name:
+                        sel = self.cfg_mic.count() - 1
+                        app_logger.debug(f"  ✓ Exact match for saved device")
+                    # Then try partial match on device name
+                    elif device_name in saved_device or saved_device in device_name:
+                        sel = self.cfg_mic.count() - 1
+                        app_logger.debug(f"  ✓ Partial match for saved device")
+                
+            except Exception as e:
+                app_logger.warning(f"Error reading device {i}: {e}")
+                continue
+        
+        if self.cfg_mic.count() == 0:
+            app_logger.error("No input devices found!")
+            self.cfg_mic.addItem("No microphone detected", -1)
+        else:
+            self.cfg_mic.setCurrentIndex(sel)
+            app_logger.info(f"Selected device index: {sel}, name: {self.cfg_mic.currentText()}")
+        
         p.terminate()
 
     def update_meter(self):
+        """Update live microphone meter with robust error handling"""
         if self.recorder and self.recorder.active:
             return
         
         try:
             if not self.meter_stream:
                 idx = self.cfg_mic.currentData()
-                sr = int(self.pa_sys.get_device_info_by_index(idx)['defaultSampleRate'])
-                self.meter_stream = self.pa_sys.open(
-                    format=pyaudio.paInt16, 
-                    channels=1, 
-                    rate=sr, 
-                    input=True, 
-                    input_device_index=idx, 
-                    frames_per_buffer=1024
-                )
+                
+                # Check for invalid device
+                if idx is None or idx < 0:
+                    app_logger.debug("No valid device selected for meter")
+                    return
+                
+                try:
+                    device_info = self.pa_sys.get_device_info_by_index(idx)
+                    sr = int(device_info['defaultSampleRate'])
+                    
+                    # Verify device supports input
+                    if device_info['maxInputChannels'] <= 0:
+                        app_logger.warning(f"Device {idx} has no input channels")
+                        return
+                    
+                    self.meter_stream = self.pa_sys.open(
+                        format=pyaudio.paInt16, 
+                        channels=1, 
+                        rate=sr, 
+                        input=True, 
+                        input_device_index=idx, 
+                        frames_per_buffer=1024
+                    )
+                    app_logger.debug(f"Meter stream opened: device {idx}, rate {sr}Hz")
+                    
+                except Exception as e:
+                    app_logger.warning(f"Failed to open meter stream: {e}")
+                    if self.meter_stream:
+                        try:
+                            self.meter_stream.close()
+                        except:
+                            pass
+                        self.meter_stream = None
+                    return
             
+            # Read from stream
             d = self.meter_stream.read(1024, exception_on_overflow=False)
             rms = int(np.sqrt(np.mean(np.frombuffer(d, dtype=np.int16).astype(np.float64)**2)))
             self.live_meter.setValue(rms)
-        except Exception as e:
-            app_logger.debug(f"Meter update error: {e}")
+            
+        except OSError as e:
+            # Device disconnected or stream error
+            app_logger.debug(f"Meter stream error (device may have changed): {e}")
             if self.meter_stream:
-                self.meter_stream.close()
+                try:
+                    self.meter_stream.close()
+                except:
+                    pass
+                self.meter_stream = None
+                
+        except Exception as e:
+            app_logger.debug(f"Unexpected meter error: {e}")
+            if self.meter_stream:
+                try:
+                    self.meter_stream.close()
+                except:
+                    pass
                 self.meter_stream = None
 
     def save_cfg(self):
@@ -1014,6 +1292,8 @@ class WhisperRApp(QMainWindow):
             "paste_delay": self.cfg_p_win.value(),
             "hotkey": self.btn_hk1.text(),
             "ptt_key": self.btn_hk2.text(),
+            "ptt_prolonged_hold": self.cfg_ptt_prolonged.isChecked(),
+            "ptt_hold_time": self.cfg_ptt_hold_time.value(),
             "visibility_hotkey": self.btn_hk_vis.text(),
             "noise_floor": self.n_spin.value(),
             "speech_vol": self.s_spin.value(),
@@ -1061,6 +1341,20 @@ class WhisperRApp(QMainWindow):
         self.btn_cal.setEnabled(True)
         self.lbl_cal.setText("✓ Calibration complete")
         app_logger.info(f"Calibration complete: noise={noise}, speech={speech}")
+    
+    def on_mic_changed(self):
+        """Handle microphone device change - reset meter stream"""
+        app_logger.info(f"Microphone changed to: {self.cfg_mic.currentText()}")
+        
+        # Close existing meter stream
+        if self.meter_stream:
+            try:
+                self.meter_stream.close()
+                app_logger.debug("Closed old meter stream")
+            except Exception as e:
+                app_logger.debug(f"Error closing meter stream: {e}")
+            finally:
+                self.meter_stream = None
 
     def toggle_rec(self):
         if self.recorder and self.recorder.active:
@@ -1089,17 +1383,57 @@ class WhisperRApp(QMainWindow):
     def on_p(self, key):
         try:
             key_str = self.key_to_string(key)
+            
+            # Check if this is the PTT key
             if key_str == self.config.settings["ptt_key"] and self.recorder:
-                self.recorder.ptt_pressed = True
-                app_logger.debug("PTT pressed")
+                # Check if prolonged hold is enabled
+                if self.config.settings["ptt_prolonged_hold"]:
+                    # Record the press time
+                    self.recorder.ptt_press_time = time.time()
+                    self.recorder.ptt_sent_to_system = False
+                    app_logger.debug("PTT key pressed (prolonged hold mode)")
+                else:
+                    # Immediate activation
+                    self.recorder.ptt_pressed = True
+                    app_logger.debug("PTT pressed (immediate mode)")
         except Exception as e:
             app_logger.debug(f"PTT press error: {e}")
     
     def on_r(self, key):
         try:
-            if self.recorder:
-                self.recorder.ptt_pressed = False
-                app_logger.debug("PTT released")
+            if not self.recorder:
+                return
+                
+            key_str = self.key_to_string(key)
+            
+            # Check if this is the PTT key being released
+            if key_str == self.config.settings["ptt_key"]:
+                if self.config.settings["ptt_prolonged_hold"]:
+                    # Calculate how long the key was held
+                    hold_duration = time.time() - self.recorder.ptt_press_time
+                    required_time = self.config.settings["ptt_hold_time"]
+                    
+                    if hold_duration >= required_time:
+                        # Key was held long enough - deactivate PTT
+                        self.recorder.ptt_pressed = False
+                        app_logger.debug(f"PTT released after {hold_duration:.2f}s (activated)")
+                    else:
+                        # Key was NOT held long enough - send to system
+                        if not self.recorder.ptt_sent_to_system:
+                            # Simulate the key press to Windows
+                            try:
+                                # Import here to avoid issues if not available
+                                import pyautogui
+                                # Convert our key format to pyautogui format
+                                pyautogui.press(self.config.settings["ptt_key"])
+                                app_logger.debug(f"PTT key sent to system (held only {hold_duration:.2f}s)")
+                            except Exception as e:
+                                app_logger.error(f"Failed to send key to system: {e}")
+                        self.recorder.ptt_sent_to_system = True
+                else:
+                    # Immediate mode - just deactivate
+                    self.recorder.ptt_pressed = False
+                    app_logger.debug("PTT released (immediate mode)")
         except Exception as e:
             app_logger.debug(f"PTT release error: {e}")
     
