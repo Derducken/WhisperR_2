@@ -15,7 +15,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Application version
-__version__ = "2.0.1"
+__version__ = "2.0.3"
 APP_NAME = "WhisperR"
 
 # --- 1. GLOBAL CRASH LOGGING ---
@@ -104,7 +104,7 @@ from PyQt6.QtGui import QPainter, QColor, QFont, QIcon, QAction, QKeyEvent
 # --- 3. CONSTANTS ---
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 LANG_MAP = {"Auto": None, "English": "en", "Greek": "el", "German": "de", "French": "fr", "Spanish": "es"}
-HALLUCINATIONS = ["thank you.", "thanks for watching.", "god bless.", "god bless you.", "subtitles by", "Thank you for watching, and I'll see you in the next video", "Thank you for watching and see you in the next video."]
+HALLUCINATIONS = ["thank you.", "thanks for watching.", "god bless.", "god bless you.", "subtitles by", "Thank you for watching, and I'll see you in the next video"]
 
 DARK_STYLE = """
 QMainWindow, QDialog, QScrollArea, QTabWidget { background-color: #121212; }
@@ -165,13 +165,13 @@ class AppConfig:
             "clear_exit": False, "save_to_disk": False, "auto_space": True,
             "min_to_tray": False, "input_device_name": "", "paste_delay": 0.5, 
             "hotkey": "ctrl+alt+r", "ptt_key": "f8", 
-            "ptt_prolonged_hold": False, "ptt_hold_time": 0.5,
             "visibility_hotkey": "ctrl+shift+w", "live_mode": "Simple", 
             "dict_mode": "Continuous", "auto_pause_sec": 1.5, "noise_floor": 200, 
             "speech_vol": 1500, "commands": {"Launch Notepad": "notepad.exe"},
             "ind_show": True, "ind_type": "Both", "ind_pos": "Top-Right", 
             "ind_size": 32, "ind_off": 20, "bar_edge": "Top", "bar_size": 5,
-            "log_level": "INFO"
+            "bar_thickness": 5, "ind_opacity": 255, "bar_opacity": 255,
+            "log_level": "INFO", "use_vad": False
         }
         self.load()
         app_logger.set_level(self.settings["log_level"])
@@ -190,11 +190,43 @@ class AppConfig:
 
     def save(self):
         try:
+            # Create backup of existing config
+            backup_path = self.path + ".backup"
+            if os.path.exists(self.path):
+                try:
+                    shutil.copy2(self.path, backup_path)
+                except:
+                    pass  # Backup failed, but continue anyway
+            
+            # Write new config
             with open(self.path, 'w', encoding='utf-8') as f: 
                 json.dump(self.settings, f, indent=4)
+            
             app_logger.info("Configuration saved successfully")
+            
+            # Remove backup after successful save
+            if os.path.exists(backup_path):
+                try:
+                    os.remove(backup_path)
+                except:
+                    pass
+                    
+        except PermissionError as e:
+            app_logger.error(f"Permission denied saving config: {e}")
+            raise Exception(f"Cannot save settings - permission denied. Try running as administrator.")
         except Exception as e:
-            app_logger.error(f"Failed to save config: {e}")
+            app_logger.error(f"Failed to save config: {e}", exc_info=True)
+            
+            # Try to restore backup
+            backup_path = self.path + ".backup"
+            if os.path.exists(backup_path):
+                try:
+                    shutil.copy2(backup_path, self.path)
+                    app_logger.info("Restored config from backup")
+                except:
+                    pass
+            
+            raise Exception(f"Failed to save settings: {e}")
 
 # --- 6. WORKERS ---
 class CalibrationWorker(QThread):
@@ -313,7 +345,16 @@ class TranscriberWorker(QThread):
         self.queue = queue.Queue()
         self.running = True
         self.model = None
+        self.current_model_name = None
+        self.current_language = None
         app_logger.info("Transcriber worker initialized")
+    
+    def reload_model(self):
+        """Force model reload (e.g., when language changes)"""
+        app_logger.info("Model reload requested")
+        self.model = None
+        self.current_model_name = None
+        self.current_language = None
     
     def run(self):
         try:
@@ -332,10 +373,16 @@ class TranscriberWorker(QThread):
                 audio_data, src = task
                 app_logger.debug(f"Processing audio from source: {src}")
                 
-                if not self.model:
-                    model_name = self.config.settings['model']
-                    self.log_msg.emit(f"Loading {model_name} (trying GPU)...")
-                    app_logger.info(f"Loading Whisper model: {model_name}")
+                model_name = self.config.settings['model']
+                lang_code = self.config.settings["lang_code"]
+                
+                # Check if model needs to be reloaded (model or language changed)
+                if not self.model or self.current_model_name != model_name or self.current_language != lang_code:
+                    if self.model:
+                        app_logger.info(f"Model/language changed, reloading...")
+                    
+                    self.log_msg.emit(f"Loading {model_name} for {self.config.settings['lang_name']}...")
+                    app_logger.info(f"Loading Whisper model: {model_name}, language: {lang_code}")
                     
                     try:
                         # Try CUDA first
@@ -343,10 +390,11 @@ class TranscriberWorker(QThread):
                             model_name, 
                             device="cuda", 
                             compute_type="float16",
-                            # Critical: Disable features that cause DLL issues in frozen apps
                             download_root=None,
                             local_files_only=False
                         )
+                        self.current_model_name = model_name
+                        self.current_language = lang_code
                         app_logger.info("Model loaded successfully on GPU")
                         self.log_msg.emit("✓ GPU acceleration active")
                     except Exception as e:
@@ -360,6 +408,8 @@ class TranscriberWorker(QThread):
                                 download_root=None,
                                 local_files_only=False
                             )
+                            self.current_model_name = model_name
+                            self.current_language = lang_code
                             app_logger.info("Model loaded successfully on CPU")
                             self.log_msg.emit("✓ CPU mode active (slower but stable)")
                         except Exception as e2:
@@ -370,18 +420,25 @@ class TranscriberWorker(QThread):
                 
                 self.status_changed.emit(True)
                 
-                lang_code = self.config.settings["lang_code"]
                 task_type = "translate" if self.config.settings["translate"] else "transcribe"
+                use_vad = self.config.settings.get("use_vad", False)
                 
-                app_logger.debug(f"Transcribing: lang={lang_code}, task={task_type}")
+                app_logger.debug(f"Transcribing: lang={lang_code}, task={task_type}, VAD={use_vad}")
                 
-                segs, _ = self.model.transcribe(
-                    audio_data, 
-                    language=lang_code, 
-                    vad_filter=False, 
-                    initial_prompt=self.config.settings["initial_prompt"],
-                    task=task_type
-                )
+                try:
+                    segs, _ = self.model.transcribe(
+                        audio_data, 
+                        language=lang_code, 
+                        vad_filter=use_vad,  # Use config setting
+                        initial_prompt=self.config.settings["initial_prompt"],
+                        task=task_type
+                    )
+                except Exception as e:
+                    app_logger.error(f"Transcription error: {e}")
+                    self.log_msg.emit(f"Transcription error: {e}")
+                    self.status_changed.emit(False)
+                    self.queue.task_done()
+                    continue
                 
                 text = " ".join([s.text.strip() for s in segs if s.no_speech_prob < 0.8]).strip()
                 
@@ -412,8 +469,6 @@ class AudioRecorder(QThread):
         self.config = config
         self.active = False
         self.ptt_pressed = False
-        self.ptt_press_time = 0  # Track when PTT was pressed
-        self.ptt_sent_to_system = False  # Track if we sent the key to system
         app_logger.info("Audio recorder initialized")
     
     def run(self):
@@ -520,16 +575,6 @@ class AudioRecorder(QThread):
         self.active = True
         
         while self.active:
-            # Check for prolonged hold PTT activation
-            if self.config.settings["ptt_prolonged_hold"] and self.ptt_press_time > 0:
-                hold_duration = time.time() - self.ptt_press_time
-                required_time = self.config.settings["ptt_hold_time"]
-                
-                # Activate PTT if held long enough
-                if hold_duration >= required_time and not self.ptt_pressed:
-                    self.ptt_pressed = True
-                    app_logger.debug(f"PTT activated after {hold_duration:.2f}s hold")
-            
             if self.config.settings["live_mode"] == "Push-To-Talk" and not self.ptt_pressed:
                 time.sleep(0.05)
                 continue
@@ -725,42 +770,69 @@ class WhisperRApp(QMainWindow):
         app_logger.info(f"Base directory: {BASE_DIR}")
         app_logger.info(f"Frozen: {getattr(sys, 'frozen', False)}")
         
-        self.config = AppConfig()
-        self.recorder = None
-        
-        self.transcriber = TranscriberWorker(self.config)
-        self.transcriber.finished_text.connect(self.on_text)
-        self.transcriber.status_changed.connect(self.on_trans_status)
-        self.transcriber.log_msg.connect(lambda m: self.scratchpad.append(f"[System] {m}"))
-        self.transcriber.start()
-        
-        self.indicator = StatusOverlay(self.config)
-        
-        self.sig_toggle_vis.connect(self.toggle_visibility_safe)
-        self.sig_toggle_rec.connect(self.toggle_rec)
-        
-        self.tray = QSystemTrayIcon(self)
-        self.tray.setIcon(QIcon.fromTheme("audio-input-microphone"))
-        tm = QMenu()
-        tm.addAction("Show/Restore", self.toggle_visibility_safe)
-        tm.addAction("Quit", QApplication.instance().quit)
-        self.tray.setContextMenu(tm)
-        self.tray.show()
-        
-        self.setup_ui()
-        self.setup_logic()
-        
-        self.m_timer = QTimer()
-        self.m_timer.timeout.connect(self.monitor_dirs)
-        self.m_timer.start(5000)
-        
-        self.pa_sys = pyaudio.PyAudio()
-        self.meter_stream = None
-        self.meter_timer = QTimer()
-        self.meter_timer.timeout.connect(self.update_meter)
-        self.meter_timer.start(100)
-        
-        app_logger.info("Application initialized successfully")
+        try:
+            app_logger.debug("Initializing configuration...")
+            self.config = AppConfig()
+            self.recorder = None
+            
+            app_logger.debug("Initializing transcriber worker...")
+            self.transcriber = TranscriberWorker(self.config)
+            self.transcriber.finished_text.connect(self.on_text)
+            self.transcriber.status_changed.connect(self.on_trans_status)
+            self.transcriber.log_msg.connect(lambda m: self.scratchpad.append(f"[System] {m}"))
+            self.transcriber.start()
+            
+            app_logger.debug("Initializing status overlay...")
+            self.indicator = StatusOverlay(self.config)
+            
+            self.sig_toggle_vis.connect(self.toggle_visibility_safe)
+            self.sig_toggle_rec.connect(self.toggle_rec)
+            
+            # Set window and tray icon
+            app_logger.debug("Setting up icons...")
+            icon_path = os.path.join(BASE_DIR, "icon.png")
+            if os.path.exists(icon_path):
+                app_icon = QIcon(icon_path)
+                self.setWindowIcon(app_icon)
+                app_logger.info(f"Loaded icon from: {icon_path}")
+            else:
+                app_icon = QIcon.fromTheme("audio-input-microphone")
+                app_logger.debug("Using default theme icon (icon.png not found)")
+            
+            app_logger.debug("Initializing system tray...")
+            self.tray = QSystemTrayIcon(self)
+            self.tray.setIcon(app_icon)
+            tm = QMenu()
+            tm.addAction("Show/Restore", self.toggle_visibility_safe)
+            tm.addAction("Quit", QApplication.instance().quit)
+            self.tray.setContextMenu(tm)
+            self.tray.show()
+            
+            app_logger.debug("Building UI...")
+            self.setup_ui()
+            
+            app_logger.debug("Setting up hotkeys and listeners...")
+            self.setup_logic()
+            
+            app_logger.debug("Starting folder monitor timer...")
+            self.m_timer = QTimer()
+            self.m_timer.timeout.connect(self.monitor_dirs)
+            self.m_timer.start(5000)
+            
+            app_logger.debug("Initializing PyAudio system...")
+            self.pa_sys = pyaudio.PyAudio()
+            self.meter_stream = None
+            
+            app_logger.debug("Starting meter update timer...")
+            self.meter_timer = QTimer()
+            self.meter_timer.timeout.connect(self.update_meter)
+            self.meter_timer.start(100)
+            
+            app_logger.info("Application initialized successfully")
+            
+        except Exception as e:
+            app_logger.error(f"Critical error during initialization: {e}", exc_info=True)
+            raise
 
     def toggle_visibility_safe(self):
         if self.isVisible() and self.windowState() != Qt.WindowState.WindowMinimized:
@@ -787,11 +859,19 @@ class WhisperRApp(QMainWindow):
         t1 = QWidget()
         l1 = QVBoxLayout(t1)
         
-        l1.addWidget(QLabel("Logs & Results:"))
+        # Compact label with minimal space
+        label_layout = QVBoxLayout()
+        label_layout.setSpacing(0)
+        label_layout.setContentsMargins(0, 0, 0, 20)  # 20px bottom margin
+        logs_label = QLabel("Logs & Results:")
+        logs_label.setStyleSheet("font-weight: bold;")
+        label_layout.addWidget(logs_label)
+        l1.addLayout(label_layout)
+        
+        # Textarea takes rest of space
         self.scratchpad = QTextEdit()
         self.scratchpad.setFont(QFont("Consolas", 9))
-        self.scratchpad.setMaximumHeight(300)
-        l1.addWidget(self.scratchpad)
+        l1.addWidget(self.scratchpad)  # No max height - takes all available space
         
         hb = QHBoxLayout()
         self.btn_toggle = QPushButton("Start Dictation")
@@ -963,23 +1043,8 @@ class WhisperRApp(QMainWindow):
         self.btn_hk2.clicked.connect(lambda: self.cap_hk(self.btn_hk2, "ptt_key"))
         hotkey_layout.addRow("Push-to-Talk:", self.btn_hk2)
         
-        # PTT Prolonged Hold feature
-        self.cfg_ptt_prolonged = QCheckBox("Enable Prolonged Hold (hold key to activate)")
-        self.cfg_ptt_prolonged.setChecked(self.config.settings["ptt_prolonged_hold"])
-        hotkey_layout.addRow(self.cfg_ptt_prolonged)
-        
-        self.cfg_ptt_hold_time = QDoubleSpinBox()
-        self.cfg_ptt_hold_time.setRange(0.1, 5.0)
-        self.cfg_ptt_hold_time.setValue(self.config.settings["ptt_hold_time"])
-        self.cfg_ptt_hold_time.setSuffix(" sec")
-        self.cfg_ptt_hold_time.setEnabled(self.config.settings["ptt_prolonged_hold"])
-        hotkey_layout.addRow("Hold Duration:", self.cfg_ptt_hold_time)
-        
-        # Connect the checkbox to enable/disable the hold time spinbox
-        self.cfg_ptt_prolonged.toggled.connect(self.cfg_ptt_hold_time.setEnabled)
-        
-        # Add explanatory label
-        ptt_info = QLabel("When enabled: Quick press sends key to system, hold activates PTT")
+        # Note about PTT
+        ptt_info = QLabel("Note: PTT key will also function normally in other apps")
         ptt_info.setStyleSheet("color: #888; font-size: 8pt; font-style: italic;")
         ptt_info.setWordWrap(True)
         hotkey_layout.addRow(ptt_info)
@@ -1066,15 +1131,38 @@ class WhisperRApp(QMainWindow):
         self.cfg_bar_edge.setCurrentText(self.config.settings["bar_edge"])
         visual_layout.addRow("Bar Edge:", self.cfg_bar_edge)
         
+        self.cfg_bar_thickness = QSpinBox()
+        self.cfg_bar_thickness.setRange(1, 50)
+        self.cfg_bar_thickness.setValue(self.config.settings.get("bar_thickness", 5))
+        self.cfg_bar_thickness.setSuffix(" px")
+        self.cfg_bar_thickness.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # Ensure it gets focus
+        visual_layout.addRow("Bar Thickness:", self.cfg_bar_thickness)
+        
         self.cfg_ind_sz = QSpinBox()
         self.cfg_ind_sz.setRange(16, 256)
         self.cfg_ind_sz.setValue(self.config.settings["ind_size"])
+        self.cfg_ind_sz.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         visual_layout.addRow("Icon Size:", self.cfg_ind_sz)
         
         self.cfg_ind_off = QSpinBox()
         self.cfg_ind_off.setRange(0, 256)
         self.cfg_ind_off.setValue(self.config.settings["ind_off"])
+        self.cfg_ind_off.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         visual_layout.addRow("Corner Offset:", self.cfg_ind_off)
+        
+        self.cfg_ind_opacity = QSpinBox()
+        self.cfg_ind_opacity.setRange(10, 255)
+        self.cfg_ind_opacity.setValue(self.config.settings.get("ind_opacity", 255))
+        self.cfg_ind_opacity.setToolTip("10 = nearly transparent, 255 = fully opaque")
+        self.cfg_ind_opacity.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        visual_layout.addRow("Icon Opacity:", self.cfg_ind_opacity)
+        
+        self.cfg_bar_opacity = QSpinBox()
+        self.cfg_bar_opacity.setRange(10, 255)
+        self.cfg_bar_opacity.setValue(self.config.settings.get("bar_opacity", 255))
+        self.cfg_bar_opacity.setToolTip("10 = nearly transparent, 255 = fully opaque")
+        self.cfg_bar_opacity.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        visual_layout.addRow("Bar Opacity:", self.cfg_bar_opacity)
         
         visual_group.setLayout(visual_layout)
         main_layout.addWidget(visual_group)
@@ -1088,7 +1176,12 @@ class WhisperRApp(QMainWindow):
         self.cfg_log_level.setCurrentText(self.config.settings["log_level"])
         advanced_layout.addRow("Logging Level:", self.cfg_log_level)
         
-        self.btn_setup = QPushButton("Download GPU Dependencies")
+        self.cfg_use_vad = QCheckBox("Use VAD (Voice Activity Detection)")
+        self.cfg_use_vad.setChecked(self.config.settings.get("use_vad", False))
+        self.cfg_use_vad.setToolTip("Filters non-speech audio. Disable if you get onnxruntime errors.")
+        advanced_layout.addRow(self.cfg_use_vad)
+        
+        self.btn_setup = QPushButton("GPU Acceleration Setup Guide")
         self.btn_setup.setStyleSheet("background-color: #27ae60; color: white;")
         self.btn_setup.clicked.connect(self.setup_deps)
         advanced_layout.addRow(self.btn_setup)
@@ -1214,25 +1307,34 @@ class WhisperRApp(QMainWindow):
                 
                 try:
                     device_info = self.pa_sys.get_device_info_by_index(idx)
-                    sr = int(device_info['defaultSampleRate'])
                     
-                    # Verify device supports input
-                    if device_info['maxInputChannels'] <= 0:
-                        app_logger.warning(f"Device {idx} has no input channels")
+                    # CRITICAL: Verify device supports input AND check channel count
+                    max_input_channels = device_info.get('maxInputChannels', 0)
+                    if max_input_channels <= 0:
+                        app_logger.debug(f"Device {idx} has no input channels (output-only device)")
                         return
+                    
+                    # Some devices report wrong channel count - use 1 channel for mono
+                    channels = 1
+                    
+                    sr = int(device_info['defaultSampleRate'])
                     
                     self.meter_stream = self.pa_sys.open(
                         format=pyaudio.paInt16, 
-                        channels=1, 
+                        channels=channels,  # Always use mono
                         rate=sr, 
                         input=True, 
                         input_device_index=idx, 
                         frames_per_buffer=1024
                     )
-                    app_logger.debug(f"Meter stream opened: device {idx}, rate {sr}Hz")
+                    app_logger.debug(f"Meter stream opened: device {idx}, rate {sr}Hz, channels={channels}")
                     
                 except Exception as e:
-                    app_logger.warning(f"Failed to open meter stream: {e}")
+                    # Don't spam the log - only log once per device
+                    if not hasattr(self, '_last_meter_error_device') or self._last_meter_error_device != idx:
+                        app_logger.warning(f"Failed to open meter stream for device {idx}: {e}")
+                        self._last_meter_error_device = idx
+                    
                     if self.meter_stream:
                         try:
                             self.meter_stream.close()
@@ -1247,8 +1349,7 @@ class WhisperRApp(QMainWindow):
             self.live_meter.setValue(rms)
             
         except OSError as e:
-            # Device disconnected or stream error
-            app_logger.debug(f"Meter stream error (device may have changed): {e}")
+            # Device disconnected or stream error - close and don't spam log
             if self.meter_stream:
                 try:
                     self.meter_stream.close()
@@ -1257,7 +1358,11 @@ class WhisperRApp(QMainWindow):
                 self.meter_stream = None
                 
         except Exception as e:
-            app_logger.debug(f"Unexpected meter error: {e}")
+            # Unexpected error - log once per device
+            if not hasattr(self, '_last_meter_exception_device'):
+                app_logger.debug(f"Unexpected meter error: {e}")
+                self._last_meter_exception_device = True
+            
             if self.meter_stream:
                 try:
                     self.meter_stream.close()
@@ -1266,6 +1371,11 @@ class WhisperRApp(QMainWindow):
                 self.meter_stream = None
 
     def save_cfg(self):
+        # Visual feedback - change button temporarily
+        self.sender().setEnabled(False)
+        self.sender().setText("💾 Saving...")
+        QApplication.processEvents()  # Force UI update
+        
         # Collect commands from table
         cmds = {}
         for r in range(self.cmd_table.rowCount()):
@@ -1292,8 +1402,6 @@ class WhisperRApp(QMainWindow):
             "paste_delay": self.cfg_p_win.value(),
             "hotkey": self.btn_hk1.text(),
             "ptt_key": self.btn_hk2.text(),
-            "ptt_prolonged_hold": self.cfg_ptt_prolonged.isChecked(),
-            "ptt_hold_time": self.cfg_ptt_hold_time.value(),
             "visibility_hotkey": self.btn_hk_vis.text(),
             "noise_floor": self.n_spin.value(),
             "speech_vol": self.s_spin.value(),
@@ -1307,17 +1415,47 @@ class WhisperRApp(QMainWindow):
             "bar_edge": self.cfg_bar_edge.currentText(),
             "ind_size": self.cfg_ind_sz.value(),
             "ind_off": self.cfg_ind_off.value(),
+            "bar_thickness": self.cfg_bar_thickness.value(),
+            "ind_opacity": self.cfg_ind_opacity.value(),
+            "bar_opacity": self.cfg_bar_opacity.value(),
             "timestamps": self.cfg_ts.isChecked(),
             "translate": self.cfg_trans.isChecked(),
-            "log_level": self.cfg_log_level.currentText()
+            "log_level": self.cfg_log_level.currentText(),
+            "use_vad": self.cfg_use_vad.isChecked()
         })
         
-        self.config.save()
-        app_logger.set_level(self.config.settings["log_level"])
-        self.scratchpad.append("✓ Settings saved successfully")
-        
-        # Restart hotkey listeners with new keys
-        self.setup_logic()
+        try:
+            self.config.save()
+            app_logger.set_level(self.config.settings["log_level"])
+            self.scratchpad.append("✓ Settings saved successfully")
+            
+            # Visual feedback - success
+            self.sender().setText("✓ SAVED!")
+            self.sender().setStyleSheet("background-color: #27ae60; color: white; font-weight: bold;")
+            QTimer.singleShot(1500, lambda: self.reset_save_button())
+            
+            # Restart hotkey listeners with new keys
+            self.setup_logic()
+            
+        except Exception as e:
+            app_logger.error(f"Failed to save settings: {e}", exc_info=True)
+            self.scratchpad.append(f"✗ Failed to save settings: {e}")
+            
+            # Visual feedback - error
+            self.sender().setText("✗ SAVE FAILED")
+            self.sender().setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
+            QTimer.singleShot(2000, lambda: self.reset_save_button())
+        finally:
+            self.sender().setEnabled(True)
+    
+    def reset_save_button(self):
+        """Reset save button to original state"""
+        # Find the save button
+        for widget in self.findChildren(QPushButton):
+            if "SAVE" in widget.text().upper() and "SETTINGS" in widget.text().upper():
+                widget.setText("💾 SAVE ALL SETTINGS")
+                widget.setStyleSheet("background-color: #0078d7; color: white; font-weight: bold;")
+                break
 
     def start_cal(self):
         if self.recorder and self.recorder.active:
@@ -1381,25 +1519,20 @@ class WhisperRApp(QMainWindow):
         self.indicator.update()
 
     def on_p(self, key):
+        """Handle PTT key press - simplified for reliability"""
         try:
             key_str = self.key_to_string(key)
             
             # Check if this is the PTT key
             if key_str == self.config.settings["ptt_key"] and self.recorder:
-                # Check if prolonged hold is enabled
-                if self.config.settings["ptt_prolonged_hold"]:
-                    # Record the press time
-                    self.recorder.ptt_press_time = time.time()
-                    self.recorder.ptt_sent_to_system = False
-                    app_logger.debug("PTT key pressed (prolonged hold mode)")
-                else:
-                    # Immediate activation
-                    self.recorder.ptt_pressed = True
-                    app_logger.debug("PTT pressed (immediate mode)")
+                # Immediate activation (prolonged hold removed - caused key leakage issues)
+                self.recorder.ptt_pressed = True
+                app_logger.debug("PTT activated")
         except Exception as e:
-            app_logger.debug(f"PTT press error: {e}")
+            app_logger.error(f"PTT press error: {e}", exc_info=True)
     
     def on_r(self, key):
+        """Handle PTT key release"""
         try:
             if not self.recorder:
                 return
@@ -1408,34 +1541,10 @@ class WhisperRApp(QMainWindow):
             
             # Check if this is the PTT key being released
             if key_str == self.config.settings["ptt_key"]:
-                if self.config.settings["ptt_prolonged_hold"]:
-                    # Calculate how long the key was held
-                    hold_duration = time.time() - self.recorder.ptt_press_time
-                    required_time = self.config.settings["ptt_hold_time"]
-                    
-                    if hold_duration >= required_time:
-                        # Key was held long enough - deactivate PTT
-                        self.recorder.ptt_pressed = False
-                        app_logger.debug(f"PTT released after {hold_duration:.2f}s (activated)")
-                    else:
-                        # Key was NOT held long enough - send to system
-                        if not self.recorder.ptt_sent_to_system:
-                            # Simulate the key press to Windows
-                            try:
-                                # Import here to avoid issues if not available
-                                import pyautogui
-                                # Convert our key format to pyautogui format
-                                pyautogui.press(self.config.settings["ptt_key"])
-                                app_logger.debug(f"PTT key sent to system (held only {hold_duration:.2f}s)")
-                            except Exception as e:
-                                app_logger.error(f"Failed to send key to system: {e}")
-                        self.recorder.ptt_sent_to_system = True
-                else:
-                    # Immediate mode - just deactivate
-                    self.recorder.ptt_pressed = False
-                    app_logger.debug("PTT released (immediate mode)")
+                self.recorder.ptt_pressed = False
+                app_logger.debug("PTT deactivated")
         except Exception as e:
-            app_logger.debug(f"PTT release error: {e}")
+            app_logger.error(f"PTT release error: {e}", exc_info=True)
     
     def key_to_string(self, key):
         """Convert pynput key to string format"""
@@ -1488,7 +1597,7 @@ class WhisperRApp(QMainWindow):
             except:
                 pass
         
-        # Create hotkey mapping
+        # Create hotkey mapping (for toggle dictation and show/hide)
         hotkey_map = {}
         
         try:
@@ -1509,9 +1618,14 @@ class WhisperRApp(QMainWindow):
                 f"Failed to register hotkeys:\n{e}\n\nPlease check your hotkey settings."
             )
         
-        # Start PTT listener
+        # Start PTT listener with suppression capability
         try:
-            self.ptt_l = keyboard.Listener(on_press=self.on_p, on_release=self.on_r)
+            # Create listener that can suppress keys
+            self.ptt_l = keyboard.Listener(
+                on_press=self.on_p, 
+                on_release=self.on_r,
+                suppress=False  # We'll handle suppression manually
+            )
             self.ptt_l.start()
             app_logger.info("PTT listener started")
         except Exception as e:
@@ -1560,42 +1674,51 @@ class WhisperRApp(QMainWindow):
                     app_logger.error(f"Failed to process file {f.name}: {e}")
     
     def setup_deps(self):
-        url = "https://github.com/purfview/whisper-standalone-win/releases/download/libs/cuBLAS_cuDNN_zlib.zip"
+        """Show guide for downloading GPU dependencies instead of auto-download (URLs keep breaking)"""
+        guide_text = """
+<b>GPU Acceleration Setup Guide</b>
+
+<b>For NVIDIA GPU users:</b>
+
+The app needs CUDA libraries for GPU acceleration. Unfortunately, download URLs keep changing, so here's how to get them manually:
+
+<b>Option 1: Download cuDNN (Recommended)</b>
+1. Visit: <a href='https://developer.nvidia.com/cudnn-downloads'>https://developer.nvidia.com/cudnn-downloads</a>
+2. Download cuDNN for Windows
+3. Extract the ZIP file
+4. Copy ALL .dll files to the WhisperR folder (same folder as WhisperR.exe)
+5. Restart WhisperR
+
+<b>Option 2: Use CPU Mode</b>
+CPU mode works perfectly fine - just slower:
+- No setup needed
+- Works on all systems
+- Good for "base" and "small" models
+
+<b>AMD GPU Users:</b>
+AMD GPU support requires ROCm (complex setup). Recommend using CPU mode instead.
+
+<b>Already have CUDA installed?</b>
+If you have CUDA toolkit or other GPU apps, WhisperR might already work with GPU!
+
+<b>How to verify GPU is working:</b>
+After placing DLL files, check the logs when transcribing:
+• "Model loaded successfully on GPU" = GPU working! ✓
+• "GPU Failed... Using CPU" = CPU mode (still works fine)
+
+<b>Note:</b> The "tiny" and "base" models work great on CPU for real-time dictation!
+        """
         
-        reply = QMessageBox.question(
-            self, 
-            "Download Dependencies", 
-            "Download NVIDIA GPU acceleration files?\n\n"
-            "Size: ~500MB\n"
-            "Required for: NVIDIA GPU users\n"
-            "Optional for: CPU-only or AMD GPU users\n\n"
-            "Continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("GPU Acceleration Setup")
+        msg_box.setTextFormat(Qt.TextFormat.RichText)
+        msg_box.setText(guide_text)
+        msg_box.setIcon(QMessageBox.Icon.Information)
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg_box.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        msg_box.exec()
         
-        if reply == QMessageBox.StandardButton.Yes:
-            def download_task():
-                try:
-                    file_path = os.path.join(BASE_DIR, "gpu_libs.zip")
-                    app_logger.info(f"Downloading GPU dependencies from {url}")
-                    
-                    self.scratchpad.append("[Download] Starting download...")
-                    urllib.request.urlretrieve(url, file_path)
-                    
-                    self.scratchpad.append("[Download] Extracting files...")
-                    with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                        zip_ref.extractall(BASE_DIR)
-                    
-                    os.remove(file_path)
-                    
-                    self.scratchpad.append("[Download] ✓ Complete! Restart the app to use GPU acceleration.")
-                    app_logger.info("GPU dependencies downloaded and extracted successfully")
-                except Exception as e:
-                    error_msg = f"[Download] ✗ Error: {e}"
-                    self.scratchpad.append(error_msg)
-                    app_logger.error(f"GPU dependencies download failed: {e}")
-            
-            threading.Thread(target=download_task, daemon=True).start()
+        app_logger.info("GPU setup guide displayed")
     
     def open_log_file(self):
         try:
@@ -1706,24 +1829,24 @@ class StatusOverlay(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        # Determine color based on state
+        # Determine base color based on state
         if (self.is_list or self.is_rec) and self.is_trans:
-            color = QColor(128, 0, 128, 255)  # Purple: recording + transcribing
+            base_color = (128, 0, 128)  # Purple: recording + transcribing
         elif self.is_rec:
-            color = QColor(255, 0, 0, 255)     # Red: actively recording
+            base_color = (255, 0, 0)     # Red: actively recording
         elif self.is_list:
-            color = QColor(100, 0, 0, 255)     # Dark red: listening
+            base_color = (100, 0, 0)     # Dark red: listening
         elif self.is_trans:
-            color = QColor(0, 0, 255, 255)     # Blue: transcribing only
+            base_color = (0, 0, 255)     # Blue: transcribing only
         else:
-            color = QColor(128, 128, 128, 100) # Gray: idle
+            base_color = (128, 128, 128) # Gray: idle
         
         screen_rect = self.rect()
         size = self.config.settings["ind_size"]
         offset = self.config.settings["ind_off"]
         position = self.config.settings["ind_pos"]
         
-        # Draw icon indicator
+        # Draw icon indicator with opacity
         if "Icon" in self.config.settings["ind_type"] or "Both" in self.config.settings["ind_type"]:
             if "Left" in position:
                 icon_x = offset
@@ -1735,25 +1858,33 @@ class StatusOverlay(QWidget):
             else:
                 icon_y = screen_rect.height() - size - offset
             
-            painter.setBrush(color)
+            # Apply icon opacity
+            icon_opacity = self.config.settings.get("ind_opacity", 255)
+            icon_color = QColor(base_color[0], base_color[1], base_color[2], icon_opacity)
+            
+            painter.setBrush(icon_color)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawEllipse(icon_x, icon_y, size, size)
         
-        # Draw bar indicator
+        # Draw bar indicator with opacity and thickness
         if "Bar" in self.config.settings["ind_type"] or "Both" in self.config.settings["ind_type"]:
-            bar_size = self.config.settings["bar_size"]
+            bar_thickness = self.config.settings.get("bar_thickness", 5)
             edge = self.config.settings["bar_edge"]
             
-            painter.setBrush(color)
+            # Apply bar opacity
+            bar_opacity = self.config.settings.get("bar_opacity", 255)
+            bar_color = QColor(base_color[0], base_color[1], base_color[2], bar_opacity)
+            
+            painter.setBrush(bar_color)
             
             if edge == "Top":
-                painter.drawRect(0, 0, screen_rect.width(), bar_size)
+                painter.drawRect(0, 0, screen_rect.width(), bar_thickness)
             elif edge == "Bottom":
-                painter.drawRect(0, screen_rect.height() - bar_size, screen_rect.width(), bar_size)
+                painter.drawRect(0, screen_rect.height() - bar_thickness, screen_rect.width(), bar_thickness)
             elif edge == "Left":
-                painter.drawRect(0, 0, bar_size, screen_rect.height())
+                painter.drawRect(0, 0, bar_thickness, screen_rect.height())
             else:  # Right
-                painter.drawRect(screen_rect.width() - bar_size, 0, bar_size, screen_rect.height())
+                painter.drawRect(screen_rect.width() - bar_thickness, 0, bar_thickness, screen_rect.height())
 
 
 if __name__ == "__main__":
