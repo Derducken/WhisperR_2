@@ -291,3 +291,6 @@ env/
 *.swp
 *.swo
 *~
+WhisperR - working.py
+
+build_output.txt

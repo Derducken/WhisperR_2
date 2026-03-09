@@ -1,5 +1,537 @@
 import sys
 import os
+
+
+# Runs in a separate process via multiprocessing.Process (NOT subprocess.Popen).
+# Using multiprocessing.Process is the correct PyInstaller-compatible approach:
+# PyInstaller's freeze_support() hooks handle the re-execution of the frozen
+# binary so that the full import machinery (including torch.__spec__) is intact.
+#
+# This function is defined at module level so multiprocessing can pickle it.
+# It communicates with the parent via three multiprocessing.Queue objects
+# passed as arguments (task_q, result_q, log_q).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ai_worker_process(task_q, result_q, log_q):
+    """AI worker — runs in a child process, owns faster-whisper + ctranslate2."""
+    import os, sys, traceback
+
+    def _log(msg):
+        try:
+            log_q.put_nowait(msg)
+        except Exception:
+            pass
+
+    # ── Env vars — set BEFORE any C-extension import ─────────────────────────
+    # CUDA_VISIBLE_DEVICES=-1 is the most important one: it tells torch AND
+    # ctranslate2 to not initialize any CUDA context on import. Without it,
+    # `import faster_whisper` triggers torch CUDA DLL loading, which SEH-crashes
+    # in the frozen app if cuDNN/cuBLAS DLLs are present but broken/mismatched.
+    # We remove this env var only when actually attempting a CUDA model load.
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+    # CT2_USE_MKL=0: Force oneDNN backend instead of Intel MKL.
+    # ctranslate2 auto-selects MKL on Intel CPUs and oneDNN on AMD CPUs, but
+    # the auto-detection can misfire in frozen apps. oneDNN (dnnl.dll) is the
+    # correct backend for AMD hardware and avoids missing MKL DLL errors.
+    os.environ["CT2_USE_MKL"] = "0"  # Force oneDNN, not MKL (correct for AMD CPUs)
+
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # Hard-set: must override any inherited value
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("CT2_FORCE_CPU_ISA", "GENERIC")
+    os.environ["CT2_VERBOSE"] = "1"  # Enable backend selection logging
+    os.environ.setdefault("PYTORCH_JIT", "0")
+
+    # ── DLL search paths ──────────────────────────────────────────────────────
+    # CRITICAL: os.add_dll_directory() is per-process. The main process set it up
+    # but that does NOT inherit to this child. We must repeat the setup here.
+    if os.name == 'nt':
+        _base = os.path.dirname(sys.executable)
+        _internal = os.path.join(_base, '_internal')
+
+        # 1) Add _internal/ and all its subdirectories (recursive 2 levels)
+        for _root in [_base, _internal]:
+            if os.path.isdir(_root):
+                try:
+                    os.add_dll_directory(_root)
+                    os.environ['PATH'] = _root + os.pathsep + os.environ.get('PATH', '')
+                except Exception:
+                    pass
+                try:
+                    for _e in os.scandir(_root):
+                        if _e.is_dir():
+                            try:
+                                os.add_dll_directory(_e.path)
+                                os.environ['PATH'] = _e.path + os.pathsep + os.environ.get('PATH', '')
+                            except Exception:
+                                pass
+                            # 2nd level — ctranslate2 nests cuda DLLs deep
+                            try:
+                                for _ee in os.scandir(_e.path):
+                                    if _ee.is_dir():
+                                        try:
+                                            os.add_dll_directory(_ee.path)
+                                            os.environ['PATH'] = _ee.path + os.pathsep + os.environ.get('PATH', '')
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+        # 2) site-packages/nvidia/*/bin — where `pip install nvidia-cudnn-cu12` puts DLLs
+        try:
+            import site
+            for _sp in site.getsitepackages():
+                for _lib in ("cudnn", "cublas", "cuda_runtime", "cufft",
+                             "curand", "cusolver", "cusparse", "nvrtc", "nvjitlink"):
+                    _p = os.path.join(_sp, "nvidia", _lib, "bin")
+                    if os.path.isdir(_p):
+                        try:
+                            os.add_dll_directory(_p)
+                            os.environ['PATH'] = _p + os.pathsep + os.environ.get('PATH', '')
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # 3) ctranslate2 package directory — where dnnl.dll and CUDA DLLs live
+        try:
+            import ctranslate2 as _ct2_path
+            _ct2_dir = os.path.dirname(_ct2_path.__file__)
+            if os.path.isdir(_ct2_dir):
+                os.add_dll_directory(_ct2_dir)
+                os.environ['PATH'] = _ct2_dir + os.pathsep + os.environ.get('PATH', '')
+        except Exception:
+            pass
+
+        # 4) System CUDA toolkit paths (common install locations)
+        for _cuda_base in (
+            os.environ.get("CUDA_PATH", ""),
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.0\bin",
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1\bin",
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2\bin",
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.3\bin",
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin",
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.5\bin",
+            r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin",
+        ):
+            if _cuda_base and os.path.isdir(_cuda_base):
+                try:
+                    os.add_dll_directory(_cuda_base)
+                    os.environ['PATH'] = _cuda_base + os.pathsep + os.environ.get('PATH', '')
+                except Exception:
+                    pass
+
+    _log(f"AI worker process started (pid={os.getpid()})")
+
+    # Enable faulthandler so crashes write a traceback to stderr
+    # (visible in the log if stderr is captured, otherwise helps with debugging)
+    try:
+        import faulthandler
+        import tempfile
+        _fh_path = os.path.join(tempfile.gettempdir(), f'whisperr_crash_{os.getpid()}.txt')
+        _fh_file = open(_fh_path, 'w')
+        faulthandler.enable(file=_fh_file)
+        _log(f"  Crash log: {_fh_path}")
+    except Exception as _fe:
+        _log(f"  faulthandler setup failed: {_fe}")
+
+    # ── Pre-load ctranslate2.dll and CUDA DLLs at worker startup ─────────────
+    # ctranslate2 uses CUDA_DYNAMIC_LOADING=ON — it calls LoadLibrary() for
+    # CUDA DLLs from inside its C++ constructor. In a frozen spawned subprocess
+    # os.add_dll_directory() from the parent doesn't carry over. We pre-load
+    # everything via ctypes so DLLs are pinned before any WhisperModel() call.
+    if os.name == 'nt':
+        import ctypes, shutil as _shutil
+        _base_exe = os.path.dirname(sys.executable)
+        _internal = os.path.join(_base_exe, '_internal')
+
+        # -- ctranslate2.dll --
+        try:
+            _ct2_pkg = None
+            try:
+                import ctranslate2 as _ct2_tmp
+                _ct2_pkg = os.path.dirname(_ct2_tmp.__file__)
+            except Exception:
+                pass
+            if _ct2_pkg:
+                _ct2_dll = os.path.join(_ct2_pkg, 'ctranslate2.dll')
+                if os.path.isfile(_ct2_dll):
+                    ctypes.CDLL(_ct2_dll)
+                    _log(f"  Pre-loaded ctranslate2.dll from {_ct2_pkg}")
+        except Exception as _e:
+            _log(f"  ctranslate2.dll pre-load skipped: {_e}")
+
+        # -- CUDA DLLs: cudart64_12, cublas64_12, cublasLt64_12 --
+        # Search: _internal/ (bundled by spec), nvidia pip package bin dirs,
+        # known fallback locations. Copy into _internal/ on first find so all
+        # future worker spawns find them immediately without searching.
+        _cuda_search = []
+        if os.path.isdir(_internal):
+            _cuda_search.append(_internal)
+            try: os.add_dll_directory(_internal)
+            except Exception: pass
+        for _pyroot in [
+            os.path.dirname(os.path.dirname(sys.executable)),
+            r'C:\Python312', r'C:\Python311', r'C:\Python310',
+            os.environ.get('PYTHONHOME', ''),
+        ]:
+            if not _pyroot: continue
+            _nv = os.path.join(_pyroot, 'Lib', 'site-packages', 'nvidia')
+            if os.path.isdir(_nv):
+                for _nvpkg in os.listdir(_nv):
+                    _bin = os.path.join(_nv, _nvpkg, 'bin')
+                    if os.path.isdir(_bin):
+                        _cuda_search.append(_bin)
+                        try: os.add_dll_directory(_bin)
+                        except Exception: pass
+        for _fb in [
+            r'C:\Users\koura\AppData\Local\Programs\Ollama\lib\ollama',
+            r'C:\Ducklord\Faster-Whisper-XXL\Faster-Whisper-XXL\_xxl_data\torch\lib',
+        ]:
+            if os.path.isdir(_fb):
+                _cuda_search.append(_fb)
+                try: os.add_dll_directory(_fb)
+                except Exception: pass
+
+        # cudnn64_9.dll is a stub that loads the actual compute DLLs.
+        # In a frozen subprocess they must be pre-loaded explicitly.
+        _cuda_needed = [
+            'cudart64_12.dll', 'cublas64_12.dll', 'cublasLt64_12.dll',
+            'cudnn64_9.dll',
+            'cudnn_ops64_9.dll', 'cudnn_cnn64_9.dll', 'cudnn_adv64_9.dll',
+            'cudnn_graph64_9.dll', 'cudnn_heuristic64_9.dll',
+            'cudnn_engines_precompiled64_9.dll',
+            'cudnn_engines_runtime_compiled64_9.dll',
+        ]
+        _cuda_loaded, _cuda_missing = [], []
+        for _dll in _cuda_needed:
+            _ok = False
+            try:
+                ctypes.CDLL(_dll)
+                _cuda_loaded.append(_dll)
+                _ok = True
+            except Exception:
+                pass
+            if not _ok:
+                for _d in _cuda_search:
+                    _fp = os.path.join(_d, _dll)
+                    if os.path.isfile(_fp):
+                        try:
+                            ctypes.CDLL(_fp)
+                            _dst = os.path.join(_internal, _dll)
+                            if os.path.isdir(_internal) and not os.path.isfile(_dst):
+                                try: _shutil.copy2(_fp, _dst)
+                                except Exception: pass
+                            _cuda_loaded.append(_dll)
+                            _ok = True
+                            break
+                        except Exception:
+                            pass
+            if not _ok:
+                _cuda_missing.append(_dll)
+        if _cuda_loaded:
+            _log(f"  CUDA pre-loaded: {', '.join(_cuda_loaded)}")
+        if _cuda_missing:
+            _log(f"  CUDA missing: {', '.join(_cuda_missing)}")
+
+    # ── DLL fix: copy ctranslate2 DLLs from package dir into _internal/ ─────
+    # PyInstaller collects ctranslate2's .pyd but misses the sibling DLLs
+    # (dnnl.dll, cublas64_12.dll, etc.) that ctranslate2 loads via LoadLibrary
+    # at runtime. We find ctranslate2's package dir and add it to the DLL
+    # search path, and also copy any missing DLLs into _internal/.
+    if os.name == 'nt':
+        _base_d = os.path.dirname(sys.executable)
+        _internal_d = os.path.join(_base_d, '_internal')
+
+        # Find ctranslate2's package directory — that's where dnnl.dll lives
+        _ct2_pkg_dir = None
+        try:
+            import ctranslate2 as _ct2_tmp
+            _ct2_pkg_dir = os.path.dirname(_ct2_tmp.__file__)
+        except Exception:
+            pass
+
+        # If not importable yet, try finding it via sys.path
+        if not _ct2_pkg_dir:
+            for _sp in sys.path:
+                _candidate = os.path.join(_sp, 'ctranslate2')
+                if os.path.isdir(_candidate):
+                    _ct2_pkg_dir = _candidate
+                    break
+
+        if _ct2_pkg_dir and os.path.isdir(_ct2_pkg_dir):
+            # Add ctranslate2's package dir to DLL search so Windows finds the DLLs
+            try:
+                os.add_dll_directory(_ct2_pkg_dir)
+                os.environ['PATH'] = _ct2_pkg_dir + os.pathsep + os.environ.get('PATH', '')
+            except Exception:
+                pass
+
+            # Copy any missing critical DLLs into _internal/ (permanent fix for this run)
+            _critical_dlls = [
+                # CUDA DLLs shipped inside ctranslate2's package dir.
+                "cublas64_12.dll", "cublasLt64_12.dll",
+                "cudnn64_9.dll", "cudnn_ops64_9.dll", "cudnn_cnn64_9.dll",
+                "cudnn_adv64_9.dll", "cudnn_engines_precompiled64_9.dll",
+                "cudnn_engines_runtime_compiled64_9.dll", "cudnn_graph64_9.dll",
+                "cudnn_heuristic64_9.dll",
+            ]
+            # libiomp5md.dll is in _internal/ but ctranslate2.dll is in
+            # _internal/ctranslate2/ — Windows resolves DLL dependencies
+            # relative to the loading DLL's own directory first, so it
+            # can't see libiomp5md.dll one level up. Copy it alongside
+            # ctranslate2.dll so it's found immediately.
+            _iomp_src = os.path.join(_internal_d, 'libiomp5md.dll')
+            _iomp_dst = os.path.join(_ct2_pkg_dir, 'libiomp5md.dll')
+            if os.path.isfile(_iomp_src) and not os.path.isfile(_iomp_dst):
+                try:
+                    import shutil
+                    shutil.copy2(_iomp_src, _iomp_dst)
+                    _log(f"  Copied libiomp5md.dll into ctranslate2 pkg dir")
+                except Exception as _ce:
+                    _log(f"  Could not copy libiomp5md.dll: {_ce}")
+            _copied = []
+            _found_in_pkg = []
+            for _dll in _critical_dlls:
+                _src = os.path.join(_ct2_pkg_dir, _dll)
+                if os.path.isfile(_src):
+                    _found_in_pkg.append(_dll)
+                    _dst = os.path.join(_internal_d, _dll)
+                    if not os.path.isfile(_dst):
+                        try:
+                            import shutil
+                            shutil.copy2(_src, _dst)
+                            _copied.append(_dll)
+                        except Exception as _ce:
+                            _log(f"  Could not copy {_dll}: {_ce}")
+            if _found_in_pkg:
+                _log(f"  Found in ct2 pkg: {', '.join(_found_in_pkg)}")
+            if _copied:
+                _log(f"  Copied to _internal/: {', '.join(_copied)}")
+
+        # Log every DLL in ctranslate2's package dir (full inventory)
+        try:
+            _all_dlls = [f for f in os.listdir(_ct2_pkg_dir) if f.lower().endswith('.dll')]
+            _log(f"  ct2 pkg DLLs: {', '.join(sorted(_all_dlls))}")
+        except Exception:
+            pass
+
+        # Log DLL presence status for diagnostics
+        _ct2_dlls_check = ["dnnl.dll", "mkldnn.dll", "mkl_core.dll",
+                           "mkl_rt.dll", "mkl_intel_thread.dll",
+                           "iomp5md.dll", "libiomp5md.dll", "ctranslate2.dll"]
+        _ok, _miss = [], []
+        for _dll in _ct2_dlls_check:
+            _found_dll = False
+            for _search in ([_ct2_pkg_dir] if _ct2_pkg_dir else []) + [_base_d, _internal_d]:
+                if _search and os.path.isfile(os.path.join(_search, _dll)):
+                    _found_dll = True
+                    break
+            (_ok if _found_dll else _miss).append(_dll)
+        if _ok:
+            _log(f"  DLL OK: {', '.join(_ok)}")
+        if _miss:
+            _log(f"  DLL MISSING: {', '.join(_miss)}")
+
+    model = None
+    current_model_name = None
+    current_language = None
+    WhisperModel = None
+
+    while True:
+        try:
+            msg = task_q.get(timeout=1.0)
+        except Exception:
+            continue
+
+        if msg == '__STOP__':
+            _log("AI worker: received stop signal, exiting")
+            break
+
+        model_name, lang_code, compute_pref, audio_data, src, translate, use_vad, prompt = msg
+
+        # Import on first task — by the time we get here, multiprocessing has
+        # fully initialized the frozen interpreter so torch.__spec__ is valid.
+        if WhisperModel is None:
+            try:
+                _log("Importing ctranslate2...")
+                import ctranslate2 as _ct2
+                _log(f"ctranslate2 {_ct2.__version__} imported OK")
+                _log("Importing faster_whisper...")
+                from faster_whisper import WhisperModel
+                _log("faster_whisper imported OK")
+            except Exception as e:
+                _log(f"Import error: {type(e).__name__}: {e}")
+                result_q.put(('status', False))
+                continue
+
+        # Load model if needed
+        need_load = (
+            model is None or
+            current_model_name != model_name or
+            current_language != lang_code
+        )
+        if need_load and model_name:
+            _log(f"Loading {model_name} (pref={compute_pref})...")
+            loaded = False
+
+            # ── Resolve model path from HF cache (before CUDA or CPU attempt) ─
+            # In frozen apps huggingface_hub's internal resolution can fail
+            # (missing constants module). We locate the cached snapshot ourselves
+            # and pass an absolute path, bypassing all hub download logic.
+            _model_path = model_name  # fallback → name triggers normal download
+            try:
+                _hf_home = os.environ.get(
+                    "HF_HOME",
+                    os.environ.get(
+                        "HUGGINGFACE_HUB_CACHE",
+                        os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
+                    )
+                )
+                _log(f"  HF cache: {_hf_home}")
+                _repo_dir = os.path.join(_hf_home, f"models--Systran--faster-whisper-{model_name}")
+                if os.path.isdir(_repo_dir):
+                    _snaps_dir = os.path.join(_repo_dir, "snapshots")
+                    _snaps = [s for s in os.listdir(_snaps_dir)
+                              if os.path.isdir(os.path.join(_snaps_dir, s))]
+                    if _snaps:
+                        _snap_path = os.path.join(_snaps_dir, sorted(_snaps)[-1])
+                        _has_weights = any(f.endswith(('.bin', '.ct2'))
+                                           for f in os.listdir(_snap_path))
+                        if _has_weights:
+                            _model_path = _snap_path
+                            _log(f"  Resolved: {_model_path}")
+                        else:
+                            _log(f"  Snapshot empty, using name")
+                    else:
+                        _log(f"  No snapshots, using name")
+                else:
+                    _log(f"  Not cached, will download")
+            except Exception as _hfe:
+                _log(f"  Path resolve failed: {_hfe}")
+
+            if compute_pref in ('cuda', 'auto'):
+                # CUDA DLLs were pre-loaded at worker startup (see above).
+                # _cuda_missing tells us if cudart was found.
+                _critical = {'cudart64_12.dll', 'cublas64_12.dll', 'cudnn_ops64_9.dll'}
+                _skip_cuda = bool(_critical & set(_cuda_missing)) if os.name == 'nt' else False
+                if _skip_cuda:
+                    _log("  cudart64_12.dll not loaded — skipping CUDA, using CPU")
+                else:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+                cuda_device_count = 0
+                if not _skip_cuda:
+                    try:
+                        import ctranslate2 as _ct2_check
+                        cuda_device_count = _ct2_check.get_cuda_device_count()
+                        _log(f"  CUDA probe: {cuda_device_count} device(s) found")
+                    except Exception as _pe:
+                        _log(f"  CUDA probe error: {_pe}")
+                        cuda_device_count = 0
+
+                if cuda_device_count > 0:
+                    for ctype in ('float16', 'int8_float16'):
+                        try:
+                            _log(f"  Trying CUDA {ctype}...")
+                            model = WhisperModel(
+                                _model_path, device="cuda",
+                                compute_type=ctype,
+                                cpu_threads=4,
+                                num_workers=1,
+                                download_root=None,
+                                local_files_only=True,
+                            )
+                            current_model_name = model_name
+                            current_language = lang_code
+                            _log(f"✓ {model_name} loaded on GPU ({ctype})")
+                            loaded = True
+                            break
+                        except Exception as e:
+                            _log(f"  CUDA {ctype} failed: {type(e).__name__}: {e}")
+                else:
+                    if not _skip_cuda:
+                        _log("  GPU unavailable — falling back to CPU")
+
+                if not loaded:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+            if not loaded:
+                # ── CPU path ──────────────────────────────────────────────────
+                # CUDA_VISIBLE_DEVICES=-1 is already set (at startup, or just
+                # re-set above after a failed CUDA attempt). This prevents
+                # ctranslate2 from enumerating/touching any CUDA DLLs during
+                # CPU model load — the main cause of SEH crashes in frozen apps.
+                # Resolve the model path from HF cache before calling WhisperModel.
+                # In frozen apps, huggingface_hub's internal path resolution can
+                # fail or return a bad path — we find the cached model directory
+                # ourselves and pass the absolute path directly to WhisperModel,
+                # bypassing any hub download logic entirely.
+                # Force offline mode — prevents any HF hub network calls or
+                # symlink resolution inside WhisperModel.__init__ that crash
+                # when huggingface_hub is partially initialised in frozen apps.
+                os.environ["HF_HUB_OFFLINE"] = "1"
+                os.environ["TRANSFORMERS_OFFLINE"] = "1"
+                os.environ["HF_DATASETS_OFFLINE"] = "1"
+
+                _files_in_model = sorted(os.listdir(_model_path)) if os.path.isdir(_model_path) else []
+                _log(f"  model files: {_files_in_model}")
+
+                for ctype in ('float32', 'int8'):
+                    try:
+                        _log(f"  Trying CPU {ctype}...")
+                        model = WhisperModel(
+                            _model_path, device="cpu",
+                            compute_type=ctype,
+                            cpu_threads=4,
+                            num_workers=1,
+                            download_root=None,
+                            local_files_only=True,
+                        )
+                        current_model_name = model_name
+                        current_language = lang_code
+                        _log(f"✓ {model_name} loaded on CPU ({ctype})")
+                        loaded = True
+                        break
+                    except Exception as e:
+                        _log(f"  CPU {ctype} failed: {type(e).__name__}: {e}")
+
+            if not loaded:
+                _log(f"All load attempts failed for {model_name}")
+                result_q.put(('status', False))
+                continue
+
+        # src=None → preload sentinel
+        if src is None:
+            result_q.put(('status', False))
+            continue
+
+        # Transcribe
+        result_q.put(('status', True))
+        try:
+            import numpy as np
+            audio_np = np.frombuffer(audio_data, dtype=np.float32)
+            segments, _ = model.transcribe(
+                audio_np,
+                language=lang_code if lang_code != 'auto' else None,
+                task='translate' if translate else 'transcribe',
+                vad_filter=use_vad,
+                initial_prompt=prompt or None,
+            )
+            text = ' '.join(s.text.strip() for s in segments).strip()
+            result_q.put(('text', text, src))
+        except Exception as e:
+            _log(f"Transcription error: {e}\n{traceback.format_exc()}")
+        result_q.put(('status', False))
+
+
+
+
 import json
 import time
 import threading
@@ -15,7 +547,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Application version
-__version__ = "2.0.3"
+__version__ = "2.0.6"
 APP_NAME = "WhisperR"
 
 # --- 1. GLOBAL CRASH LOGGING ---
@@ -45,24 +577,36 @@ os.environ["QT_PA_PLATFORM"] = "windows:dpiawareness=0"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["PYTORCH_NVFUSER_DISABLE"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+# Force ctranslate2 to use GENERIC CPU ISA (no AVX/AVX2 dispatch) in worker subprocess.
+# AVX-dispatched code can crash in a freshly-spawned frozen subprocess on some Windows
+# configs. This is inherited by the child via child_env = os.environ.copy().
+os.environ.setdefault("CT2_FORCE_CPU_ISA", "GENERIC")
+
+import multiprocessing
+import multiprocessing.connection
 
 # Additional fix: Disable torch multiprocessing which uses shared memory
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
-# Prevent torch from trying to load shared memory module
+# Prevent torch from loading its C extensions (shm.dll, _C.pyd etc.) in the
+# parent process before the UI is up.  The worker subprocess has its own more
+# complete stub; here we only need to suppress shm.dll in the frozen parent.
 if getattr(sys, 'frozen', False):
-    # In frozen mode, prevent torch.multiprocessing from loading
     import warnings
     warnings.filterwarnings('ignore')
-    
-    # Monkey-patch sys.modules to prevent shm.dll loading
+
     class DummySHM:
-        """Dummy module to replace torch shared memory"""
-        def __getattr__(self, name):
-            return lambda *args, **kwargs: None
-    
-    # Pre-load to prevent torch from importing it
+        """Robust stub for torch.multiprocessing — handles calls, iteration, etc."""
+        def __call__(self, *a, **k):  return DummySHM()
+        def __iter__(self):           return iter([])
+        def __len__(self):            return 0
+        def __bool__(self):           return False
+        def __getitem__(self, k):     return DummySHM()
+        def __enter__(self):          return self
+        def __exit__(self, *a):       return False
+        def __getattr__(self, name):  return DummySHM()
+
     sys.modules['torch.multiprocessing'] = DummySHM()
     sys.modules['torch.multiprocessing.reductions'] = DummySHM()
 
@@ -98,8 +642,8 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QDialog, QMessageBox,
     QSystemTrayIcon, QMenu
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QPoint, QObject
-from PyQt6.QtGui import QPainter, QColor, QFont, QIcon, QAction, QKeyEvent
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QPoint, QObject, QEvent
+from PyQt6.QtGui import QPainter, QColor, QFont, QIcon, QAction, QKeyEvent, QPixmap, QPen
 
 # --- 3. CONSTANTS ---
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
@@ -122,6 +666,13 @@ QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit { background-color: #2a2a2a; bord
 """
 
 # --- 4. LOGGING SETUP ---
+class _FlushingFileHandler(logging.FileHandler):
+    """FileHandler that flushes to disk after every record.
+    This ensures log lines are never lost if the process hard-crashes (C++ level)."""
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
 class AppLogger:
     def __init__(self):
         self.log_path = os.path.join(BASE_DIR, "app_log.txt")
@@ -129,8 +680,8 @@ class AppLogger:
         self.logger = logging.getLogger(APP_NAME)
         self.logger.setLevel(logging.DEBUG)
         
-        # File handler
-        fh = logging.FileHandler(self.log_path, mode='w', encoding='utf-8')
+        # File handler — flushes after every line so hard C++ crashes don't eat logs
+        fh = _FlushingFileHandler(self.log_path, mode='w', encoding='utf-8')
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
         self.logger.addHandler(fh)
@@ -146,10 +697,17 @@ class AppLogger:
         self.level = levels.get(level_name, logging.INFO)
         self.logger.setLevel(self.level)
     
-    def debug(self, msg): self.logger.debug(msg)
-    def info(self, msg): self.logger.info(msg)
-    def warning(self, msg): self.logger.warning(msg)
-    def error(self, msg): self.logger.error(msg)
+    def debug(self, msg, exc_info=False): 
+        self.logger.debug(msg, exc_info=exc_info)
+    
+    def info(self, msg, exc_info=False): 
+        self.logger.info(msg, exc_info=exc_info)
+    
+    def warning(self, msg, exc_info=False): 
+        self.logger.warning(msg, exc_info=exc_info)
+    
+    def error(self, msg, exc_info=False): 
+        self.logger.error(msg, exc_info=exc_info)
 
 app_logger = AppLogger()
 
@@ -163,14 +721,14 @@ class AppConfig:
             "audio_folder": str(Path.home() / "WhisperR_Recordings"),
             "mon_folder": str(Path.home() / "WhisperR_Watch"),
             "clear_exit": False, "save_to_disk": False, "auto_space": True,
-            "min_to_tray": False, "input_device_name": "", "paste_delay": 0.5, 
+            "min_to_tray": False, "input_device_name": "", "input_device_index": None, "paste_delay": 0.5, 
             "hotkey": "ctrl+alt+r", "ptt_key": "f8", 
             "visibility_hotkey": "ctrl+shift+w", "live_mode": "Simple", 
             "dict_mode": "Continuous", "auto_pause_sec": 1.5, "noise_floor": 200, 
             "speech_vol": 1500, "commands": {"Launch Notepad": "notepad.exe"},
             "ind_show": True, "ind_type": "Both", "ind_pos": "Top-Right", 
             "ind_size": 32, "ind_off": 20, "bar_edge": "Top", "bar_size": 5,
-            "bar_thickness": 5, "ind_opacity": 255, "bar_opacity": 255,
+            "bar_thickness": 5, "ind_opacity": 255, "bar_opacity": 255, "ind_hide_idle": True,
             "log_level": "INFO", "use_vad": False
         }
         self.load()
@@ -185,8 +743,52 @@ class AppConfig:
                 app_logger.info("Configuration loaded successfully")
             except Exception as e:
                 app_logger.error(f"Failed to load config: {e}")
-        for k in ["audio_folder", "mon_folder"]: 
-            Path(self.settings[k]).mkdir(parents=True, exist_ok=True)
+                app_logger.warning("Using default configuration")
+        
+        # Validate and fix paths
+        for k in ["audio_folder", "mon_folder"]:
+            path_str = self.settings[k]
+            
+            # Check for invalid characters like \x01
+            try:
+                # Try to create Path - this will fail if path is invalid
+                test_path = Path(path_str)
+                
+                # Check if path contains invalid characters
+                if '\x00' in str(test_path) or '\x01' in str(test_path):
+                    raise ValueError(f"Invalid characters in path: {path_str}")
+                
+                # Try to resolve - catches things like invalid drive letters
+                if not test_path.is_absolute():
+                    raise ValueError(f"Path is not absolute: {path_str}")
+                
+                # Try to create the directory
+                test_path.mkdir(parents=True, exist_ok=True)
+                app_logger.debug(f"Path validated: {k} = {path_str}")
+                
+            except Exception as e:
+                # Path is corrupted or invalid - reset to default
+                app_logger.error(f"Invalid path for {k}: {path_str} - Error: {e}")
+                
+                if k == "audio_folder":
+                    default_path = str(Path.home() / "WhisperR_Recordings")
+                else:
+                    default_path = str(Path.home() / "WhisperR_Watch")
+                
+                app_logger.warning(f"Resetting {k} to default: {default_path}")
+                self.settings[k] = default_path
+                
+                # Try to create default path
+                try:
+                    Path(default_path).mkdir(parents=True, exist_ok=True)
+                except Exception as e2:
+                    app_logger.error(f"Failed to create default path: {e2}")
+                    # Last resort - use temp directory
+                    import tempfile
+                    temp_path = os.path.join(tempfile.gettempdir(), f"WhisperR_{k}")
+                    self.settings[k] = temp_path
+                    Path(temp_path).mkdir(parents=True, exist_ok=True)
+                    app_logger.warning(f"Using temp path: {temp_path}")
 
     def save(self):
         try:
@@ -229,6 +831,16 @@ class AppConfig:
             raise Exception(f"Failed to save settings: {e}")
 
 # --- 6. WORKERS ---
+# ─────────────────────────────────────────────────────────────────
+# AI WORKER — runs in a completely separate process
+# This is the ONLY way to prevent CTranslate2 (ctranslate2 C++ engine)
+# from hard-crashing the entire app when it does AVX2/CUDA initialisation
+# inside a PyInstaller frozen app.  If the worker process crashes, it
+# crashes alone; the UI process survives and can restart it.
+# ─────────────────────────────────────────────────────────────────
+
+# (AI worker function _ai_worker_process is defined at the top of this file)
+
 class CalibrationWorker(QThread):
     progress = pyqtSignal(int)
     status_msg = pyqtSignal(str)
@@ -335,129 +947,251 @@ class CalibrationWorker(QThread):
             p.terminate()
 
 class TranscriberWorker(QThread):
-    finished_text = pyqtSignal(str, str)
+    """Manages a child AI-worker process via multiprocessing.Process.
+
+    The child process owns faster-whisper + ctranslate2. If it crashes,
+    this thread detects it and can restart it. IPC via multiprocessing.Queue.
+    """
+    finished_text  = pyqtSignal(str, str)
     status_changed = pyqtSignal(bool)
-    log_msg = pyqtSignal(str)
-    
-    def __init__(self, config): 
+    log_msg        = pyqtSignal(str)
+
+    def __init__(self, config):
         super().__init__()
-        self.config = config
-        self.queue = queue.Queue()
+        self.config  = config
         self.running = True
-        self.model = None
-        self.current_model_name = None
-        self.current_language = None
+        self._proc   = None
+        self._task_q   = None
+        self._result_q = None
+        self._log_q    = None
+        self._pending     = queue.Queue()
+        self._cuda_failed  = False
+        self._crash_count  = 0
         app_logger.info("Transcriber worker initialized")
-    
+
+    # ── public API ────────────────────────────────────────────────
+
+    def preload_model(self):
+        """Ask the worker to pre-warm the model (runs before first recording)."""
+        cfg = self.config.settings
+        compute = 'cpu' if self._cuda_failed else cfg.get('compute_pref', 'auto')
+        task = (
+            cfg['model'], cfg['lang_code'], compute,
+            None, None,           # audio_data=None, src=None → preload sentinel
+            False, False, '',     # translate, use_vad, prompt
+        )
+        app_logger.info(f"TranscriberWorker.preload_model: queuing preload for model={cfg['model']} compute={compute}")
+        self._pending.put(task)
+
     def reload_model(self):
-        """Force model reload (e.g., when language changes)"""
-        app_logger.info("Model reload requested")
-        self.model = None
-        self.current_model_name = None
-        self.current_language = None
-    
-    def run(self):
+        """Force model reload (kills and restarts the worker process)."""
+        app_logger.info("Model reload requested — restarting worker")
+        self._stop_worker()
+        self._start_worker()
+
+    def submit(self, audio_data, src):
+        """Queue audio data for transcription."""
+        cfg = self.config.settings
+        compute = 'cpu' if self._cuda_failed else cfg.get('compute_pref', 'auto')
+        task = (
+            cfg['model'], cfg['lang_code'], compute,
+            audio_data, src,
+            cfg.get('translate', False),
+            cfg.get('use_vad', False),
+            cfg.get('initial_prompt', ''),
+        )
+        self._pending.put(task)
+
+    # ── subprocess lifecycle ───────────────────────────────────────
+
+    def _start_worker(self):
+        """Spawn (or re-spawn) the AI worker as a multiprocessing.Process.
+
+        Uses multiprocessing.Process so PyInstaller's freeze_support() hooks
+        handle the frozen-binary re-execution correctly — torch.__spec__ and
+        all import machinery are intact in the child, unlike subprocess.Popen.
+
+        IPC uses three multiprocessing.Queue objects (task, result, log).
+        """
         try:
-            # Import in thread to avoid main thread DLL issues
-            from faster_whisper import WhisperModel
-            app_logger.info("faster_whisper imported successfully")
+            ctx = multiprocessing.get_context('spawn')
+            self._task_q   = ctx.Queue()
+            self._result_q = ctx.Queue()
+            self._log_q    = ctx.Queue()
+
+            self._proc = ctx.Process(
+                target=_ai_worker_process,
+                args=(self._task_q, self._result_q, self._log_q),
+                daemon=True,
+                name='WhisperR-AI-Worker',
+            )
+            self._proc.start()
+            app_logger.info(f"AI worker process started (pid={self._proc.pid})")
         except Exception as e:
-            err_msg = f"AI Import Error: {e}"
-            app_logger.error(err_msg)
-            self.log_msg.emit(err_msg)
+            app_logger.error(f"Failed to start AI worker: {e}", exc_info=True)
+            self._proc = None
+
+    def _stop_worker(self):
+        """Gracefully stop the worker process."""
+        proc = self._proc
+        self._proc = None
+        if proc is None:
             return
-        
-        while self.running:
-            try:
-                task = self.queue.get(timeout=1)
-                audio_data, src = task
-                app_logger.debug(f"Processing audio from source: {src}")
-                
-                model_name = self.config.settings['model']
-                lang_code = self.config.settings["lang_code"]
-                
-                # Check if model needs to be reloaded (model or language changed)
-                if not self.model or self.current_model_name != model_name or self.current_language != lang_code:
-                    if self.model:
-                        app_logger.info(f"Model/language changed, reloading...")
-                    
-                    self.log_msg.emit(f"Loading {model_name} for {self.config.settings['lang_name']}...")
-                    app_logger.info(f"Loading Whisper model: {model_name}, language: {lang_code}")
-                    
-                    try:
-                        # Try CUDA first
-                        self.model = WhisperModel(
-                            model_name, 
-                            device="cuda", 
-                            compute_type="float16",
-                            download_root=None,
-                            local_files_only=False
-                        )
-                        self.current_model_name = model_name
-                        self.current_language = lang_code
-                        app_logger.info("Model loaded successfully on GPU")
-                        self.log_msg.emit("✓ GPU acceleration active")
-                    except Exception as e:
-                        app_logger.warning(f"GPU loading failed: {e}. Trying CPU...")
-                        self.log_msg.emit(f"GPU unavailable. Using CPU...")
-                        try:
-                            self.model = WhisperModel(
-                                model_name, 
-                                device="cpu", 
-                                compute_type="int8",
-                                download_root=None,
-                                local_files_only=False
-                            )
-                            self.current_model_name = model_name
-                            self.current_language = lang_code
-                            app_logger.info("Model loaded successfully on CPU")
-                            self.log_msg.emit("✓ CPU mode active (slower but stable)")
-                        except Exception as e2:
-                            app_logger.error(f"CPU loading also failed: {e2}")
-                            self.log_msg.emit(f"Model loading failed: {e2}")
-                            self.queue.task_done()
-                            continue
-                
-                self.status_changed.emit(True)
-                
-                task_type = "translate" if self.config.settings["translate"] else "transcribe"
-                use_vad = self.config.settings.get("use_vad", False)
-                
-                app_logger.debug(f"Transcribing: lang={lang_code}, task={task_type}, VAD={use_vad}")
-                
+        try:
+            if proc.is_alive():
                 try:
-                    segs, _ = self.model.transcribe(
-                        audio_data, 
-                        language=lang_code, 
-                        vad_filter=use_vad,  # Use config setting
-                        initial_prompt=self.config.settings["initial_prompt"],
-                        task=task_type
-                    )
-                except Exception as e:
-                    app_logger.error(f"Transcription error: {e}")
-                    self.log_msg.emit(f"Transcription error: {e}")
-                    self.status_changed.emit(False)
-                    self.queue.task_done()
-                    continue
-                
-                text = " ".join([s.text.strip() for s in segs if s.no_speech_prob < 0.8]).strip()
-                
-                if text and text.lower() not in HALLUCINATIONS:
-                    app_logger.info(f"Transcription completed: '{text[:50]}...'")
-                    self.finished_text.emit(text, src)
-                else:
-                    app_logger.debug("No valid speech detected or hallucination filtered")
-                
-                self.status_changed.emit(False)
-                self.queue.task_done()
-                
+                    self._task_q.put('__STOP__')
+                except Exception:
+                    pass
+                proc.join(timeout=3)
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=1)
+        except Exception as e:
+            app_logger.warning(f"_stop_worker: {e}")
+        # Close queues
+        for q in (self._task_q, self._result_q, self._log_q):
+            try:
+                if q is not None:
+                    q.close()
+                    q.join_thread()
+            except Exception:
+                pass
+        self._task_q = self._result_q = self._log_q = None
+
+    def _worker_alive(self):
+        return self._proc is not None and self._proc.is_alive()
+
+    def _drain_log(self):
+        """Read any pending log messages from the worker and emit them."""
+        try:
+            while self._log_q and not self._log_q.empty():
+                msg = self._log_q.get_nowait()
+                app_logger.info(f"[worker] {msg}")
+                self.log_msg.emit(msg)
+        except Exception:
+            pass
+
+    # ── main thread loop ──────────────────────────────────────────
+
+    def run(self):
+        app_logger.info("TranscriberWorker.run: thread started")
+        self._start_worker()
+
+        while self.running:
+            # Drain log messages
+            self._drain_log()
+
+            # Check for a pending task
+            try:
+                task = self._pending.get(timeout=0.2)
             except queue.Empty:
                 continue
+
+            # Restart dead worker
+            if not self._worker_alive():
+                app_logger.warning("AI worker died — restarting...")
+                self.log_msg.emit("⚠ AI worker restarted (crashed?)")
+                self._start_worker()
+                if not self._worker_alive():
+                    app_logger.error("Could not restart AI worker")
+                    self.log_msg.emit("AI worker failed to restart — check logs")
+                    continue
+
+            # Send task to worker
+            try:
+                self._task_q.put(task)
             except Exception as e:
-                err_msg = f"AI Error: {e}"
-                app_logger.error(err_msg)
-                self.log_msg.emit(err_msg)
+                app_logger.error(f"Failed to send task to worker: {e}")
+                continue
+
+            # Read results until we get the final status=False.
+            # We poll in 1s increments so we can:
+            #   • drain log messages continuously (worker progress visible)
+            #   • detect a dead process quickly
+            #   • apply a short timeout only for active transcription,
+            #     but allow unlimited time for model loading
+            worker_crashed = False
+            transcription_started = False  # True after status=True received
+            idle_secs = 0                  # seconds with no message and worker alive
+            TRANSCRIPTION_TIMEOUT = 120    # seconds — applies only after status=True
+
+            while True:
+                self._drain_log()
+
+                # Dead process check
+                if not self._worker_alive():
+                    if self._result_q.empty():
+                        ec = getattr(self._proc, "exitcode", "?")
+                        app_logger.warning(f"Worker died mid-task (exitcode={ec})")
+                        worker_crashed = True
+                        break
+                    # else: process exited cleanly, drain remaining results
+
+                try:
+                    msg = self._result_q.get(timeout=1.0)
+                    idle_secs = 0  # got a message — reset idle counter
+                except Exception:
+                    # No message this second
+                    if not self._worker_alive():
+                        ec = getattr(self._proc, "exitcode", "?")
+                        app_logger.warning(f"Worker died mid-task (exitcode={ec})")
+                        worker_crashed = True
+                        break
+                    idle_secs += 1
+                    # Only enforce a timeout after transcription has started
+                    if transcription_started and idle_secs >= TRANSCRIPTION_TIMEOUT:
+                        app_logger.warning("Transcription timeout — restarting worker")
+                        self.log_msg.emit("⚠ Transcription timeout — restarting worker")
+                        self._stop_worker()
+                        self._start_worker()
+                        worker_crashed = True
+                        break
+                    # Model loading: no timeout — just keep waiting
+                    continue
+
+                if msg[0] == 'status':
+                    if msg[1]:
+                        transcription_started = True  # model loaded, transcription running
+                    self.status_changed.emit(msg[1])
+                    if not msg[1]:
+                        self._crash_count = 0  # successful completion → reset circuit breaker
+                        break  # Final status=False means task complete
+                elif msg[0] == 'text':
+                    _, text, src = msg
+                    HALLUCINATIONS_LOCAL = set(h.lower() for h in HALLUCINATIONS) if 'HALLUCINATIONS' in dir() else set()
+                    if text and text.lower() not in HALLUCINATIONS_LOCAL:
+                        app_logger.info(f"Transcription: '{text[:50]}...'")
+                        self.finished_text.emit(text, src)
+                    else:
+                        app_logger.debug("No valid speech / hallucination filtered")
+
+            # Worker crashed mid-task: unblock the UI, circuit-break after 3 failures
+            if worker_crashed:
                 self.status_changed.emit(False)
+                app_logger.warning("Worker crashed — emitting status=False to unblock UI")
+                self._cuda_failed  = True
+                self._crash_count += 1
+                if self._crash_count >= 3:
+                    app_logger.error(f"Worker crashed {self._crash_count} times — giving up")
+                    self.log_msg.emit(
+                        "✗ AI worker crashed repeatedly. "
+                        "Transcription is unavailable. "
+                        "Check the Setup tab for GPU/CPU requirements."
+                    )
+                    while not self._pending.empty():
+                        try: self._pending.get_nowait()
+                        except: break
+                else:
+                    app_logger.info(f"Restarting worker (attempt {self._crash_count}/3, CPU fallback)...")
+                    self.log_msg.emit(f"⚠ AI worker crashed — retrying on CPU (attempt {self._crash_count}/3)")
+                    self._stop_worker()
+                    self._start_worker()
+
+        # Cleanup
+        self._stop_worker()
+        app_logger.info("TranscriberWorker.run: exiting")
+
 
 class AudioRecorder(QThread):
     data_ready = pyqtSignal(object)
@@ -472,150 +1206,212 @@ class AudioRecorder(QThread):
         app_logger.info("Audio recorder initialized")
     
     def run(self):
+        app_logger.info("AudioRecorder.run: starting")
+        app_logger.info(f"AudioRecorder.run: frozen={getattr(sys, 'frozen', False)}")
+
+        # Reinitialize PyAudio fresh in the recording thread (same pattern as the
+        # working version which called sd._terminate()/_initialize() before each session).
+        # In frozen mode the initial PyAudio instance can have stale PortAudio state.
         p = pyaudio.PyAudio()
-        idx = None
-        rate = 16000
-        
-        # Find the selected device with improved matching
-        saved_device_name = self.config.settings.get("input_device_name", "")
-        app_logger.info(f"Looking for audio device: '{saved_device_name}'")
-        
         try:
+            p.terminate()
+        except Exception:
+            pass
+        p = pyaudio.PyAudio()
+        app_logger.info(f"AudioRecorder.run: PyAudio reinitialized, device_count={p.get_device_count()}")
+
+        idx = None
+
+        saved_name = self.config.settings.get("input_device_name", "")
+        saved_idx  = self.config.settings.get("input_device_index", None)
+        app_logger.info(f"AudioRecorder.run: saved_name='{saved_name}', saved_idx={saved_idx}")
+
+        # Log all input devices for diagnostics
+        for i in range(p.get_device_count()):
+            try:
+                d = p.get_device_info_by_index(i)
+                if d["maxInputChannels"] > 0:
+                    app_logger.info(f"  input device {i}: name='{d['name']}' ch={d['maxInputChannels']} rate={d['defaultSampleRate']}")
+            except Exception:
+                pass
+
+        # Determine device index from saved settings
+        idx = None
+        if saved_idx is not None:
+            try:
+                d = p.get_device_info_by_index(int(saved_idx))
+                if d["maxInputChannels"] > 0:
+                    idx = int(saved_idx)
+                    app_logger.info(f"AudioRecorder.run: using saved index {idx}: '{d['name']}'")
+            except Exception as e:
+                app_logger.warning(f"AudioRecorder.run: saved index {saved_idx} invalid: {e}")
+
+        if idx is None and saved_name:
             for i in range(p.get_device_count()):
                 try:
-                    dev = p.get_device_info_by_index(i)
-                    
-                    # Skip output-only devices
-                    if dev["maxInputChannels"] <= 0:
+                    d = p.get_device_info_by_index(i)
+                    if d["maxInputChannels"] <= 0:
                         continue
-                    
-                    # Build full device name
-                    try:
-                        host_api = p.get_host_api_info_by_index(dev["hostApi"])["name"]
-                        full_name = f"{dev['name']} ({host_api})"
-                    except:
-                        full_name = dev['name']
-                    
-                    # Match against saved device (exact or partial)
-                    if saved_device_name:
-                        if saved_device_name == full_name or dev['name'] in saved_device_name:
-                            idx = i
-                            rate = int(dev['defaultSampleRate'])
-                            app_logger.info(f"Matched device {i}: {full_name} at {rate}Hz")
-                            break
-                            
-                except Exception as e:
-                    app_logger.debug(f"Error checking device {i}: {e}")
+                    if saved_name == d["name"] or d["name"] in saved_name or saved_name in d["name"]:
+                        idx = i
+                        app_logger.info(f"AudioRecorder.run: name-matched device {idx}: '{d['name']}'")
+                        break
+                except Exception:
                     continue
-            
-            # If no match found, use default input device
-            if idx is None:
-                try:
-                    default_input = p.get_default_input_device_info()
-                    idx = default_input['index']
-                    rate = int(default_input['defaultSampleRate'])
-                    app_logger.warning(f"No saved device found, using default: {default_input['name']} at {rate}Hz")
-                except Exception as e:
-                    app_logger.error(f"Failed to get default device: {e}")
-                    # Last resort: try device 0
-                    idx = 0
-                    rate = 16000
-        
-        except Exception as e:
-            app_logger.error(f"Device enumeration error: {e}")
-            idx = 0
-            rate = 16000
-        
-        # Open audio stream with comprehensive error handling
-        stream = None
-        try:
-            app_logger.info(f"Opening audio stream: device={idx}, rate={rate}Hz")
-            stream = p.open(
-                format=pyaudio.paInt16, 
-                channels=1, 
-                rate=rate, 
-                input=True, 
-                input_device_index=idx, 
-                frames_per_buffer=2048
-            )
-            app_logger.info("Audio stream opened successfully")
-            
-        except Exception as e:
-            app_logger.error(f"Failed to open selected device {idx}: {e}")
-            
-            # Try default device as fallback
+
+        if idx is None:
             try:
-                app_logger.info("Attempting to open default audio device...")
-                stream = p.open(
-                    format=pyaudio.paInt16, 
-                    channels=1, 
-                    rate=16000, 
-                    input=True,
-                    frames_per_buffer=2048
-                )
-                rate = 16000
-                app_logger.info("Opened default audio device at 16000Hz")
-                
-            except Exception as e2:
-                app_logger.error(f"Failed to open default device: {e2}")
-                self.speech_active.emit(False)
-                p.terminate()
-                return
-        
+                default = p.get_default_input_device_info()
+                idx = int(default["index"])
+                app_logger.warning(f"AudioRecorder.run: using system default {idx}: '{default['name']}'")
+            except Exception:
+                idx = 0
+
+        # Read the device's native sample rate AND channel count.
+        # WASAPI shared mode requires matching the device's native format exactly —
+        # opening with channels=1 on a stereo device succeeds but returns zeroed buffers.
+        capture_rate = 16000  # fallback
+        capture_channels = 1  # fallback
+        if idx is not None:
+            try:
+                dev_info = p.get_device_info_by_index(idx)
+                capture_rate = int(dev_info["defaultSampleRate"])
+                if capture_rate <= 0:
+                    capture_rate = 44100
+                capture_channels = max(1, int(dev_info.get("maxInputChannels", 1)))
+            except Exception:
+                capture_rate = 44100
+                capture_channels = 1
+        app_logger.info(f"AudioRecorder.run: device idx={idx}, native rate={capture_rate}, channels={capture_channels}")
+
+        # Open stream — use native rate + native channels, fall back gracefully.
+        # We downmix to mono in dispatch() after reading, so Whisper always gets mono.
+        stream = None
+        actual_rate     = capture_rate
+        actual_channels = capture_channels
+        for attempt_idx, label in [(idx, "selected"), (None, "system default"), (0, "device 0")]:
+            for try_rate in ([capture_rate] if attempt_idx == idx else [capture_rate, 44100, 48000]):
+                for try_ch in ([capture_channels, 1] if capture_channels > 1 else [1]):
+                    try:
+                        kwargs = dict(format=pyaudio.paInt16, channels=try_ch, rate=try_rate,
+                                      input=True, frames_per_buffer=2048)
+                        if attempt_idx is not None:
+                            kwargs["input_device_index"] = attempt_idx
+                        app_logger.info(f"AudioRecorder.run: opening stream ({label} @ {try_rate}Hz ch={try_ch}): {kwargs}")
+                        stream = p.open(**kwargs)
+                        actual_rate     = try_rate
+                        actual_channels = try_ch
+                        if attempt_idx is not None:
+                            idx = attempt_idx
+                        app_logger.info(f"AudioRecorder.run: stream opened OK ({label} @ {actual_rate}Hz ch={actual_channels})")
+                        break
+                    except Exception as e:
+                        app_logger.warning(f"AudioRecorder.run: stream open failed ({label} @ {try_rate}Hz ch={try_ch}): {e}")
+                if stream is not None:
+                    break
+            if stream is not None:
+                break
+
+        # Use actual_rate / actual_channels everywhere instead of hardcoded constants
+        FIXED_RATE     = actual_rate
+        FIXED_CHANNELS = actual_channels
+
         if stream is None:
-            app_logger.error("No audio stream available, recorder cannot start")
+            app_logger.error("AudioRecorder.run: all stream attempts failed, aborting")
             p.terminate()
             return
-        
+
+        # Test read before main loop
+        try:
+            test_data = stream.read(1024, exception_on_overflow=False)
+            test_rms = int(np.sqrt(np.mean(np.frombuffer(test_data, dtype=np.int16).astype(np.float64)**2)))
+            app_logger.info(f"AudioRecorder.run: test read OK, RMS={test_rms}")
+        except Exception as e:
+            app_logger.error(f"AudioRecorder.run: test read failed: {e} — aborting")
+            try:
+                stream.stop_stream(); stream.close()
+            except Exception:
+                pass
+            p.terminate()
+            return
+
         frames = []
         last_speech = time.time()
         threshold = (self.config.settings["noise_floor"] + self.config.settings["speech_vol"]) / 2
-        app_logger.info(f"Recording started with threshold: {threshold}")
-        
+        app_logger.info(f"AudioRecorder.run: loop starting, threshold={threshold:.1f}")
+
         self.active = True
-        
+        _last_rms_log   = time.time()
+        _speech_state   = False
+        _last_state_chg = 0.0
+        _DEBOUNCE_SEC   = 0.3
+
         while self.active:
             if self.config.settings["live_mode"] == "Push-To-Talk" and not self.ptt_pressed:
                 time.sleep(0.05)
                 continue
-            
+
             try:
                 data = stream.read(1024, exception_on_overflow=False)
-                rms = int(np.sqrt(np.mean(np.frombuffer(data, dtype=np.int16).astype(np.float64)**2)))
+                raw  = np.frombuffer(data, dtype=np.int16).astype(np.float64)
+                # Downmix to mono for RMS measurement (handles stereo WASAPI devices)
+                if FIXED_CHANNELS > 1:
+                    raw = raw.reshape(-1, FIXED_CHANNELS).mean(axis=1)
+                rms  = int(np.sqrt(np.mean(raw**2)))
                 self.volume_out.emit(rms)
-                
-                if rms > threshold:
-                    if not frames:
-                        self.speech_active.emit(True)
-                        app_logger.debug("Speech detected")
+
+                now = time.time()
+                if now - _last_rms_log > 2.0:
+                    app_logger.debug(f"AudioRecorder: RMS={rms}, thr={threshold:.1f}, frames={len(frames)}, speech={_speech_state}")
+                    _last_rms_log = now
+
+                is_speech = rms > threshold
+                if is_speech != _speech_state and (now - _last_state_chg) >= _DEBOUNCE_SEC:
+                    _speech_state   = is_speech
+                    _last_state_chg = now
+                    app_logger.debug(f"AudioRecorder: speech_active -> {is_speech} (RMS={rms})")
+                    self.speech_active.emit(is_speech)
+
+                if is_speech:
                     frames.append(data)
-                    last_speech = time.time()
+                    last_speech = now
                 elif frames:
                     frames.append(data)
-                
-                if self.config.settings["dict_mode"] == "Auto-Pause" and (time.time() - last_speech) > self.config.settings["auto_pause_sec"]:
-                    if len(frames) > 20:
-                        app_logger.debug(f"Auto-pause triggered, dispatching {len(frames)} frames")
+
+                if self.config.settings["dict_mode"] == "Auto-Pause":
+                    silence_dur = now - last_speech
+                    if silence_dur > self.config.settings["auto_pause_sec"] and len(frames) > 20:
+                        app_logger.debug(f"AudioRecorder: auto-pause dispatch, {len(frames)} frames")
                         self.speech_active.emit(False)
-                        self.dispatch(frames, rate)
-                    frames = []
-                    last_speech = time.time()
+                        _speech_state   = False
+                        _last_state_chg = now
+                        self.dispatch(frames, FIXED_RATE, FIXED_CHANNELS)
+                        frames      = []
+                        last_speech = now
+
             except Exception as e:
-                app_logger.error(f"Audio recording error: {e}")
+                app_logger.error(f"AudioRecorder: read error: {e}", exc_info=True)
                 break
-        
+
         if len(frames) > 20:
-            self.dispatch(frames, rate)
-        
+            self.dispatch(frames, FIXED_RATE, FIXED_CHANNELS)
+
         self.speech_active.emit(False)
-        stream.stop_stream()
-        stream.close()
+        try:
+            stream.stop_stream()
+            stream.close()
+        except Exception:
+            pass
         p.terminate()
-        app_logger.info("Audio recording stopped")
+        app_logger.info("AudioRecorder.run: finished")
+
     
-    def dispatch(self, frames, rate):
+    def dispatch(self, frames, rate, channels=1):
         raw_np = np.frombuffer(b''.join(frames), dtype=np.int16).astype(np.float32) / 32768.0
-        
+        # Downmix multi-channel (e.g. stereo WASAPI) to mono before resampling
+        if channels > 1:
+            raw_np = raw_np.reshape(-1, channels).mean(axis=1).astype(np.float32)
+
         if rate != 16000:
             audio_16k = np.interp(
                 np.linspace(0, 1, int(len(raw_np)*16000/rate)), 
@@ -774,79 +1570,165 @@ class WhisperRApp(QMainWindow):
             app_logger.debug("Initializing configuration...")
             self.config = AppConfig()
             self.recorder = None
-            
-            app_logger.debug("Initializing transcriber worker...")
+
+            # Build UI FIRST so self.scratchpad exists before any worker thread
+            # can emit log_msg and try to write to it.
+            app_logger.debug("→ Building UI (setup_ui)...")
+            self.setup_ui()
+            app_logger.debug("✓ setup_ui() complete")
+
+            app_logger.debug("→ Creating TranscriberWorker...")
             self.transcriber = TranscriberWorker(self.config)
+            app_logger.debug("✓ TranscriberWorker created, connecting signals...")
             self.transcriber.finished_text.connect(self.on_text)
             self.transcriber.status_changed.connect(self.on_trans_status)
-            self.transcriber.log_msg.connect(lambda m: self.scratchpad.append(f"[System] {m}"))
+            self.transcriber.log_msg.connect(self._on_transcriber_log)
+            app_logger.debug("→ Starting TranscriberWorker thread...")
             self.transcriber.start()
+            app_logger.debug("✓ TranscriberWorker thread started")
             
-            app_logger.debug("Initializing status overlay...")
+            app_logger.debug("→ Creating StatusOverlay...")
             self.indicator = StatusOverlay(self.config)
+            app_logger.debug("✓ StatusOverlay created")
             
+            app_logger.debug("→ Connecting app-level signals...")
             self.sig_toggle_vis.connect(self.toggle_visibility_safe)
             self.sig_toggle_rec.connect(self.toggle_rec)
+            app_logger.debug("✓ App-level signals connected")
             
-            # Set window and tray icon
             app_logger.debug("Setting up icons...")
             icon_path = os.path.join(BASE_DIR, "icon.png")
+            app_logger.debug(f"  __init__: Looking for icon at: {icon_path}")
+            app_logger.debug(f"  __init__: icon.png exists: {os.path.exists(icon_path)}")
             if os.path.exists(icon_path):
+                app_logger.debug(f"  __init__: Loading QIcon from file...")
                 app_icon = QIcon(icon_path)
+                app_logger.debug(f"  __init__: QIcon loaded, isNull={app_icon.isNull()}")
                 self.setWindowIcon(app_icon)
                 app_logger.info(f"Loaded icon from: {icon_path}")
             else:
+                app_logger.debug("  __init__: icon.png not found, using theme icon 'audio-input-microphone'")
                 app_icon = QIcon.fromTheme("audio-input-microphone")
-                app_logger.debug("Using default theme icon (icon.png not found)")
+                app_logger.debug(f"  __init__: Theme icon loaded, isNull={app_icon.isNull()}")
             
-            app_logger.debug("Initializing system tray...")
+            app_logger.debug("  __init__: Creating QSystemTrayIcon...")
             self.tray = QSystemTrayIcon(self)
+            app_logger.debug(f"  __init__: QSystemTrayIcon created (id={id(self.tray)})")
+            app_logger.debug("  __init__: Setting tray icon...")
             self.tray.setIcon(app_icon)
+            app_logger.debug(f"  __init__: Tray icon set (isNull={self.tray.icon().isNull()})")
+            
+            app_logger.debug("  __init__: Creating tray context menu...")
             tm = QMenu()
             tm.addAction("Show/Restore", self.toggle_visibility_safe)
             tm.addAction("Quit", QApplication.instance().quit)
             self.tray.setContextMenu(tm)
+            app_logger.debug("  __init__: Tray context menu set")
+            
+            app_logger.debug("  __init__: Calling tray.show()...")
             self.tray.show()
+            app_logger.debug(f"  __init__: tray.show() called, tray.isVisible={self.tray.isVisible()}")
             
-            app_logger.debug("Building UI...")
-            self.setup_ui()
+            # Double-click or single-click tray icon → restore window
+            self.tray.activated.connect(self._on_tray_activated)
             
-            app_logger.debug("Setting up hotkeys and listeners...")
+            app_logger.debug("→ Setting up hotkeys and listeners (setup_logic)...")
             self.setup_logic()
+            app_logger.debug("✓ setup_logic() complete")
             
-            app_logger.debug("Starting folder monitor timer...")
+            app_logger.debug("→ Starting folder monitor timer...")
             self.m_timer = QTimer()
             self.m_timer.timeout.connect(self.monitor_dirs)
             self.m_timer.start(5000)
+            app_logger.debug("✓ Folder monitor timer started")
             
-            app_logger.debug("Initializing PyAudio system...")
-            self.pa_sys = pyaudio.PyAudio()
-            self.meter_stream = None
-            
-            app_logger.debug("Starting meter update timer...")
-            self.meter_timer = QTimer()
-            self.meter_timer.timeout.connect(self.update_meter)
-            self.meter_timer.start(100)
+            # No standalone pa_sys / meter_timer.
+            # The live meter is driven purely by AudioRecorder.volume_out signal
+            # (connected in toggle_rec). This avoids running a second PyAudio
+            # instance alongside AudioRecorder's, which crashes in frozen mode.
+            self.meter_stream = None  # kept for compat refs in toggle_rec cleanup
             
             app_logger.info("Application initialized successfully")
+            self._model_loading   = True
+            self._is_listening    = False
+            self._speech_active   = False
+            self._is_transcribing = False
+            app_logger.info("Queueing initial model preload...")
+            self.transcriber.preload_model()
             
         except Exception as e:
             app_logger.error(f"Critical error during initialization: {e}", exc_info=True)
+            
+            # Try to show error message to user
+            try:
+                QMessageBox.critical(
+                    None,
+                    "Initialization Error",
+                    f"WhisperR failed to start:\n\n{e}\n\nCheck app_log.txt for details."
+                )
+            except:
+                pass
+            
             raise
 
     def toggle_visibility_safe(self):
-        if self.isVisible() and self.windowState() != Qt.WindowState.WindowMinimized:
-            if self.config.settings["min_to_tray"]:
-                self.hide()
-                app_logger.debug("Window hidden to tray")
-            else:
-                self.setWindowState(Qt.WindowState.WindowMinimized)
+        # Read from the live checkbox so unsaved changes are respected.
+        if hasattr(self, 'cfg_tray'):
+            min_to_tray = self.cfg_tray.isChecked()
         else:
-            self.show()
-            self.setWindowState(Qt.WindowState.WindowNoState)
-            self.raise_()
+            min_to_tray = self.config.settings.get("min_to_tray", False)
+        app_logger.debug(f"toggle_visibility_safe: isHidden={self.isHidden()}, isMinimized={self.isMinimized()}, min_to_tray={min_to_tray}")
+        if self.isHidden() or self.isMinimized():
+            self.showNormal()
             self.activateWindow()
-            app_logger.debug("Window restored")
+            self.raise_()
+            app_logger.debug("toggle_visibility_safe: window restored")
+        else:
+            if min_to_tray:
+                self.hide()
+                app_logger.debug("toggle_visibility_safe: window hidden to tray")
+            else:
+                self.showMinimized()
+                app_logger.debug("toggle_visibility_safe: window minimized to taskbar")
+
+    def _on_tray_activated(self, reason):
+        # Restore on double-click or single-click (Trigger)
+        if reason in (QSystemTrayIcon.ActivationReason.DoubleClick,
+                      QSystemTrayIcon.ActivationReason.Trigger):
+            app_logger.debug(f"_on_tray_activated: reason={reason}, restoring window")
+            self.showNormal()
+            self.activateWindow()
+            self.raise_()
+    
+    def showEvent(self, event):
+        """Override showEvent to log when window is shown"""
+        app_logger.debug("→ showEvent: Window about to be shown")
+        try:
+            super().showEvent(event)
+            app_logger.debug("✓ showEvent: Window shown successfully")
+        except Exception as e:
+            app_logger.error(f"✗ showEvent crashed: {e}", exc_info=True)
+            raise
+    
+    def paintEvent(self, event):
+        """Override paintEvent to log painting"""
+        app_logger.debug("→ paintEvent: Window painting")
+        try:
+            super().paintEvent(event)
+            app_logger.debug("✓ paintEvent: Painting complete")
+        except Exception as e:
+            app_logger.error(f"✗ paintEvent crashed: {e}", exc_info=True)
+            raise
+    
+    def resizeEvent(self, event):
+        """Override resizeEvent to log resizing"""
+        app_logger.debug(f"→ resizeEvent: Resizing to {event.size().width()}x{event.size().height()}")
+        try:
+            super().resizeEvent(event)
+            app_logger.debug("✓ resizeEvent: Resize complete")
+        except Exception as e:
+            app_logger.error(f"✗ resizeEvent crashed: {e}", exc_info=True)
+            raise
 
     def setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v{__version__}")
@@ -873,6 +1755,18 @@ class WhisperRApp(QMainWindow):
         self.scratchpad.setFont(QFont("Consolas", 9))
         l1.addWidget(self.scratchpad)  # No max height - takes all available space
         
+        # ── App state indicator ──────────────────────────────────────
+        # A simple coloured dot + label embedded in the main window.
+        # Zero floating-window complexity — works perfectly in frozen mode.
+        self.app_state_label = QLabel("● Idle")
+        self.app_state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.app_state_label.setFixedHeight(26)
+        self.app_state_label.setStyleSheet(
+            "color: #888888; font-size: 13px; font-weight: bold; "
+            "background: #1e1e1e; border-radius: 4px; padding: 2px 8px;"
+        )
+        l1.addWidget(self.app_state_label)
+
         hb = QHBoxLayout()
         self.btn_toggle = QPushButton("Start Dictation")
         self.btn_toggle.setFixedHeight(40)
@@ -953,6 +1847,7 @@ class WhisperRApp(QMainWindow):
         self.cfg_model = QComboBox()
         self.cfg_model.addItems(WHISPER_MODELS)
         self.cfg_model.setCurrentText(self.config.settings["model"])
+        self.cfg_model.currentTextChanged.connect(self._on_model_changed)
         ai_layout.addRow("Whisper Model:", self.cfg_model)
         
         self.cfg_lang = QComboBox()
@@ -1150,19 +2045,9 @@ class WhisperRApp(QMainWindow):
         self.cfg_ind_off.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         visual_layout.addRow("Corner Offset:", self.cfg_ind_off)
         
-        self.cfg_ind_opacity = QSpinBox()
-        self.cfg_ind_opacity.setRange(10, 255)
-        self.cfg_ind_opacity.setValue(self.config.settings.get("ind_opacity", 255))
-        self.cfg_ind_opacity.setToolTip("10 = nearly transparent, 255 = fully opaque")
-        self.cfg_ind_opacity.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        visual_layout.addRow("Icon Opacity:", self.cfg_ind_opacity)
-        
-        self.cfg_bar_opacity = QSpinBox()
-        self.cfg_bar_opacity.setRange(10, 255)
-        self.cfg_bar_opacity.setValue(self.config.settings.get("bar_opacity", 255))
-        self.cfg_bar_opacity.setToolTip("10 = nearly transparent, 255 = fully opaque")
-        self.cfg_bar_opacity.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        visual_layout.addRow("Bar Opacity:", self.cfg_bar_opacity)
+        self.cfg_ind_hide_idle = QCheckBox("Hide indicators when idle (dictation off)")
+        self.cfg_ind_hide_idle.setChecked(self.config.settings.get("ind_hide_idle", True))
+        visual_layout.addRow(self.cfg_ind_hide_idle)
         
         visual_group.setLayout(visual_layout)
         main_layout.addWidget(visual_group)
@@ -1178,7 +2063,7 @@ class WhisperRApp(QMainWindow):
         
         self.cfg_use_vad = QCheckBox("Use VAD (Voice Activity Detection)")
         self.cfg_use_vad.setChecked(self.config.settings.get("use_vad", False))
-        self.cfg_use_vad.setToolTip("Filters non-speech audio. Disable if you get onnxruntime errors.")
+        self.cfg_use_vad.setToolTip("Filters out non-speech segments before transcription.\nReduces hallucinations on silence. Recommended for push-to-talk.")
         advanced_layout.addRow(self.cfg_use_vad)
         
         self.btn_setup = QPushButton("GPU Acceleration Setup Guide")
@@ -1292,88 +2177,17 @@ class WhisperRApp(QMainWindow):
         p.terminate()
 
     def update_meter(self):
-        """Update live microphone meter with robust error handling"""
-        if self.recorder and self.recorder.active:
-            return
-        
-        try:
-            if not self.meter_stream:
-                idx = self.cfg_mic.currentData()
-                
-                # Check for invalid device
-                if idx is None or idx < 0:
-                    app_logger.debug("No valid device selected for meter")
-                    return
-                
-                try:
-                    device_info = self.pa_sys.get_device_info_by_index(idx)
-                    
-                    # CRITICAL: Verify device supports input AND check channel count
-                    max_input_channels = device_info.get('maxInputChannels', 0)
-                    if max_input_channels <= 0:
-                        app_logger.debug(f"Device {idx} has no input channels (output-only device)")
-                        return
-                    
-                    # Some devices report wrong channel count - use 1 channel for mono
-                    channels = 1
-                    
-                    sr = int(device_info['defaultSampleRate'])
-                    
-                    self.meter_stream = self.pa_sys.open(
-                        format=pyaudio.paInt16, 
-                        channels=channels,  # Always use mono
-                        rate=sr, 
-                        input=True, 
-                        input_device_index=idx, 
-                        frames_per_buffer=1024
-                    )
-                    app_logger.debug(f"Meter stream opened: device {idx}, rate {sr}Hz, channels={channels}")
-                    
-                except Exception as e:
-                    # Don't spam the log - only log once per device
-                    if not hasattr(self, '_last_meter_error_device') or self._last_meter_error_device != idx:
-                        app_logger.warning(f"Failed to open meter stream for device {idx}: {e}")
-                        self._last_meter_error_device = idx
-                    
-                    if self.meter_stream:
-                        try:
-                            self.meter_stream.close()
-                        except:
-                            pass
-                        self.meter_stream = None
-                    return
-            
-            # Read from stream
-            d = self.meter_stream.read(1024, exception_on_overflow=False)
-            rms = int(np.sqrt(np.mean(np.frombuffer(d, dtype=np.int16).astype(np.float64)**2)))
-            self.live_meter.setValue(rms)
-            
-        except OSError as e:
-            # Device disconnected or stream error - close and don't spam log
-            if self.meter_stream:
-                try:
-                    self.meter_stream.close()
-                except:
-                    pass
-                self.meter_stream = None
-                
-        except Exception as e:
-            # Unexpected error - log once per device
-            if not hasattr(self, '_last_meter_exception_device'):
-                app_logger.debug(f"Unexpected meter error: {e}")
-                self._last_meter_exception_device = True
-            
-            if self.meter_stream:
-                try:
-                    self.meter_stream.close()
-                except:
-                    pass
-                self.meter_stream = None
+        """Meter is now driven by AudioRecorder.volume_out signal — no-op here."""
+        pass
+
 
     def save_cfg(self):
+        # Get reference to save button before any operations
+        save_button = self.sender()
+        
         # Visual feedback - change button temporarily
-        self.sender().setEnabled(False)
-        self.sender().setText("💾 Saving...")
+        save_button.setEnabled(False)
+        save_button.setText("💾 Saving...")
         QApplication.processEvents()  # Force UI update
         
         # Collect commands from table
@@ -1397,6 +2211,7 @@ class WhisperRApp(QMainWindow):
             "clear_exit": self.cfg_clear.isChecked(),
             "save_to_disk": not self.cfg_ram.isChecked(),
             "input_device_name": self.cfg_mic.currentText(),
+            "input_device_index": self.cfg_mic.currentData(),
             "dict_mode": self.cfg_dict_m.currentText(),
             "auto_pause_sec": self.cfg_p_sec.value(),
             "paste_delay": self.cfg_p_win.value(),
@@ -1416,8 +2231,9 @@ class WhisperRApp(QMainWindow):
             "ind_size": self.cfg_ind_sz.value(),
             "ind_off": self.cfg_ind_off.value(),
             "bar_thickness": self.cfg_bar_thickness.value(),
-            "ind_opacity": self.cfg_ind_opacity.value(),
-            "bar_opacity": self.cfg_bar_opacity.value(),
+            "ind_hide_idle": self.cfg_ind_hide_idle.isChecked(),
+            "ind_opacity": 220,
+            "bar_opacity": 220,
             "timestamps": self.cfg_ts.isChecked(),
             "translate": self.cfg_trans.isChecked(),
             "log_level": self.cfg_log_level.currentText(),
@@ -1430,9 +2246,12 @@ class WhisperRApp(QMainWindow):
             self.scratchpad.append("✓ Settings saved successfully")
             
             # Visual feedback - success
-            self.sender().setText("✓ SAVED!")
-            self.sender().setStyleSheet("background-color: #27ae60; color: white; font-weight: bold;")
-            QTimer.singleShot(1500, lambda: self.reset_save_button())
+            save_button.setText("✓ SAVED!")
+            save_button.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold;")
+            save_button.setEnabled(True)
+            
+            # Reset after delay
+            QTimer.singleShot(1500, lambda: self.reset_save_button(save_button))
             
             # Restart hotkey listeners with new keys
             self.setup_logic()
@@ -1442,29 +2261,29 @@ class WhisperRApp(QMainWindow):
             self.scratchpad.append(f"✗ Failed to save settings: {e}")
             
             # Visual feedback - error
-            self.sender().setText("✗ SAVE FAILED")
-            self.sender().setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
-            QTimer.singleShot(2000, lambda: self.reset_save_button())
-        finally:
-            self.sender().setEnabled(True)
+            save_button.setText("✗ SAVE FAILED")
+            save_button.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
+            save_button.setEnabled(True)
+            
+            # Reset after delay
+            QTimer.singleShot(2000, lambda: self.reset_save_button(save_button))
     
-    def reset_save_button(self):
+    def reset_save_button(self, button):
         """Reset save button to original state"""
-        # Find the save button
-        for widget in self.findChildren(QPushButton):
-            if "SAVE" in widget.text().upper() and "SETTINGS" in widget.text().upper():
-                widget.setText("💾 SAVE ALL SETTINGS")
-                widget.setStyleSheet("background-color: #0078d7; color: white; font-weight: bold;")
-                break
+        try:
+            button.setText("💾 SAVE ALL SETTINGS")
+            button.setStyleSheet("background-color: #0078d7; color: white; font-weight: bold;")
+        except RuntimeError:
+            # Widget was deleted, ignore
+            pass
 
     def start_cal(self):
         if self.recorder and self.recorder.active:
             QMessageBox.warning(self, "Recording Active", "Stop dictation before calibrating.")
             return
         
-        if self.meter_stream:
-            self.meter_stream.close()
-            self.meter_stream = None
+        # meter_stream is always None (meter driven by volume_out signal)
+        self.meter_stream = None
         
         self.btn_cal.setEnabled(False)
         self.cal_w = CalibrationWorker(self.cfg_mic.currentData())
@@ -1495,39 +2314,68 @@ class WhisperRApp(QMainWindow):
                 self.meter_stream = None
 
     def toggle_rec(self):
+        app_logger.debug(f"→ toggle_rec: recorder={self.recorder}, recorder.active={self.recorder.active if self.recorder else 'N/A'}")
         if self.recorder and self.recorder.active:
+            app_logger.info("toggle_rec: Stopping dictation")
             self.recorder.active = False
             self.btn_toggle.setText("Start Dictation")
-            self.indicator.is_list = False
-            self.indicator.is_rec = False
+            self._is_listening  = False
+            self._speech_active = False
+            self._update_app_state()
             app_logger.info("Dictation stopped")
         else:
+            app_logger.info("toggle_rec: Starting dictation")
             if self.meter_stream:
+                app_logger.debug("toggle_rec: Closing meter stream before starting recorder")
                 self.meter_stream.close()
                 self.meter_stream = None
             
             self.recorder = AudioRecorder(self.config)
-            self.recorder.data_ready.connect(lambda d: self.transcriber.queue.put((d, "live")))
-            self.recorder.speech_active.connect(lambda a: (setattr(self.indicator, 'is_rec', a), self.indicator.update()))
+            app_logger.debug(f"toggle_rec: AudioRecorder created, id={id(self.recorder)}")
+            
+            self.recorder.data_ready.connect(lambda d: self.transcriber.submit(d, "live"))
+            app_logger.debug("toggle_rec: data_ready signal connected")
+            
+            # FIX: Debounce speech_active signal to prevent rapid mic icon flickering.
+            # The AudioRecorder emits speech_active on EVERY audio chunk that crosses the
+            # RMS threshold, which can fire 10-20x per second. Instead of directly setting
+            # is_rec, we route it through _on_speech_active which only repaints when the
+            # state actually changes, eliminating the rapid icon flicker.
+            self.recorder.speech_active.connect(self._on_speech_active)
+            app_logger.debug("toggle_rec: speech_active signal connected to debounced handler")
+            
             self.recorder.volume_out.connect(self.live_meter.setValue)
+            app_logger.debug("toggle_rec: volume_out signal connected")
+            
             self.recorder.start()
+            app_logger.debug("toggle_rec: AudioRecorder thread started")
             
             self.btn_toggle.setText("⏹ STOP DICTATION")
-            self.indicator.is_list = True
+            self._is_listening = True
+            self._update_app_state()
             app_logger.info("Dictation started")
-        
-        self.indicator.update()
+        app_logger.debug("✓ toggle_rec: Complete")
+    
+    def _on_speech_active(self, active):
+        app_logger.debug(f"→ _on_speech_active: active={active}")
+        if active != self._speech_active:
+            self._speech_active = active
+            self._update_app_state()
+        app_logger.debug("✓ _on_speech_active: Complete")
 
     def on_p(self, key):
         """Handle PTT key press - simplified for reliability"""
         try:
             key_str = self.key_to_string(key)
+            ptt_key = self.config.settings["ptt_key"]
+            is_ptt = (key_str == ptt_key)
+            app_logger.debug(f"→ on_p: key='{key_str}', ptt_key='{ptt_key}', is_ptt={is_ptt}, recorder={self.recorder is not None}, recorder.active={self.recorder.active if self.recorder else 'N/A'}")
             
             # Check if this is the PTT key
-            if key_str == self.config.settings["ptt_key"] and self.recorder:
-                # Immediate activation (prolonged hold removed - caused key leakage issues)
+            if is_ptt and self.recorder:
+                prev = self.recorder.ptt_pressed
                 self.recorder.ptt_pressed = True
-                app_logger.debug("PTT activated")
+                app_logger.debug(f"  on_p: PTT activated (was {prev} → True)")
         except Exception as e:
             app_logger.error(f"PTT press error: {e}", exc_info=True)
     
@@ -1535,14 +2383,19 @@ class WhisperRApp(QMainWindow):
         """Handle PTT key release"""
         try:
             if not self.recorder:
+                app_logger.debug("→ on_r: no recorder, ignoring")
                 return
                 
             key_str = self.key_to_string(key)
+            ptt_key = self.config.settings["ptt_key"]
+            is_ptt = (key_str == ptt_key)
+            app_logger.debug(f"→ on_r: key='{key_str}', ptt_key='{ptt_key}', is_ptt={is_ptt}")
             
             # Check if this is the PTT key being released
-            if key_str == self.config.settings["ptt_key"]:
+            if is_ptt:
+                prev = self.recorder.ptt_pressed
                 self.recorder.ptt_pressed = False
-                app_logger.debug("PTT deactivated")
+                app_logger.debug(f"  on_r: PTT deactivated (was {prev} → False)")
         except Exception as e:
             app_logger.error(f"PTT release error: {e}", exc_info=True)
     
@@ -1554,64 +2407,223 @@ class WhisperRApp(QMainWindow):
             return key.name.lower()
         return str(key).lower()
     
+    # ── State indicator helpers ──────────────────────────────────────────────
+
+    def _on_transcriber_log(self, msg: str):
+        """Route TranscriberWorker log messages to the scratchpad and update
+        the loading indicator."""
+        self.scratchpad.append(f"[System] {msg}")
+        loading_words = ("Loading ", "GPU unavailable", "loading on CPU",
+                         "Trying CPU", "Trying CUDA", "Importing")
+        done_words    = ("✓", "ready", "failed", "error", "Error", "Import error")
+        crash_restart = "restarted after crash"
+
+        if crash_restart in msg:
+            # Worker restarted after a CUDA crash — re-queue preload on CPU
+            self._model_loading = True
+            self._update_app_state()
+            self.transcriber.preload_model()
+        elif any(w in msg for w in loading_words):
+            self._model_loading = True
+            self._update_app_state()
+        elif any(w in msg for w in done_words):
+            self._model_loading = False
+            self._update_app_state()
+
+    def _on_model_changed(self, model_name: str):
+        """Called when the model dropdown selection changes.
+        Saves new selection and pre-warms the model immediately."""
+        if not hasattr(self, 'transcriber'):
+            return
+        app_logger.info(f"Model changed to: {model_name} — preloading")
+        self._model_loading = True
+        self._update_app_state()
+        self.scratchpad.append(f"[System] Model changed to {model_name} — loading in background...")
+        self.transcriber.preload_model()
+
+    def _make_tray_icon(self, state: str) -> QIcon:
+        """Draw a coloured circle QIcon for the system tray.
+        Pure QPainter — no external files, works in frozen mode.
+        
+        state: 'idle' | 'loading' | 'recording' | 'transcribing' | 'both'
+        """
+        COLORS = {
+            'idle':         (100, 100, 100),   # grey
+            'loading':      (200, 140,  20),   # amber
+            'recording':    (220,  40,  40),   # red
+            'transcribing': ( 40, 100, 220),   # blue
+            'both':         (160,  40, 190),   # purple
+        }
+        r, g, b = COLORS.get(state, COLORS['idle'])
+        sz = 64
+        pix = QPixmap(sz, sz)
+        pix.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor(r, g, b))
+        p.setPen(QPen(QColor(255, 255, 255, 160), 3))
+        p.drawEllipse(4, 4, sz - 8, sz - 8)
+        p.end()
+        return QIcon(pix)
+
+    def _update_app_state(self):
+        """Refresh the in-window state label and tray icon to reflect current state.
+        
+        Priority: loading > recording+transcribing > recording > transcribing > idle
+        Called from on_trans_status, _on_speech_active, toggle_rec, _on_transcriber_log.
+        """
+        loading  = getattr(self, '_model_loading',  False)
+        is_list  = getattr(self, '_is_listening',   False)  # dictation armed
+        is_rec   = getattr(self, '_speech_active',  False)  # currently speaking
+        is_trans = getattr(self, '_is_transcribing', False) # processing audio
+
+        if loading:
+            state = 'loading'
+            dot   = '⏳'
+            text  = 'Loading model...'
+            color = '#ffaa00'
+            tip   = 'WhisperR — Loading model'
+        elif is_rec and is_trans:
+            state = 'both'
+            dot   = '●'
+            text  = 'Recording + Transcribing'
+            color = '#cc44ff'
+            tip   = 'WhisperR — Recording + Transcribing'
+        elif is_rec:
+            state = 'recording'
+            dot   = '●'
+            text  = 'Recording'
+            color = '#ff4444'
+            tip   = 'WhisperR — Recording'
+        elif is_trans:
+            state = 'transcribing'
+            dot   = '●'
+            text  = 'Transcribing...'
+            color = '#4488ff'
+            tip   = 'WhisperR — Transcribing'
+        elif is_list:
+            state = 'listening'
+            dot   = '●'
+            text  = 'Listening...'
+            color = '#28b450'
+            tip   = 'WhisperR — Listening'
+        else:
+            state = 'idle'
+            dot   = '●'
+            text  = 'Idle'
+            color = '#666666'
+            tip   = 'WhisperR — Idle'
+
+        # In-window label (always visible when window is open)
+        if hasattr(self, 'app_state_label'):
+            self.app_state_label.setText(f"{dot} {text}")
+            self.app_state_label.setStyleSheet(
+                f"color: {color}; font-size: 13px; font-weight: bold; "
+                "background: #1e1e1e; border-radius: 4px; padding: 2px 8px;"
+            )
+
+        # Bar + icon overlay — mirrors the window label exactly
+        if hasattr(self, 'indicator'):
+            self.indicator.set_state(state)
+
+        # Tray icon (visible even when window is hidden / minimised to tray)
+        if hasattr(self, 'tray'):
+            self.tray.setIcon(self._make_tray_icon(state))
+            self.tray.setToolTip(tip)
+
     def on_trans_status(self, active):
-        self.indicator.is_trans = active
-        self.indicator.update()
+        app_logger.debug(f"→ on_trans_status: active={active}")
+        self._model_loading   = False
+        self._is_transcribing = active
+        self._update_app_state()
+        app_logger.debug("✓ on_trans_status: done")
     
     def on_text(self, text, src):
         timestamp = datetime.now().strftime('%H:%M:%S')
+        app_logger.debug(f"→ on_text: src='{src}', text length={len(text)}, text='{text[:60]}{'...' if len(text)>60 else ''}'")
         self.scratchpad.append(f"[{timestamp}] {text}")
         
         if src == "live":
-            p_text = text + " " if self.config.settings["auto_space"] else text
+            auto_space = self.config.settings["auto_space"]
+            p_text = text + " " if auto_space else text
+            paste_delay = self.config.settings["paste_delay"]
+            app_logger.debug(f"  on_text: auto_space={auto_space}, paste_delay={paste_delay}s, p_text length={len(p_text)}")
             
             try:
+                app_logger.debug("  on_text: Copying to clipboard via pyperclip...")
                 pyperclip.copy(p_text)
-                time.sleep(self.config.settings["paste_delay"])
+                app_logger.debug(f"  on_text: Clipboard set. Sleeping {paste_delay}s...")
+                time.sleep(paste_delay)
+                app_logger.debug("  on_text: Sleep done. Sending Ctrl+V via pyautogui...")
                 pyautogui.hotkey('ctrl', 'v')
-                app_logger.info(f"Text pasted: '{text[:30]}...'")
+                app_logger.info(f"Text pasted: '{text[:30]}{'...' if len(text)>30 else ''}'")
             except Exception as e:
-                app_logger.error(f"Paste error: {e}")
+                app_logger.error(f"Paste error: {e}", exc_info=True)
             
             # Check for voice commands
+            app_logger.debug(f"  on_text: Checking {len(self.config.settings['commands'])} voice commands...")
             for phrase, cmd in self.config.settings["commands"].items():
-                if phrase.lower() in text.lower():
+                match = phrase.lower() in text.lower()
+                app_logger.debug(f"  on_text: Command check: phrase='{phrase}' in text → {match}")
+                if match:
                     try:
+                        app_logger.info(f"  on_text: Executing command: '{cmd}'")
                         subprocess.Popen(cmd, shell=True)
                         app_logger.info(f"Command executed: {cmd}")
                         self.scratchpad.append(f"[Command] Executed: {cmd}")
                     except Exception as e:
-                        app_logger.error(f"Command execution failed: {e}")
+                        app_logger.error(f"Command execution failed: {e}", exc_info=True)
+        
+        app_logger.debug("✓ on_text: Complete")
 
     def setup_logic(self):
+        app_logger.debug(f"→ setup_logic: Starting. has hk_l={hasattr(self, 'hk_l')}, has ptt_l={hasattr(self, 'ptt_l')}")
+        
         # Stop existing listeners
         if hasattr(self, 'hk_l'):
             try:
+                app_logger.debug(f"  setup_logic: Stopping existing hk_l (id={id(self.hk_l)})...")
                 self.hk_l.stop()
-            except:
-                pass
+                app_logger.debug("  setup_logic: Stopped old hotkey listener")
+            except Exception as e:
+                app_logger.debug(f"  setup_logic: Error stopping hotkey listener: {e}")
         
         if hasattr(self, 'ptt_l'):
             try:
+                app_logger.debug(f"  setup_logic: Stopping existing ptt_l (id={id(self.ptt_l)})...")
                 self.ptt_l.stop()
-            except:
-                pass
+                app_logger.debug("  setup_logic: Stopped old PTT listener")
+            except Exception as e:
+                app_logger.debug(f"  setup_logic: Error stopping PTT listener: {e}")
         
         # Create hotkey mapping (for toggle dictation and show/hide)
         hotkey_map = {}
         
         try:
-            toggle_hotkey = self.normalize_hotkey(self.config.settings["hotkey"])
-            visibility_hotkey = self.normalize_hotkey(self.config.settings["visibility_hotkey"])
+            raw_toggle = self.config.settings["hotkey"]
+            raw_vis = self.config.settings["visibility_hotkey"]
+            app_logger.debug(f"  setup_logic: Raw hotkeys: toggle='{raw_toggle}', visibility='{raw_vis}'")
             
-            hotkey_map[toggle_hotkey] = lambda: self.sig_toggle_rec.emit()
-            hotkey_map[visibility_hotkey] = lambda: self.sig_toggle_vis.emit()
+            toggle_hotkey = self.normalize_hotkey(raw_toggle)
+            visibility_hotkey = self.normalize_hotkey(raw_vis)
+            app_logger.debug(f"  setup_logic: Normalized hotkeys: toggle='{toggle_hotkey}', visibility='{visibility_hotkey}'")
             
+            # Store hotkeys for conflict checking
+            self.toggle_hotkey_normalized = toggle_hotkey
+            self.visibility_hotkey_normalized = visibility_hotkey
+            app_logger.debug(f"  setup_logic: Stored normalized hotkeys on self")
+            
+            hotkey_map[toggle_hotkey] = self.on_toggle_hotkey
+            hotkey_map[visibility_hotkey] = self.on_visibility_hotkey
+            app_logger.debug(f"  setup_logic: hotkey_map = {list(hotkey_map.keys())}")
+            
+            app_logger.debug("  setup_logic: Creating GlobalHotKeys listener...")
             self.hk_l = keyboard.GlobalHotKeys(hotkey_map)
+            app_logger.debug(f"  setup_logic: GlobalHotKeys created (id={id(self.hk_l)}), starting...")
             self.hk_l.start()
             app_logger.info(f"Hotkeys registered: {list(hotkey_map.keys())}")
         except Exception as e:
-            app_logger.error(f"Hotkey registration failed: {e}")
+            app_logger.error(f"Hotkey registration failed: {e}", exc_info=True)
             QMessageBox.warning(
                 self, 
                 "Hotkey Error", 
@@ -1620,16 +2632,45 @@ class WhisperRApp(QMainWindow):
         
         # Start PTT listener with suppression capability
         try:
+            ptt_key_setting = self.config.settings.get('ptt_key', 'NOT SET')
+            app_logger.debug(f"  setup_logic: Creating PTT keyboard listener, ptt_key='{ptt_key_setting}'")
+            app_logger.debug(f"  setup_logic: on_p={self.on_p}, on_r={self.on_r}")
+            
             # Create listener that can suppress keys
+            app_logger.debug("  setup_logic: Instantiating keyboard.Listener (suppress=False)...")
             self.ptt_l = keyboard.Listener(
                 on_press=self.on_p, 
                 on_release=self.on_r,
                 suppress=False  # We'll handle suppression manually
             )
+            app_logger.debug(f"  setup_logic: keyboard.Listener instantiated (id={id(self.ptt_l)})")
+            
+            app_logger.debug("  setup_logic: Starting PTT listener thread...")
             self.ptt_l.start()
-            app_logger.info("PTT listener started")
+            app_logger.debug(f"  setup_logic: PTT listener thread started, is_alive={self.ptt_l.is_alive()}")
+            
+            app_logger.info("PTT listener started successfully")
+            
         except Exception as e:
-            app_logger.error(f"PTT listener failed: {e}")
+            app_logger.error(f"PTT listener failed to start: {e}", exc_info=True)
+            app_logger.error(f"PTT listener error type: {type(e).__name__}")
+            app_logger.error(f"PTT listener error args: {e.args}")
+            
+            # Try to continue without PTT
+            self.ptt_l = None
+            app_logger.warning("Continuing without PTT listener")
+        
+        app_logger.debug("✓ setup_logic: Complete")
+    
+    def on_toggle_hotkey(self):
+        """Handler for toggle dictation hotkey - prevents subset conflicts"""
+        app_logger.debug("Toggle dictation hotkey triggered (exact match)")
+        self.sig_toggle_rec.emit()
+    
+    def on_visibility_hotkey(self):
+        """Handler for visibility hotkey - prevents subset conflicts"""
+        app_logger.debug("Visibility hotkey triggered (exact match)")
+        self.sig_toggle_vis.emit()
     
     def normalize_hotkey(self, hotkey_str):
         """Convert our hotkey format to pynput format"""
@@ -1668,7 +2709,7 @@ class WhisperRApp(QMainWindow):
                 try:
                     target = proc_dir / f.name
                     shutil.move(str(f), str(target))
-                    self.transcriber.queue.put((str(target.absolute()), "file"))
+                    self.transcriber.submit(str(target.absolute()), "file")
                     app_logger.info(f"File moved to processing: {f.name}")
                 except Exception as e:
                     app_logger.error(f"Failed to process file {f.name}: {e}")
@@ -1741,7 +2782,7 @@ After placing DLL files, check the logs when transcribing:
         )
         
         for p in paths:
-            self.transcriber.queue.put((os.path.abspath(p), "file"))
+            self.transcriber.submit(os.path.abspath(p), "file")
             app_logger.info(f"File imported for transcription: {p}")
 
     def browse_f(self, line_edit):
@@ -1773,7 +2814,7 @@ After placing DLL files, check the logs when transcribing:
                 app_logger.error(f"Failed to export prompt: {e}")
     
     def closeEvent(self, event):
-        app_logger.info("Application closing")
+        app_logger.info("closeEvent: X button pressed — shutting down application")
         
         # Clean up recordings if requested
         if self.config.settings["clear_exit"]:
@@ -1789,117 +2830,255 @@ After placing DLL files, check the logs when transcribing:
         # Stop workers
         if self.recorder:
             self.recorder.active = False
+            app_logger.debug("closeEvent: recorder stopped")
         
         self.transcriber.running = False
+        self.transcriber._stop_worker()
+        app_logger.debug("closeEvent: transcriber stopped")
         
+        # Hide tray icon so it doesn't linger in the system tray after exit
+        if hasattr(self, 'tray'):
+            self.tray.hide()
+            app_logger.debug("closeEvent: tray icon hidden")
+        
+        # Destroy the overlay widget so it doesn't outlive the main window
+        if hasattr(self, 'indicator'):
+            self.indicator.hide_all()
+            self.indicator.deleteLater()
+            app_logger.debug("closeEvent: overlay hidden and scheduled for deletion")
+        
+        app_logger.info("closeEvent: accepting — application will exit")
         event.accept()
+        
+        # Force Qt to quit the event loop so the process actually exits
+        QApplication.instance().quit()
+    
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.WindowStateChange:
+            was_minimized = bool(event.oldState() & Qt.WindowState.WindowMinimized)
+            is_minimized  = bool(self.windowState() & Qt.WindowState.WindowMinimized)
+            # Read from the live checkbox so unsaved changes are respected.
+            # Fall back to config dict if the UI hasn't been built yet.
+            if hasattr(self, 'cfg_tray'):
+                min_to_tray = self.cfg_tray.isChecked()
+            else:
+                min_to_tray = self.config.settings.get("min_to_tray", False)
+            app_logger.debug(f"changeEvent: was_minimized={was_minimized}, is_minimized={is_minimized}, min_to_tray={min_to_tray}")
+            if not was_minimized and is_minimized:
+                if min_to_tray:
+                    self.hide()
+                    return
+        super().changeEvent(event)
 
 
 class StatusOverlay(QWidget):
+    """On-screen status indicator — shown at a screen edge, stays on top.
+
+    Design: TWO completely separate opaque windows, styled with CSS background-color.
+    - A thin BAR along one edge of the screen (configurable: Top/Bottom/Left/Right).
+    - A small circular ICON in one corner.
+    
+    No compositor tricks, no WA_TranslucentBackground, no ctypes SetLayeredWindowAttributes.
+    Just plain colored rectangles.  This works reliably in frozen apps because:
+      - No DWM composition involved
+      - No magenta color-key transparency (which crashed previous attempts)
+      - The windows simply have a solid background and sit on top of everything
+      - They do NOT steal focus (WA_ShowWithoutActivating + Tool flag)
+    
+    The bar/icon are hidden when the app is idle (configurable) so they don't
+    distract during normal use.
+    """
+
+    # State → CSS color string (must match _update_app_state states)
+    COLORS = {
+        'idle':         'rgba(80, 80, 80, 180)',
+        'listening':    'rgba(40, 180, 80, 220)',
+        'loading':      'rgba(200, 140, 20, 220)',
+        'recording':    'rgba(220, 40, 40, 230)',
+        'transcribing': 'rgba(40, 100, 220, 230)',
+        'both':         'rgba(150, 40, 190, 230)',
+    }
+
+    _COMMON_FLAGS = (
+        Qt.WindowType.FramelessWindowHint |
+        Qt.WindowType.WindowStaysOnTopHint |
+        Qt.WindowType.Tool |
+        Qt.WindowType.WindowDoesNotAcceptFocus
+    )
+
     def __init__(self, config):
-        super().__init__()
+        # StatusOverlay is NOT a real widget itself — it just coordinates two child windows.
+        # It holds NO state of its own. set_state(state) is the only way to update it,
+        # called directly from _update_app_state() so bar/icon always match the window label.
+        super().__init__(None)
+        self.hide()  # Never show the parent
+
         self.config = config
-        
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint | 
-            Qt.WindowType.WindowStaysOnTopHint | 
-            Qt.WindowType.Tool
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        
-        self.is_list = False
-        self.is_rec = False
-        self.is_trans = False
-        
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_pos)
-        self.timer.start(1000)
-        
-        self.update_pos()
-        self.show()
-    
-    def update_pos(self):
-        screen = QApplication.primaryScreen().geometry()
-        self.setGeometry(0, 0, screen.width(), screen.height())
-    
-    def paintEvent(self, event):
-        if not self.config.settings["ind_show"]:
+        self._current_state = 'idle'
+
+        # Create the two visible child windows
+        self._bar  = self._make_panel()
+        self._icon = self._make_panel()
+
+        # Reposition timer — updates geometry every second in case screen changes
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._reposition)
+        self._timer.start(1000)
+
+        QTimer.singleShot(100, self._reposition)
+        app_logger.debug("StatusOverlay: initialised (stateless display)")
+
+    def _make_panel(self):
+        """Create a single borderless always-on-top opaque panel window."""
+        w = QWidget(None)
+        w.setWindowFlags(self._COMMON_FLAGS)
+        w.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        w.hide()
+        return w
+
+    def set_state(self, state: str):
+        """Mirror the window label state directly. Called from _update_app_state()."""
+        self._current_state = state
+        cfg  = self.config.settings
+
+        if not cfg.get("ind_show", True):
+            self._bar.hide()
+            self._icon.hide()
             return
-        
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
-        # Determine base color based on state
-        if (self.is_list or self.is_rec) and self.is_trans:
-            base_color = (128, 0, 128)  # Purple: recording + transcribing
-        elif self.is_rec:
-            base_color = (255, 0, 0)     # Red: actively recording
-        elif self.is_list:
-            base_color = (100, 0, 0)     # Dark red: listening
-        elif self.is_trans:
-            base_color = (0, 0, 255)     # Blue: transcribing only
+
+        # Hide when idle if configured
+        if state == 'idle':
+            if cfg.get("ind_hide_idle", True):
+                self._bar.hide()
+                self._icon.hide()
+                return
+
+        color_css = self.COLORS.get(state, self.COLORS['idle'])
+        kind = cfg.get("ind_type", "Both")
+
+        # Bar
+        if "Bar" in kind or "Both" in kind:
+            self._bar.setStyleSheet(f"background-color: {color_css}; border: none;")
+            self._bar.show()
+            self._bar.raise_()
         else:
-            base_color = (128, 128, 128) # Gray: idle
-        
-        screen_rect = self.rect()
-        size = self.config.settings["ind_size"]
-        offset = self.config.settings["ind_off"]
-        position = self.config.settings["ind_pos"]
-        
-        # Draw icon indicator with opacity
-        if "Icon" in self.config.settings["ind_type"] or "Both" in self.config.settings["ind_type"]:
-            if "Left" in position:
-                icon_x = offset
-            else:
-                icon_x = screen_rect.width() - size - offset
-            
-            if "Top" in position:
-                icon_y = offset
-            else:
-                icon_y = screen_rect.height() - size - offset
-            
-            # Apply icon opacity
-            icon_opacity = self.config.settings.get("ind_opacity", 255)
-            icon_color = QColor(base_color[0], base_color[1], base_color[2], icon_opacity)
-            
-            painter.setBrush(icon_color)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(icon_x, icon_y, size, size)
-        
-        # Draw bar indicator with opacity and thickness
-        if "Bar" in self.config.settings["ind_type"] or "Both" in self.config.settings["ind_type"]:
-            bar_thickness = self.config.settings.get("bar_thickness", 5)
-            edge = self.config.settings["bar_edge"]
-            
-            # Apply bar opacity
-            bar_opacity = self.config.settings.get("bar_opacity", 255)
-            bar_color = QColor(base_color[0], base_color[1], base_color[2], bar_opacity)
-            
-            painter.setBrush(bar_color)
-            
-            if edge == "Top":
-                painter.drawRect(0, 0, screen_rect.width(), bar_thickness)
-            elif edge == "Bottom":
-                painter.drawRect(0, screen_rect.height() - bar_thickness, screen_rect.width(), bar_thickness)
-            elif edge == "Left":
-                painter.drawRect(0, 0, bar_thickness, screen_rect.height())
-            else:  # Right
-                painter.drawRect(screen_rect.width() - bar_thickness, 0, bar_thickness, screen_rect.height())
+            self._bar.hide()
+
+        # Icon (circle)
+        if "Icon" in kind or "Both" in kind:
+            size = cfg.get("ind_size", 28)
+            r    = size // 2
+            self._icon.setStyleSheet(
+                f"background-color: {color_css}; border: none; border-radius: {r}px;"
+            )
+            self._icon.show()
+            self._icon.raise_()
+        else:
+            self._icon.hide()
+
+    def _reposition(self):
+        """Recalculate geometry for bar and icon (called every second and on state change)."""
+        try:
+            screen = QApplication.primaryScreen().geometry()
+            cfg    = self.config.settings
+
+            if not cfg.get("ind_show", True):
+                self._bar.hide()
+                self._icon.hide()
+                return
+
+            kind   = cfg.get("ind_type",     "Both")
+            pos    = cfg.get("ind_pos",       "Top-Right")
+            edge   = cfg.get("bar_edge",      "Top")
+            thick  = cfg.get("bar_thickness", 5)
+            size   = cfg.get("ind_size",      28)
+            offset = cfg.get("ind_off",       20)
+            sw, sh = screen.width(), screen.height()
+
+            if "Bar" in kind or "Both" in kind:
+                if edge == "Top":
+                    self._bar.setGeometry(screen.x(), screen.y(), sw, thick)
+                elif edge == "Bottom":
+                    self._bar.setGeometry(screen.x(), screen.y() + sh - thick, sw, thick)
+                elif edge == "Left":
+                    self._bar.setGeometry(screen.x(), screen.y(), thick, sh)
+                else:
+                    self._bar.setGeometry(screen.x() + sw - thick, screen.y(), thick, sh)
+
+            if "Icon" in kind or "Both" in kind:
+                ix = screen.x() + (offset if "Left" in pos else sw - size - offset)
+                iy = screen.y() + (offset if "Top"  in pos else sh - size - offset)
+                self._icon.setGeometry(ix, iy, size, size)
+
+            # Re-apply current state so visibility/color stay correct after resize
+            self.set_state(self._current_state)
+
+        except Exception as e:
+            app_logger.error(f"StatusOverlay._reposition error: {e}", exc_info=True)
+
+    def hide_all(self):
+        self._bar.hide()
+        self._icon.hide()
+
+    def deleteLater(self):
+        self._bar.deleteLater()
+        self._icon.deleteLater()
+        super().deleteLater()
 
 
 if __name__ == "__main__":
+    # PyInstaller + multiprocessing on Windows: must call freeze_support()
+    # before anything else so worker subprocesses are handled correctly.
+    import multiprocessing
+    multiprocessing.freeze_support()
     app_logger.info("="*60)
     app_logger.info(f"{APP_NAME} v{__version__} - Starting")
     app_logger.info(f"Python: {sys.version}")
-    app_logger.info(f"Platform: {sys.platform}")
+    app_logger.info(f"Platform: {sys.platform}\"")
     app_logger.info("="*60)
     
-    app = QApplication(sys.argv)
-    app.setStyleSheet(DARK_STYLE)
-    
-    window = WhisperRApp()
-    window.show()
-    
-    exit_code = app.exec()
-    app_logger.info(f"Application exited with code {exit_code}")
-    sys.exit(exit_code)
+    try:
+        app_logger.debug("→ Creating QApplication instance...")
+        app = QApplication(sys.argv)
+        app_logger.debug("✓ QApplication created")
+        
+        # Don't quit when the main window is hidden (e.g. minimized to tray)
+        app.setQuitOnLastWindowClosed(False)
+        app_logger.debug("✓ setQuitOnLastWindowClosed(False) set")
+        
+        app_logger.debug("→ Applying dark stylesheet...")
+        app.setStyleSheet(DARK_STYLE)
+        app_logger.debug("✓ Stylesheet applied")
+        
+        app_logger.debug("→ Creating WhisperRApp instance...")
+        window = WhisperRApp()
+        app_logger.debug("✓ WhisperRApp instance created")
+        
+        app_logger.debug("→ Calling window.show()...")
+        window.show()
+        app_logger.debug("✓ window.show() returned — window is now visible")
+        app_logger.info(f"  window.isVisible={window.isVisible()}, geometry={window.geometry()}")
+        
+        app_logger.debug("→ Processing pending Qt events (processEvents)...")
+        app.processEvents()
+        app_logger.debug("✓ processEvents() returned — about to enter event loop")
+        
+        app_logger.debug("→ Starting Qt event loop (app.exec())...")
+        exit_code = app.exec()
+        app_logger.info(f"Application exited with code {exit_code}")
+        sys.exit(exit_code)
+        
+    except Exception as e:
+        app_logger.error("="*60)
+        app_logger.error(f"CRASH IN MAIN: {e}")
+        app_logger.error("="*60)
+        app_logger.error("Full traceback:", exc_info=True)
+        
+        # Write crash details to separate file
+        with open(os.path.join(BASE_DIR, "MAIN_CRASH.txt"), "w") as f:
+            f.write(f"Crash in main at {datetime.now()}\n")
+            f.write(f"Error: {e}\n\n")
+            traceback.print_exc(file=f)
+        
+        raise
