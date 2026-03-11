@@ -1,6 +1,6 @@
 import sys
 import os
-
+import multiprocessing
 
 # Runs in a separate process via multiprocessing.Process (NOT subprocess.Popen).
 # Using multiprocessing.Process is the correct PyInstaller-compatible approach:
@@ -15,6 +15,13 @@ import os
 def _ai_worker_process(task_q, result_q, log_q):
     """AI worker — runs in a child process, owns faster-whisper + ctranslate2."""
     import os, sys, traceback
+    # Force onnxruntime (used by VAD/Silero) to CPU-only mode before any import.
+    # Without this, onnxruntime_pybind11_state.dll tries to init its CUDA execution
+    # provider which conflicts with ctranslate2's already-loaded CUDA DLLs and causes
+    # an access violation.  These env vars must be set before onnxruntime is ever imported.
+    os.environ["ORT_DISABLE_CUDA"]        = "1"
+    os.environ["ORT_LOGGING_LEVEL"]       = "3"   # suppress ORT verbosity
+    os.environ["ORTEP_DISABLE_PROVIDERS"] = "CUDA"
 
     def _log(msg):
         try:
@@ -357,7 +364,7 @@ def _ai_worker_process(task_q, result_q, log_q):
     current_language = None
     WhisperModel = None
 
-    _vad_broken = False  # once VAD fails in this worker session, disable it permanently
+    _vad_broken = False  # set True on first VAD failure; disables VAD for rest of session
 
     while True:
         try:
@@ -369,7 +376,7 @@ def _ai_worker_process(task_q, result_q, log_q):
             _log("AI worker: received stop signal, exiting")
             break
 
-        model_name, lang_code, compute_pref, audio_data, src, translate, use_vad, prompt = msg
+        model_name, lang_code, compute_pref, audio_data, src, translate, use_vad, prompt, min_confidence = msg
 
         # If VAD failed in a previous task this session, honour that for all future tasks.
         if _vad_broken and use_vad:
@@ -531,23 +538,58 @@ def _ai_worker_process(task_q, result_q, log_q):
             result_q.put(('status', False))
             continue
 
+        # ── VAD safety: block onnxruntime DLL load in frozen app ───────────────
+        # onnxruntime_pybind11_state.dll crashes in DllMain (access violation)
+        # when loaded alongside ctranslate2's CUDA DLLs in a PyInstaller child.
+        # env vars like ORT_DISABLE_CUDA are set AFTER DllMain runs — too late.
+        # Fix: in frozen mode, monkey-patch faster_whisper.vad so get_vad_model()
+        # raises RuntimeError immediately, before `import onnxruntime` is reached.
+        # This is done once per worker lifetime and is idempotent.
+        if getattr(sys, 'frozen', False) and use_vad and not _vad_broken:
+            try:
+                import faster_whisper.vad as _fwvad
+                def _safe_get_vad_model():
+                    raise RuntimeError(
+                        "onnxruntime blocked in frozen app to prevent DLL crash")
+                _fwvad.get_vad_model = _safe_get_vad_model
+                _vad_broken = True
+                result_q.put(('warn',
+                    'VAD disabled — onnxruntime crashes in frozen mode. '
+                    'Transcription will work normally without VAD.'))
+                _log('VAD monkey-patched out (frozen app protection).')
+                use_vad = False
+            except Exception as _vp:
+                _log(f'VAD patch failed ({_vp}), forcing vad_filter=False anyway.')
+                _vad_broken = True
+                use_vad = False
+
         # Transcribe
         result_q.put(('status', True))
         try:
             import numpy as np
-            audio_np = np.frombuffer(audio_data, dtype=np.float32)
+            if isinstance(audio_data, str):
+                # File path submitted via import_files() — decode with faster-whisper's
+                # own audio loading (which uses ffmpeg/av under the hood).
+                from faster_whisper.audio import decode_audio
+                audio_np = decode_audio(audio_data, sampling_rate=16000)
+            else:
+                audio_np = np.frombuffer(audio_data, dtype=np.float32)
 
-            # onnxruntime (used by VAD/Silero) crashes in frozen apps when it tries
-            # to initialise its CUDA execution provider alongside ctranslate2's
-            # already-loaded CUDA DLLs (access violation in onnxruntime_pybind11_state.dll).
-            # Force CPU-only ORT providers via env var before the first import.
-            # This must be set before faster_whisper touches onnxruntime.
-            if use_vad:
-                import os as _os
-                _os.environ.setdefault('ORT_LOGGING_LEVEL', '3')           # suppress ORT spam
-                _os.environ.setdefault('ORTEP_DISABLE_PROVIDERS', 'CUDA')  # no CUDA provider
-                # Belt-and-suspenders: also set the disable-all-non-CPU flag
-                _os.environ.setdefault('ORT_DISABLE_CUDA', '1')
+            # _conf_ok maps min_confidence (0-1 UI slider) to avg_logprob threshold.
+            # avg_logprob is negative: 0.0 = perfect, -1.0 = poor.
+            # We scale the UI value so that:
+            #   0.0 → threshold = -inf (keep everything)
+            #   0.5 → threshold = -0.5  (reasonable default)
+            #   0.9 → threshold = -0.1  (strict but achievable)
+            #   1.0 → threshold =  0.0  (only perfect segments)
+            # Formula: threshold = -(1.0 - min_confidence)
+            _logprob_threshold = -(1.0 - min_confidence) if min_confidence > 0.0 else float('-inf')
+
+            def _conf_ok(s):
+                ok = s.avg_logprob >= _logprob_threshold
+                if not ok:
+                    _log(f"  segment filtered (logprob={s.avg_logprob:.3f} < {_logprob_threshold:.3f}): {s.text!r}")
+                return ok
 
             segments, _ = model.transcribe(
                 audio_np,
@@ -556,35 +598,24 @@ def _ai_worker_process(task_q, result_q, log_q):
                 vad_filter=use_vad,
                 initial_prompt=prompt or None,
             )
-            text = ' '.join(s.text.strip() for s in segments).strip()
+            seg_list = list(segments)  # materialise — generator exhausts on iteration
+            if seg_list:
+                _log(f"  segments={len(seg_list)}, logprobs={[round(s.avg_logprob,3) for s in seg_list]}, threshold={_logprob_threshold:.3f}")
+            text = ' '.join(s.text.strip() for s in seg_list if _conf_ok(s)).strip()
             result_q.put(('text', text, src))
-        except RuntimeError as e:
-            if 'onnxruntime' in str(e).lower() or 'vad' in str(e).lower():
-                # VAD failed — retry without it, disable for this session, warn ONCE
-                _log(f"VAD unavailable ({e}), retrying without VAD filter")
-                if not _vad_broken:
-                    _vad_broken = True
-                    result_q.put(('warn', 'VAD filter unavailable — disabled for this session. (onnxruntime DLL conflict in frozen app)'))
-                try:
-                    segments, _ = model.transcribe(
-                        audio_np,
-                        language=lang_code if lang_code != 'auto' else None,
-                        task='translate' if translate else 'transcribe',
-                        vad_filter=False,
-                        initial_prompt=prompt or None,
-                    )
-                    text = ' '.join(s.text.strip() for s in segments).strip()
-                    result_q.put(('text', text, src))
-                except Exception as e2:
-                    _log(f"Transcription error (no-VAD retry): {e2}\n{traceback.format_exc()}")
-            else:
-                _log(f"Transcription error: {e}\n{traceback.format_exc()}")
         except Exception as e:
             _log(f"Transcription error: {e}\n{traceback.format_exc()}")
         result_q.put(('status', False))
 
 
 
+
+# ── PyInstaller freeze_support — MUST be after _ai_worker_process is defined ─
+# On Windows spawn, PyInstaller re-runs the .exe to create worker subprocesses.
+# freeze_support() intercepts that re-run, looks up _ai_worker_process by name,
+# calls it, then exits — so the full Qt/UI code never runs in the worker.
+# Placing this AFTER the function definition ensures it can be found.
+multiprocessing.freeze_support()
 
 import json
 import time
@@ -694,7 +725,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QComboBox, QLabel, QFileDialog, QTabWidget, QCheckBox, 
     QDoubleSpinBox, QProgressBar, QFormLayout, QLineEdit, QGroupBox, QSpinBox, 
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QDialog, QMessageBox,
-    QSystemTrayIcon, QMenu
+    QSystemTrayIcon, QMenu, QSlider, QListWidget, QAbstractItemView, QSplitter
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QPoint, QObject, QEvent
 from PyQt6.QtGui import QPainter, QColor, QFont, QIcon, QAction, QKeyEvent, QPixmap, QPen
@@ -716,15 +747,10 @@ QProgressBar { background: #1e1e1e; border: 1px solid #333; text-align: center; 
 QProgressBar::chunk { background-color: #0078d7; border-radius: 6px; }
 QHeaderView::section { background-color: #252525; color: white; padding: 4px; border: 1px solid #333; }
 QTableWidget { background-color: #1e1e1e; gridline-color: #333; }
-QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit { background-color: #2a2a2a; border: 1px solid #444; padding: 4px; }
-QSpinBox, QDoubleSpinBox { padding-right: 24px; min-height: 24px; }
-QSpinBox::up-button, QDoubleSpinBox::up-button { subcontrol-origin: border; subcontrol-position: top right; width: 22px; border-left: 1px solid #555; border-bottom: 1px solid #555; background-color: #3a3a3a; border-top-right-radius: 3px; }
-QSpinBox::down-button, QDoubleSpinBox::down-button { subcontrol-origin: border; subcontrol-position: bottom right; width: 22px; border-left: 1px solid #555; border-top: 1px solid #555; background-color: #3a3a3a; border-bottom-right-radius: 3px; }
-QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { width: 10px; height: 10px; image: none; border-left: 5px solid transparent; border-right: 5px solid transparent; border-bottom: 6px solid #cccccc; }
-QSpinBox::down-arrow, QDoubleSpinBox::down-arrow { width: 10px; height: 10px; image: none; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 6px solid #cccccc; }
-QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover, QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover { background-color: #0078d7; }
-QSpinBox::up-button:hover QSpinBox::up-arrow, QDoubleSpinBox::up-button:hover QDoubleSpinBox::up-arrow { border-bottom-color: #ffffff; }
-QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed, QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed { background-color: #005fa3; }
+QComboBox, QLineEdit { background-color: #2a2a2a; border: 1px solid #444; padding: 4px 28px 4px 6px; min-height: 22px; }
+QSpinBox, QDoubleSpinBox { background-color: #2a2a2a; border: 1px solid #444; padding: 4px 6px 4px 6px; min-height: 22px; }
+QSpinBox::up-button, QDoubleSpinBox::up-button { width: 0; border: none; }
+QSpinBox::down-button, QDoubleSpinBox::down-button { width: 0; border: none; }
 """
 
 # --- 4. LOGGING SETUP ---
@@ -739,37 +765,60 @@ class AppLogger:
     def __init__(self):
         self.log_path = os.path.join(BASE_DIR, "app_log.txt")
         self.level = logging.INFO
+        self._file_handler = None
+        self._disabled = False
         self.logger = logging.getLogger(APP_NAME)
         self.logger.setLevel(logging.DEBUG)
-        
-        # File handler — flushes after every line so hard C++ crashes don't eat logs
-        fh = _FlushingFileHandler(self.log_path, mode='w', encoding='utf-8')
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
-        self.logger.addHandler(fh)
-        
-        # Console handler for debugging
+        self._attach_file_handler()
+        # Console handler for debugging (always low-traffic — warnings/errors only)
         ch = logging.StreamHandler()
         ch.setLevel(logging.WARNING)
         ch.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
         self.logger.addHandler(ch)
-    
+
+    def _attach_file_handler(self):
+        if self._file_handler:
+            self.logger.removeHandler(self._file_handler)
+            self._file_handler.close()
+            self._file_handler = None
+        fh = _FlushingFileHandler(self.log_path, mode='w', encoding='utf-8')
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+        self.logger.addHandler(fh)
+        self._file_handler = fh
+
     def set_level(self, level_name):
-        levels = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR}
-        self.level = levels.get(level_name, logging.INFO)
-        self.logger.setLevel(self.level)
-    
-    def debug(self, msg, exc_info=False): 
-        self.logger.debug(msg, exc_info=exc_info)
-    
-    def info(self, msg, exc_info=False): 
-        self.logger.info(msg, exc_info=exc_info)
-    
-    def warning(self, msg, exc_info=False): 
-        self.logger.warning(msg, exc_info=exc_info)
-    
-    def error(self, msg, exc_info=False): 
-        self.logger.error(msg, exc_info=exc_info)
+        if level_name == "NONE":
+            # Disable file logging entirely — no log file created/written
+            if self._file_handler:
+                self.logger.removeHandler(self._file_handler)
+                self._file_handler.close()
+                self._file_handler = None
+            # Delete any existing log file so we start clean
+            try:
+                if os.path.exists(self.log_path):
+                    os.remove(self.log_path)
+            except Exception:
+                pass
+            self._disabled = True
+            self.logger.setLevel(logging.CRITICAL + 1)  # suppress everything
+        else:
+            levels = {"DEBUG": logging.DEBUG, "INFO": logging.INFO,
+                      "WARNING": logging.WARNING, "ERROR": logging.ERROR}
+            self._disabled = False
+            if not self._file_handler:
+                self._attach_file_handler()  # re-attach if previously disabled
+            self.level = levels.get(level_name, logging.INFO)
+            self.logger.setLevel(self.level)
+
+    def debug(self, msg, exc_info=False):
+        if not self._disabled: self.logger.debug(msg, exc_info=exc_info)
+    def info(self, msg, exc_info=False):
+        if not self._disabled: self.logger.info(msg, exc_info=exc_info)
+    def warning(self, msg, exc_info=False):
+        if not self._disabled: self.logger.warning(msg, exc_info=exc_info)
+    def error(self, msg, exc_info=False):
+        if not self._disabled: self.logger.error(msg, exc_info=exc_info)
 
 app_logger = AppLogger()
 
@@ -778,22 +827,49 @@ class AppConfig:
     def __init__(self):
         self.path = os.path.join(BASE_DIR, "config.json")
         self.settings = {
-            "model": "base", "lang_name": "English", "lang_code": "en", 
-            "translate": False, "timestamps": False, "initial_prompt": "",
+            "model": "large-v3", "lang_name": "English", "lang_code": "en",
+            "translate": False, "timestamps": False,
+            "initial_prompt": "An article for a data recovery company's site. The article uses a lot of storage-related terminology, with app and service names like Disk Drill, Recuva, CHKDSK, Windows File History, Windows File Explorer, Google Drive (GDrive), Microsoft OneDrive, Dropbox, companies like CleverFiles, file-system-related words like RAW, FAT8, FAT16, FAT32, NTFS, EXT2, EXT3, EXT4, EXT2/3/4, ReiserFS, ReFS, XFS, JFS, file formats like AVI, MKV, MP4, MOV, ARI, BRAW, R3D, FLV, OSes like Linux, Windows 95/98/NT/2000/XP/Vista/7/8/10/11, OS virtual folders like This PC, Quick Access, Recent Files, Recycle Bin, Trashcan, Libraries, technologies like S.M.A.R.T., Hard Disk Drives (HDDs), Solid State Drives (SSDs), M.2 drives, external drives, internal drives, USB drives, SD cards, TRIM, USB Type-A, USB Type-C, USB-A, USB-C, FireWire, card readers, cameras like GoPro, GoPro HERO, GoPro HERO 13 Black, GoPro MAX2, and more. Extra note: when the user says okay, parse it as OK.",
             "audio_folder": str(Path.home() / "WhisperR_Recordings"),
             "mon_folder": str(Path.home() / "WhisperR_Watch"),
-            "clear_exit": False, "save_to_disk": False, "auto_space": True,
-            "min_to_tray": False, "input_device_name": "", "input_device_index": None, "paste_delay": 0.5, 
-            "hotkey": "ctrl+alt+r", "ptt_key": "f8", 
-            "visibility_hotkey": "ctrl+shift+w", "rollback_hotkey": "ctrl+shift+z", "live_mode": "Simple", 
-            "dict_mode": "Continuous", "auto_pause_sec": 1.5, "noise_floor": 200, 
-            "speech_vol": 1500, "commands": {"Launch Notepad": "notepad.exe"},
-            "ind_show": True, "ind_type": "Both", "ind_pos": "Top-Right", 
-            "ind_size": 32, "ind_off": 20, "bar_edge": "Top", "bar_size": 5,
-            "bar_thickness": 5, "ind_opacity": 255, "bar_opacity": 255, "ind_hide_idle": True,
-            "log_level": "INFO", "use_vad": False
+            "clear_exit": True, "save_to_disk": False, "auto_space": True,
+            "min_to_tray": True,
+            "input_device_name": "Microphone (Sound Blaster AE-7)",
+            "input_device_index": 1,
+            "paste_delay": 0.5,
+            "hotkey": "<ctrl>+<alt>+z",
+            "ptt_key": "ctrl+shift+space",
+            "visibility_hotkey": "ctrl+shift+alt+z",
+            "rollback_hotkey": "ctrl+shift+z",
+            "live_mode": "Auto-Pause",
+            "dict_mode": "Auto-Pause", "auto_pause_sec": 2.0,
+            "noise_floor": 50, "speech_vol": 211,
+            "commands": {"Launch Notepad": "notepad.exe"},
+            "terms": {"hexagon software": "Hexagon Software"},
+            "ind_show": True, "ind_type": "Both", "ind_pos": "Top-Left",
+            "ind_size": 32, "ind_off": 5, "bar_edge": "Top", "bar_size": 5,
+            "bar_thickness": 3, "ind_opacity": 220, "bar_opacity": 220,
+            "ind_hide_idle": True,
+            "log_level": "NONE", "use_vad": True,
+            "ft_output_folder": str(Path.home() / "WhisperR_Output"),
+            "ft_mon_folder": str(Path.home() / "WhisperR_Watch"),
+            "ft_mon_enabled": False,
+            "use_confidence": True, "min_confidence": 0.9,
+            "sendkeys_trigger":   "sendkeys",
+            "select_trigger":     "whisperselect",
+            "move_trigger":       "whispermove",
+            "movebefore_trigger": "whisperbefore",
+            "moveafter_trigger":  "whisperafter"
         }
+        self._first_run = not os.path.exists(self.path)
         self.load()
+        # On first run, write defaults immediately so they are persisted
+        if self._first_run:
+            try:
+                self.save()
+                app_logger.info("First run — default config.json created.")
+            except Exception as _e:
+                app_logger.warning(f"First run: could not write config: {_e}")
         app_logger.set_level(self.settings["log_level"])
 
     def load(self):
@@ -1042,6 +1118,7 @@ class TranscriberWorker(QThread):
             cfg['model'], cfg['lang_code'], compute,
             None, None,           # audio_data=None, src=None → preload sentinel
             False, False, '',     # translate, use_vad, prompt
+            0.0,                  # min_confidence (unused on preload)
         )
         app_logger.info(f"TranscriberWorker.preload_model: queuing preload for model={cfg['model']} compute={compute}")
         self._pending.put(task)
@@ -1062,6 +1139,7 @@ class TranscriberWorker(QThread):
             cfg.get('translate', False),
             cfg.get('use_vad', False),
             cfg.get('initial_prompt', ''),
+            cfg.get('min_confidence', 0.0) if cfg.get('use_confidence', False) else 0.0,
         )
         self._pending.put(task)
 
@@ -1430,7 +1508,10 @@ class AudioRecorder(QThread):
                 elif self.ptt_pressed:
                     _ptt_was_pressed = True
                 if not self.ptt_pressed:
-                    time.sleep(0.05)
+                    # PTT not held — if we were recording, fall through to dispatch
+                    # (handled by the release-edge block above). Otherwise idle-sleep.
+                    if not _ptt_was_pressed:
+                        time.sleep(0.05)
                     continue
 
             try:
@@ -1648,6 +1729,218 @@ class HotkeyCaptureDialog(QDialog):
             self.accept()
 
 # --- 8. MAIN APP ---
+
+
+class SpinWidget(QWidget):
+    """Spin field with [−] [+] buttons on the right.
+
+    Layout:  [──── spin field ────] [−] [+]
+
+    Optional slider to the left of the spin field (use_slider=True):
+    Layout:  [──── slider 70% ────] [ spin ] [−] [+]
+
+    The ± buttons are fixed-width with always-visible glyphs, guaranteed
+    by an explicit per-widget stylesheet that is not affected by the global
+    dark theme rules.
+    """
+    _BTN_CSS = (
+        "QPushButton { background:#3a3a3a; border:1px solid #666; "
+        "color:#e0e0e0; font-size:15px; font-weight:bold; "
+        "min-width:26px; max-width:26px; min-height:26px; max-height:26px; "
+        "padding:0; border-radius:3px; }"
+        "QPushButton:hover  { background:#0078d7; color:#fff; border-color:#0078d7; }"
+        "QPushButton:pressed{ background:#005fa3; color:#fff; }"
+    )
+
+    def __init__(self, parent=None, *, is_double=False,
+                 min_v=0, max_v=100, step=1, value=0,
+                 decimals=2, use_slider=False, spin_width=90):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(3)
+
+        if is_double:
+            self.spin = QDoubleSpinBox()
+            self.spin.setDecimals(decimals)
+            self.spin.setSingleStep(step)
+        else:
+            self.spin = QSpinBox()
+            self.spin.setSingleStep(int(step))
+        self.spin.setRange(min_v, max_v)
+        self.spin.setValue(value)
+        self.spin.setMinimumWidth(spin_width)
+
+        self._slider = None
+        if use_slider:
+            self._slider = QSlider(Qt.Orientation.Horizontal)
+            self._slider.setRange(int(min_v * 100 if is_double else min_v),
+                                  int(max_v * 100 if is_double else max_v))
+            self._slider.setValue(int(value * 100 if is_double else value))
+            self._slider.setTickInterval(
+                int((max_v - min_v) * (10 if is_double else 1)))
+            self._slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            # Bidirectional sync
+            if is_double:
+                self._slider.valueChanged.connect(
+                    lambda v: (self.spin.blockSignals(True),
+                               self.spin.setValue(v / 100.0),
+                               self.spin.blockSignals(False)))
+                self.spin.valueChanged.connect(
+                    lambda v: (self._slider.blockSignals(True),
+                               self._slider.setValue(int(v * 100)),
+                               self._slider.blockSignals(False)))
+            else:
+                self._slider.valueChanged.connect(
+                    lambda v: (self.spin.blockSignals(True),
+                               self.spin.setValue(v),
+                               self.spin.blockSignals(False)))
+                self.spin.valueChanged.connect(
+                    lambda v: (self._slider.blockSignals(True),
+                               self._slider.setValue(v),
+                               self._slider.blockSignals(False)))
+            lay.addWidget(self._slider, stretch=7)   # ~70 % width
+            lay.addWidget(self.spin,    stretch=2)   # ~20 %
+        else:
+            lay.addWidget(self.spin, stretch=1)
+
+        btn_minus = QPushButton("−")
+        btn_plus  = QPushButton("+")
+        for b in (btn_minus, btn_plus):
+            b.setStyleSheet(self._BTN_CSS)
+            b.setSizePolicy(b.sizePolicy().horizontalPolicy(),
+                            b.sizePolicy().verticalPolicy())
+
+        btn_minus.clicked.connect(self.spin.stepDown)
+        btn_plus.clicked.connect(self.spin.stepUp)
+        lay.addWidget(btn_minus)
+        lay.addWidget(btn_plus)
+
+    # ── Proxy API ────────────────────────────────────────────────────────────
+    def value(self):          return self.spin.value()
+    def setValue(self, v):    self.spin.setValue(v)
+    def setRange(self, a, b): self.spin.setRange(a, b)
+    def setToolTip(self, t):
+        super().setToolTip(t)
+        self.spin.setToolTip(t)
+        if self._slider:
+            self._slider.setToolTip(t)
+    @property
+    def valueChanged(self):   return self.spin.valueChanged
+
+def _build_dark_style():
+    # Generate tiny triangle PNG files for spinbox up/down arrows.
+    # Qt ignores CSS border-triangle tricks for ::up-arrow/::down-arrow --
+    # it only accepts image: url() paths there.
+    import tempfile
+    from PyQt6.QtGui import QPixmap, QPainter, QColor, QPolygon
+    from PyQt6.QtCore import QPoint as QP
+    tmpdir = tempfile.gettempdir()
+
+    def _arrow_png(fname, pts_fn, sz=14):
+        path = os.path.join(tmpdir, fname)
+        pix = QPixmap(sz, sz)
+        pix.fill(QColor(0, 0, 0, 0))
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor("#cccccc"))
+        p.setPen(QColor(0, 0, 0, 0))
+        p.drawPolygon(QPolygon(pts_fn(sz)))
+        p.end()
+        pix.save(path, "PNG")
+        return path.replace("\\", "/")
+
+    up   = _arrow_png("whr_up.png",
+               lambda s: [QP(s//2, 2), QP(s-2, s-2), QP(2, s-2)])
+    down = _arrow_png("whr_dn.png",
+               lambda s: [QP(2, 2), QP(s-2, 2), QP(s//2, s-2)])
+    return DARK_STYLE.replace("{UP_ARROW}", up).replace("{DOWN_ARROW}", down)
+
+
+# ── Sendkeys helper ──────────────────────────────────────────────────────────
+# Parses strings like "Hello <ENTER>World<CTRL+C>" and sends them via pyautogui.
+# Supported tag formats:
+#   <KEY>          single key press           e.g. <ENTER>, <TAB>, <ESC>, <F5>
+#   <MOD+KEY>      modifier + key             e.g. <CTRL+C>, <ALT+F4>, <SHIFT+HOME>
+#   <MOD+MOD+KEY>  multiple modifiers         e.g. <CTRL+SHIFT+Z>
+#   <WINKEY>       Windows key (special case)
+# Literal text between tags is typed via pyautogui.typewrite or pyautogui.write.
+
+_SENDKEYS_MAP = {
+    # Navigation
+    "ENTER": "enter", "RETURN": "enter", "TAB": "tab", "ESC": "escape",
+    "ESCAPE": "escape", "SPACE": "space", "BACKSPACE": "backspace", "DELETE": "delete",
+    "DEL": "delete", "INSERT": "insert", "INS": "insert",
+    "HOME": "home", "END": "end", "PGUP": "pageup", "PAGEUP": "pageup",
+    "PGDN": "pagedown", "PAGEDOWN": "pagedown",
+    "UP": "up", "DOWN": "down", "LEFT": "left", "RIGHT": "right",
+    # Function keys
+    "F1":"f1","F2":"f2","F3":"f3","F4":"f4","F5":"f5","F6":"f6",
+    "F7":"f7","F8":"f8","F9":"f9","F10":"f10","F11":"f11","F12":"f12",
+    # Modifiers (used in combos)
+    "CTRL":"ctrl","CONTROL":"ctrl","LCTRL":"ctrlleft","RCTRL":"ctrlright",
+    "ALT":"alt","LALT":"altleft","RALT":"altright",
+    "SHIFT":"shift","LSHIFT":"shiftleft","RSHIFT":"shiftright",
+    "WIN":"winleft","WINKEY":"winleft","LWIN":"winleft","RWIN":"winright",
+    "WINDOWS":"winleft",
+    # Numpad
+    "NUM0":"num0","NUM1":"num1","NUM2":"num2","NUM3":"num3","NUM4":"num4",
+    "NUM5":"num5","NUM6":"num6","NUM7":"num7","NUM8":"num8","NUM9":"num9",
+    "NUMMINUS":"subtract","NUMPLUS":"add","NUMMUL":"multiply","NUMDIV":"divide",
+    "NUMDECIMAL":"decimal","NUMENTER":"enter",
+    # Media / misc
+    "CAPSLOCK":"capslock","NUMLOCK":"numlock","SCROLLLOCK":"scrolllock",
+    "PRINTSCREEN":"printscreen","PAUSE":"pause","BREAK":"pause",
+    "VOLUMEUP":"volumeup","VOLUMEDOWN":"volumedown","VOLUMEMUTE":"volumemute",
+    "MEDIAPLAYPAUSE":"playpause","MEDIANEXT":"nexttrack","MEDIAPREV":"prevtrack",
+}
+
+def _resolve_key(raw):
+    """Map a tag name to a pyautogui key string, or return lowercased name as fallback."""
+    return _SENDKEYS_MAP.get(raw.upper(), raw.lower())
+
+def _send_keys_sequence(text, paste_delay=0.0):
+    """Parse and send a string containing <KEY> tags and literal text.
+    
+    Examples:
+        _send_keys_sequence("Best regards,<ENTER>John")
+        _send_keys_sequence("<CTRL+A><DEL>new content")
+        _send_keys_sequence("<WINKEY+R>notepad<ENTER>")
+    """
+    import re as _re
+    import pyautogui as _pag
+    _pag.FAILSAFE = False
+
+    # Tokenise: split on <...> tags preserving the tags
+    tokens = _re.split(r'(<[^>]+>)', text)
+    for tok in tokens:
+        if not tok:
+            continue
+        if tok.startswith('<') and tok.endswith('>'):
+            inner = tok[1:-1].strip()
+            parts = [p.strip() for p in inner.split('+')]
+            keys  = [_resolve_key(p) for p in parts]
+            if len(keys) == 1:
+                try:
+                    _pag.press(keys[0])
+                except Exception as e:
+                    app_logger.warning(f"sendkeys: press({keys[0]}) failed: {e}")
+            else:
+                try:
+                    _pag.hotkey(*keys)
+                except Exception as e:
+                    app_logger.warning(f"sendkeys: hotkey({keys}) failed: {e}")
+        else:
+            # Literal text — type it character by character to handle Unicode
+            try:
+                _pag.write(tok, interval=0.02)
+            except Exception:
+                # Fallback: clipboard paste for non-ASCII characters
+                import pyperclip
+                pyperclip.copy(tok)
+                time.sleep(max(paste_delay, 0.05))
+                _pag.hotkey('ctrl', 'v')
+
 class WhisperRApp(QMainWindow):
     sig_toggle_vis = pyqtSignal()
     sig_toggle_rec = pyqtSignal()
@@ -1668,6 +1961,8 @@ class WhisperRApp(QMainWindow):
             app_logger.debug("→ Building UI (setup_ui)...")
             self.setup_ui()
             app_logger.debug("✓ setup_ui() complete")
+            self.pop_mics()
+            app_logger.debug("✓ pop_mics() complete")
 
             app_logger.debug("→ Creating TranscriberWorker...")
             self.transcriber = TranscriberWorker(self.config)
@@ -1689,6 +1984,13 @@ class WhisperRApp(QMainWindow):
             app_logger.debug("✓ App-level signals connected")
             
             app_logger.debug("Setting up icons...")
+            # Set the Windows AppUserModelID — without this, Windows groups the
+            # window under the Python interpreter's taskbar entry instead of our exe.
+            try:
+                import ctypes as _c
+                _c.windll.shell32.SetCurrentProcessExplicitAppUserModelID("WhisperR.App.1")
+            except Exception:
+                pass
             icon_path = os.path.join(BASE_DIR, "icon.png")
             app_logger.debug(f"  __init__: Looking for icon at: {icon_path}")
             app_logger.debug(f"  __init__: icon.png exists: {os.path.exists(icon_path)}")
@@ -1710,6 +2012,7 @@ class WhisperRApp(QMainWindow):
             else:
                 app_icon = QIcon()
                 app_logger.warning("icon.png not found — no custom icon set")
+            self._app_icon = app_icon  # keep reference for tray idle state
             
             app_logger.debug("  __init__: Creating QSystemTrayIcon...")
             self.tray = QSystemTrayIcon(self)
@@ -1741,6 +2044,8 @@ class WhisperRApp(QMainWindow):
             self.m_timer.timeout.connect(self.monitor_dirs)
             self.m_timer.start(5000)
             app_logger.debug("✓ Folder monitor timer started")
+            # QFileSystemWatcher for real-time folder monitoring
+            self._setup_ft_watcher()
             
             # No standalone pa_sys / meter_timer.
             # The live meter is driven purely by AudioRecorder.volume_out signal
@@ -1755,6 +2060,8 @@ class WhisperRApp(QMainWindow):
             self._is_transcribing = False
             self._ptt_held: set   = set()  # tracks currently held keys for combo PTT
             self._last_paste_text: str = ""   # last pasted text (for rollback)
+            self._session_buffer:  str = ""   # running concat of all pastes this session (for select/move)
+            self._cursor_ops_pending: bool = False  # next transcription should be lowercased (select/move used)
             self._rollback_pending: bool = False  # lowercase first result of next session
             self._rollback_armed:   bool = False  # set by rollback hotkey, consumed by toggle_rec
             self._ptt_starting: bool = False  # guard: recorder start in progress
@@ -1843,21 +2150,111 @@ class WhisperRApp(QMainWindow):
         # ===== MAIN TAB =====
         t1 = QWidget()
         l1 = QVBoxLayout(t1)
+        l1.setSpacing(0)
+        l1.setContentsMargins(4, 4, 4, 4)
+
+        # ── Splitter with two collapsible panes ──────────────────────────────
+        self._main_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._main_splitter.setHandleWidth(6)
+        self._main_splitter.setStyleSheet(
+            "QSplitter::handle { background: #2a2a2a; border-top: 1px solid #444; }"
+            "QSplitter::handle:hover { background: #0078d7; }"
+        )
+
+        # Helper: build one collapsible pane
+        def _make_pane(title, placeholder):
+            outer = QWidget()
+            vl = QVBoxLayout(outer)
+            vl.setContentsMargins(0, 0, 0, 0)
+            vl.setSpacing(2)
+
+            # Header row: label + collapse button
+            hdr = QHBoxLayout()
+            hdr.setContentsMargins(0, 0, 0, 0)
+            lbl = QLabel(title)
+            lbl.setStyleSheet("font-weight: bold; color: #aaa; font-size: 8pt; padding: 2px 4px;")
+            btn = QPushButton("▲")
+            btn.setFixedSize(22, 18)
+            btn.setStyleSheet(
+                "QPushButton { background: #252525; border: 1px solid #444; color: #aaa; "
+                "font-size: 9pt; padding: 0; border-radius: 3px; }"
+                "QPushButton:hover { background: #0078d7; color: #fff; }"
+            )
+            btn.setToolTip("Collapse / expand this pane")
+            hdr.addWidget(lbl)
+            hdr.addStretch()
+            hdr.addWidget(btn)
+            vl.addLayout(hdr)
+
+            ta = QTextEdit()
+            ta.setFont(QFont("Consolas", 9))
+            ta.setPlaceholderText(placeholder)
+            ta.setReadOnly(False)
+            vl.addWidget(ta)
+
+            # Collapse/expand toggle
+            def _toggle(checked=None, _ta=ta, _btn=btn, _outer=outer):
+                if _ta.isVisible():
+                    _ta.hide()
+                    _btn.setText("▼")
+                    _outer.setMinimumHeight(24)
+                    _outer.setMaximumHeight(24)
+                    # Give all space to the other pane
+                    idx = self._main_splitter.indexOf(_outer)
+                    other = 1 - idx
+                    sizes = list(self._main_splitter.sizes())
+                    total = sum(sizes)
+                    sizes[idx] = 0
+                    sizes[other] = total
+                    self._main_splitter.setSizes(sizes)
+                else:
+                    _ta.show()
+                    _btn.setText("▲")
+                    _outer.setMinimumHeight(60)
+                    _outer.setMaximumHeight(16777215)
+                    idx = self._main_splitter.indexOf(_outer)
+                    other = 1 - idx
+                    sizes = list(self._main_splitter.sizes())
+                    total = sum(sizes)
+                    half = total // 2
+                    sizes[idx] = half
+                    sizes[other] = total - half
+                    self._main_splitter.setSizes(sizes)
+
+            btn.clicked.connect(_toggle)
+            return outer, ta
+
+        results_pane, self.results_area = _make_pane(
+            "Results  (transcription output)",
+            "Transcription results will appear here...")
+        log_pane,     self.log_area     = _make_pane(
+            "Log  (system messages)",
+            "System messages will appear here...")
+
+        self._main_splitter.addWidget(results_pane)
+        self._main_splitter.addWidget(log_pane)
+        self._main_splitter.setSizes([320, 160])
+        self._main_splitter.setCollapsible(0, False)
+        self._main_splitter.setCollapsible(1, False)
+
+        # Keep self.scratchpad as alias → all existing .append() calls go to log_area
+        self.scratchpad = self.log_area
+
+        l1.addWidget(self._main_splitter)
         
-        # Compact label with minimal space
-        label_layout = QVBoxLayout()
-        label_layout.setSpacing(0)
-        label_layout.setContentsMargins(0, 0, 0, 20)  # 20px bottom margin
-        logs_label = QLabel("Logs & Results:")
-        logs_label.setStyleSheet("font-weight: bold;")
-        label_layout.addWidget(logs_label)
-        l1.addLayout(label_layout)
-        
-        # Textarea takes rest of space
-        self.scratchpad = QTextEdit()
-        self.scratchpad.setFont(QFont("Consolas", 9))
-        l1.addWidget(self.scratchpad)  # No max height - takes all available space
-        
+        # ── Live volume meter (driven by AudioRecorder.volume_out) ────
+        self.live_meter = QProgressBar()
+        self.live_meter.setRange(0, 8000)
+        self.live_meter.setValue(0)
+        self.live_meter.setTextVisible(False)
+        self.live_meter.setFixedHeight(6)
+        self.live_meter.setStyleSheet(
+            "QProgressBar { background:#1a1a1a; border:none; border-radius:3px; }"
+            "QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            "  stop:0 #28b450, stop:0.6 #f0a000, stop:1.0 #e74c3c); border-radius:3px; }"
+        )
+        l1.addWidget(self.live_meter)
+
         # ── App state indicator ──────────────────────────────────────
         # A simple coloured dot + label embedded in the main window.
         # Zero floating-window complexity — works perfectly in frozen mode.
@@ -1874,13 +2271,7 @@ class WhisperRApp(QMainWindow):
         self.btn_toggle = QPushButton("Start Dictation")
         self.btn_toggle.setFixedHeight(40)
         self.btn_toggle.clicked.connect(self.toggle_rec)
-        
-        self.btn_import = QPushButton("Import Audio Files")
-        self.btn_import.setFixedHeight(40)
-        self.btn_import.clicked.connect(self.import_files)
-        
         hb.addWidget(self.btn_toggle)
-        hb.addWidget(self.btn_import)
         l1.addLayout(hb)
         
         self.tabs.addTab(t1, "Main")
@@ -1928,16 +2319,131 @@ class WhisperRApp(QMainWindow):
         btn_row = QHBoxLayout()
         ba = QPushButton("Add Row")
         ba.clicked.connect(lambda: self.cmd_table.insertRow(self.cmd_table.rowCount()))
-        
         bd = QPushButton("Delete Selected Row")
         bd.clicked.connect(self.delete_command_row)
-        
+        bi_cmd = QPushButton("Import .txt")
+        bi_cmd.clicked.connect(self._import_commands)
+        be_cmd = QPushButton("Export .txt")
+        be_cmd.clicked.connect(self._export_commands)
         btn_row.addWidget(ba)
         btn_row.addWidget(bd)
+        btn_row.addWidget(bi_cmd)
+        btn_row.addWidget(be_cmd)
         l2.addLayout(btn_row)
-        
+
+        # ===== TERMS TAB =====
+        t_terms = QWidget()
+        l_terms = QVBoxLayout(t_terms)
+        lbl_terms = QLabel(
+            "Text Replacements \u2014 applied after transcription, before pasting.\n"
+            "Left: phrase Whisper says (matched case-insensitively).\n"
+            "Right: replacement text \u2014 may include <KEY> tags for special keys.\n"
+            "Examples:   sign off \u2192 Best regards,<ENTER>John       bold it \u2192 <CTRL+B>"
+        )
+        lbl_terms.setWordWrap(True)
+        l_terms.addWidget(lbl_terms)
+        self.terms_table = QTableWidget(0, 2)
+        self.terms_table.setHorizontalHeaderLabels(["Recognised Phrase", "Replacement Text"])
+        self.terms_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        for k, v in self.config.settings.get("terms", {}).items():
+            r = self.terms_table.rowCount()
+            self.terms_table.insertRow(r)
+            self.terms_table.setItem(r, 0, QTableWidgetItem(k))
+            self.terms_table.setItem(r, 1, QTableWidgetItem(v))
+        l_terms.addWidget(self.terms_table)
+        terms_btn_row = QHBoxLayout()
+        ta = QPushButton("Add Row")
+        ta.clicked.connect(lambda: self.terms_table.insertRow(self.terms_table.rowCount()))
+        td = QPushButton("Delete Selected Row")
+        td.clicked.connect(self._delete_terms_row)
+        ti = QPushButton("Import .txt")
+        ti.clicked.connect(self._import_terms)
+        te = QPushButton("Export .txt")
+        te.clicked.connect(self._export_terms)
+        terms_btn_row.addWidget(ta)
+        terms_btn_row.addWidget(td)
+        terms_btn_row.addWidget(ti)
+        terms_btn_row.addWidget(te)
+        l_terms.addLayout(terms_btn_row)
+        self.tabs.addTab(t_terms, "Terms")
+
         self.tabs.addTab(t2, "Commands")
-        
+
+        # ===== FILE TRANSCRIPTION TAB =====
+        t_ft = QWidget()
+        l_ft = QVBoxLayout(t_ft)
+
+        # ── Queue list ──────────────────────────────────────────────────
+        queue_lbl = QLabel("Files to Transcribe  (drag & drop audio files here):")
+        queue_lbl.setStyleSheet("font-weight: bold;")
+        l_ft.addWidget(queue_lbl)
+
+        self.ft_list = QListWidget()
+        self.ft_list.setAcceptDrops(True)
+        self.ft_list.setDragDropMode(QListWidget.DragDropMode.DropOnly)
+        self.ft_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.ft_list.setMinimumHeight(140)
+        # Enable drop events by subclassing with a local event-filter
+        self.ft_list.installEventFilter(self)
+        l_ft.addWidget(self.ft_list)
+
+        ft_list_btns = QHBoxLayout()
+        ft_add_btn = QPushButton("Add Files...")
+        ft_add_btn.clicked.connect(self._ft_add_files)
+        ft_del_btn = QPushButton("Remove Selected")
+        ft_del_btn.clicked.connect(self._ft_remove_selected)
+        ft_clear_btn = QPushButton("Clear All")
+        ft_clear_btn.clicked.connect(self.ft_list.clear)
+        ft_list_btns.addWidget(ft_add_btn)
+        ft_list_btns.addWidget(ft_del_btn)
+        ft_list_btns.addWidget(ft_clear_btn)
+        l_ft.addLayout(ft_list_btns)
+
+        # ── Output folder ────────────────────────────────────────────────
+        ft_out_group = QGroupBox("Output Folder")
+        ft_out_layout = QFormLayout()
+        ft_out_row = QHBoxLayout()
+        self.ft_output_folder = QLineEdit(self.config.settings.get("ft_output_folder", ""))
+        ft_browse_out = QPushButton("Browse")
+        ft_browse_out.clicked.connect(lambda: self.browse_f(self.ft_output_folder))
+        ft_out_row.addWidget(self.ft_output_folder)
+        ft_out_row.addWidget(ft_browse_out)
+        ft_out_layout.addRow("Save transcriptions to:", ft_out_row)
+        ft_out_group.setLayout(ft_out_layout)
+        l_ft.addWidget(ft_out_group)
+
+        # ── Monitor folder ────────────────────────────────────────────────
+        ft_mon_group = QGroupBox("Folder Monitor")
+        ft_mon_layout = QFormLayout()
+        ft_mon_row = QHBoxLayout()
+        self.ft_mon_folder = QLineEdit(self.config.settings.get("ft_mon_folder", ""))
+        ft_browse_mon = QPushButton("Browse")
+        ft_browse_mon.clicked.connect(lambda: self.browse_f(self.ft_mon_folder))
+        ft_mon_row.addWidget(self.ft_mon_folder)
+        ft_mon_row.addWidget(ft_browse_mon)
+        ft_mon_layout.addRow("Watch folder:", ft_mon_row)
+        self.ft_mon_enabled = QCheckBox("Enable folder monitoring (new audio files auto-added to queue)")
+        self.ft_mon_enabled.setChecked(self.config.settings.get("ft_mon_enabled", False))
+        self.ft_mon_enabled.toggled.connect(self._ft_mon_toggled)
+        ft_mon_layout.addRow(self.ft_mon_enabled)
+        ft_mon_group.setLayout(ft_mon_layout)
+        l_ft.addWidget(ft_mon_group)
+
+        # ── Transcribe button ─────────────────────────────────────────────
+        self.ft_start_btn = QPushButton("Transcribe All Queued Files")
+        self.ft_start_btn.setFixedHeight(40)
+        self.ft_start_btn.setStyleSheet("font-weight: bold; background-color: #1a5c2a; color: white;")
+        self.ft_start_btn.clicked.connect(self._ft_start_transcription)
+        l_ft.addWidget(self.ft_start_btn)
+
+        self.ft_status_lbl = QLabel("")
+        self.ft_status_lbl.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        l_ft.addWidget(self.ft_status_lbl)
+
+        l_ft.addStretch()
+        self.tabs.addTab(t_ft, "File Transcription")
+
+
         # ===== SETTINGS TAB =====
         sc = QScrollArea()
         cw = QWidget()
@@ -1949,253 +2455,360 @@ class WhisperRApp(QMainWindow):
         
         self.cfg_model = QComboBox()
         self.cfg_model.addItems(WHISPER_MODELS)
+        self.cfg_model.setToolTip(
+            "Larger models are more accurate but slower and use more RAM/VRAM.\n"
+            "tiny/base: fast, low accuracy, good for live dictation on weaker hardware.\n"
+            "small/medium: balanced. large-v3: highest accuracy, needs a GPU."
+        )
         self.cfg_model.setCurrentText(self.config.settings["model"])
         self.cfg_model.currentTextChanged.connect(self._on_model_changed)
         ai_layout.addRow("Whisper Model:", self.cfg_model)
         
         self.cfg_lang = QComboBox()
         self.cfg_lang.addItems(list(LANG_MAP.keys()))
+        self.cfg_lang.setToolTip(
+            "Set to the language you will be speaking.\n"
+            "Auto lets Whisper detect the language each time (slightly slower)."
+        )
         self.cfg_lang.setCurrentText(self.config.settings["lang_name"])
         ai_layout.addRow("Language:", self.cfg_lang)
         
         self.cfg_ts = QCheckBox("Include timestamps")
+        self.cfg_ts.setToolTip(
+            "Prepend [HH:MM:SS] timestamps to each transcribed segment.\n"
+            "Useful for audio files. Usually unwanted for live dictation."
+        )
         self.cfg_ts.setChecked(self.config.settings["timestamps"])
         ai_layout.addRow(self.cfg_ts)
         
         self.cfg_trans = QCheckBox("Translation mode (to English)")
+        self.cfg_trans.setToolTip(
+            "When enabled, Whisper translates speech to English regardless of source language.\n"
+            "Disable this if you want the transcription in the original spoken language."
+        )
         self.cfg_trans.setChecked(self.config.settings["translate"])
         ai_layout.addRow(self.cfg_trans)
-        
+
+        # -- Confidence filtering (under AI Model since it directly affects transcription output) --
+        self.cfg_use_confidence = QCheckBox("Enable confidence filtering")
+        self.cfg_use_confidence.setChecked(self.config.settings.get("use_confidence", False))
+        self.cfg_use_confidence.setToolTip(
+            "When enabled, Whisper segments whose confidence is below the threshold\n"
+            "are silently dropped before pasting.\n\n"
+            "Higher value (slider right) = stricter: drops MORE uncertain segments.\n"
+            "Lower value (slider left)  = lenient: keeps even uncertain segments.\n\n"
+            "Start around 0.50 and raise if you notice hallucinated words."
+        )
+        ai_layout.addRow(self.cfg_use_confidence)
+
+        self.cfg_conf_spin = SpinWidget(
+            is_double=True, min_v=0.0, max_v=1.0, step=0.05,
+            value=self.config.settings.get("min_confidence", 0.5), decimals=2,
+            use_slider=True, spin_width=70)
+        self.cfg_conf_spin.setToolTip(
+            "Filters out low-confidence segments based on Whisper's avg_logprob score.\n"
+            "Formula: segment kept if avg_logprob >= -(1 - min_confidence)\n"
+            "  0.0 = keep everything   0.5 = threshold -0.5   0.9 = threshold -0.1\n"
+            "Real speech typically scores between -0.1 (clear) and -0.6 (noisy).\n"
+            "Recommended: 0.4-0.6 for most use cases. 0.9 is very strict."
+        )
+        ai_layout.addRow("Min. Confidence (0-1):", self.cfg_conf_spin)
+
         ai_group.setLayout(ai_layout)
         main_layout.addWidget(ai_group)
-        
+
         # --- Audio Input Settings ---
         audio_group = QGroupBox("Audio Input Settings")
         audio_layout = QFormLayout()
-        
+
+        mic_row = QHBoxLayout()
         self.cfg_mic = QComboBox()
-        self.cfg_mic.setPlaceholderText("— Select microphone —")
-        self.pop_mics()
-        # Connect signal to reset meter when device changes
-        self.cfg_mic.currentIndexChanged.connect(self.on_mic_changed)
-        audio_layout.addRow("Microphone:", self.cfg_mic)
-        
-        self.cfg_dict_m = QComboBox()
-        self.cfg_dict_m.addItems(["Continuous", "Auto-Pause"])
-        self.cfg_dict_m.setCurrentText(self.config.settings["dict_mode"])
-        audio_layout.addRow("Detection Mode:", self.cfg_dict_m)
-        
-        self.cfg_p_sec = QDoubleSpinBox()
-        self.cfg_p_sec.setRange(0.1, 5.0)
-        self.cfg_p_sec.setValue(self.config.settings["auto_pause_sec"])
-        self.cfg_p_sec.setSuffix(" sec")
-        audio_layout.addRow("Silence Threshold:", self.cfg_p_sec)
-        
+        self.cfg_mic.setToolTip(
+            "Select the microphone to use for dictation.\n"
+            "The app shows all input devices found by PyAudio.\n"
+            "If your mic is missing, check Windows Sound settings."
+        )
+        mic_row.addWidget(self.cfg_mic, stretch=1)
+        audio_layout.addRow("Microphone:", mic_row)
+
+        levels_layout = QHBoxLayout()
+        self.n_spin = SpinWidget(min_v=0, max_v=8000, step=10,
+                               value=self.config.settings["noise_floor"])
+        self.n_spin.setToolTip(
+            "RMS level below which audio is considered silence.\n"
+            "Use Calibrate to set automatically."
+        )
+        self.s_spin = SpinWidget(min_v=0, max_v=8000, step=10,
+                               value=self.config.settings["speech_vol"])
+        self.s_spin.setToolTip(
+            "RMS level above which audio is considered speech.\n"
+            "Use Calibrate to set automatically."
+        )
+        audio_layout.addRow("Noise Floor:", self.n_spin)
+        audio_layout.addRow("Speech Vol:", self.s_spin)
+
+        cal_row = QHBoxLayout()
+        self.btn_cal = QPushButton("Calibrate Mic Levels")
+        self.btn_cal.clicked.connect(self.start_cal)
+        self.btn_cal.setToolTip(
+            "Records ~10 s of silence then ~10 s of speech to set Noise Floor and Speech Vol."
+        )
+        self.cal_prog = QProgressBar()
+        self.cal_prog.setRange(0, 100)
+        self.cal_prog.setFixedHeight(14)
+        self.lbl_cal = QLabel("")
+        cal_row.addWidget(self.btn_cal)
+        cal_row.addWidget(self.cal_prog)
+        cal_row.addWidget(self.lbl_cal)
+        audio_layout.addRow(cal_row)
+
         audio_group.setLayout(audio_layout)
         main_layout.addWidget(audio_group)
-        
-        # --- Microphone Calibration ---
-        cal_group = QGroupBox("Microphone Calibration")
-        cal_layout = QVBoxLayout()
-        
-        cal_layout.addWidget(QLabel("Live Input Level:"))
-        self.live_meter = QProgressBar()
-        self.live_meter.setRange(0, 5000)
-        cal_layout.addWidget(self.live_meter)
-        
-        self.btn_cal = QPushButton("Run Auto-Calibration")
-        self.btn_cal.clicked.connect(self.start_cal)
-        cal_layout.addWidget(self.btn_cal)
-        
-        self.cal_prog = QProgressBar()
-        cal_layout.addWidget(self.cal_prog)
-        
-        self.lbl_cal = QLabel("Idle")
-        cal_layout.addWidget(self.lbl_cal)
-        
-        levels_layout = QHBoxLayout()
-        levels_layout.addWidget(QLabel("Noise Floor:"))
-        self.n_spin = QSpinBox()
-        self.n_spin.setRange(0, 8000)
-        self.n_spin.setValue(self.config.settings["noise_floor"])
-        levels_layout.addWidget(self.n_spin)
-        
-        levels_layout.addWidget(QLabel("Speech Level:"))
-        self.s_spin = QSpinBox()
-        self.s_spin.setRange(0, 8000)
-        self.s_spin.setValue(self.config.settings["speech_vol"])
-        levels_layout.addWidget(self.s_spin)
-        
-        cal_layout.addLayout(levels_layout)
-        cal_group.setLayout(cal_layout)
-        main_layout.addWidget(cal_group)
-        
-        # --- Hotkeys ---
-        hotkey_group = QGroupBox("Keyboard Shortcuts")
-        hotkey_layout = QFormLayout()
-        
-        self.btn_hk1 = QPushButton(self.config.settings["hotkey"])
-        self.btn_hk1.clicked.connect(lambda: self.cap_hk(self.btn_hk1, "hotkey"))
-        hotkey_layout.addRow("Toggle Dictation:", self.btn_hk1)
-        
-        # Note about PTT
-        ptt_info = QLabel("Note: PTT key will also function normally in other apps")
-        ptt_info.setStyleSheet("color: #888; font-size: 8pt; font-style: italic;")
-        ptt_info.setWordWrap(True)
-        hotkey_layout.addRow(ptt_info)
-        
-        self.btn_hk_vis = QPushButton(self.config.settings["visibility_hotkey"])
-        self.btn_hk_vis.clicked.connect(lambda: self.cap_hk(self.btn_hk_vis, "visibility_hotkey"))
-        hotkey_layout.addRow("Show/Hide Window:", self.btn_hk_vis)
 
-        self.btn_hk_rollback = QPushButton(self.config.settings.get("rollback_hotkey", "ctrl+shift+z"))
-        self.btn_hk_rollback.clicked.connect(lambda: self.cap_hk(self.btn_hk_rollback, "rollback_hotkey"))
-        self.btn_hk_rollback.setToolTip(
-            "Erase trailing punctuation/fragment from the last transcription\n"
-            "and position the cursor for seamless continuation."
+        # --- Dictation Settings ---
+        dict_group = QGroupBox("Dictation Settings")
+        dict_layout = QFormLayout()
+
+        self.cfg_dict_m = QComboBox()
+        self.cfg_dict_m.addItems(["Simple", "Auto-Pause", "Continuous"])
+        self.cfg_dict_m.setCurrentText(self.config.settings.get("dict_mode", "Simple"))
+        self.cfg_dict_m.setToolTip(
+            "Simple: records until you stop manually, then transcribes.\n"
+            "Auto-Pause: detects silence and auto-stops to transcribe.\n"
+            "Continuous: transcribes in a rolling loop while active."
         )
-        hotkey_layout.addRow("Resume Transcription:", self.btn_hk_rollback)
+        dict_layout.addRow("Dictation Mode:", self.cfg_dict_m)
 
         self.cfg_live_mode = QComboBox()
-        self.cfg_live_mode.addItems(["Simple", "Push-To-Talk"])
+        self.cfg_live_mode.addItems(["Simple", "Auto-Pause", "Continuous"])
         self.cfg_live_mode.setCurrentText(self.config.settings.get("live_mode", "Simple"))
-        self.cfg_live_mode.setToolTip(
-            "Simple: dictation starts/stops with the Toggle Dictation hotkey.\n"
-            "Push-To-Talk: hold the PTT key to record; release to transcribe."
+        self.cfg_live_mode.setToolTip("Mode used when dictation is triggered via the hotkey.")
+        dict_layout.addRow("Live Mode:", self.cfg_live_mode)
+
+        self.cfg_p_sec = SpinWidget(is_double=True, min_v=0.1, max_v=10.0,
+                               step=0.1, decimals=1,
+                               value=self.config.settings.get("auto_pause_sec", 1.5))
+        self.cfg_p_sec.setToolTip(
+            "Auto-Pause: seconds of silence before transcription triggers.\n"
+            "1.0-2.0 s works well for most people."
         )
-        hotkey_layout.addRow("Dictation Mode:", self.cfg_live_mode)
+        dict_layout.addRow("Auto-Pause Silence (s):", self.cfg_p_sec)
+
+        self.cfg_p_win = SpinWidget(is_double=True, min_v=0.0, max_v=3.0,
+                               step=0.05, decimals=2,
+                               value=self.config.settings.get("paste_delay", 0.5))
+        self.cfg_p_win.setToolTip(
+            "Seconds to wait after copying to clipboard before sending Ctrl+V.\n"
+            "Increase if text sometimes fails to paste. 0.1-0.5 s is usual."
+        )
+        dict_layout.addRow("Paste Delay (s):", self.cfg_p_win)
+
+        self.cfg_space = QCheckBox("Auto-add space after each transcription")
+        self.cfg_space.setChecked(self.config.settings.get("auto_space", True))
+        self.cfg_space.setToolTip(
+            "Appends a trailing space after every pasted segment so the\n"
+            "next dictation starts a new word automatically."
+        )
+        dict_layout.addRow(self.cfg_space)
+
+        dict_group.setLayout(dict_layout)
+        main_layout.addWidget(dict_group)
+
+        # --- Hotkeys ---
+        hotkey_group = QGroupBox("Hotkeys  (click a button to re-assign)")
+        hotkey_layout = QFormLayout()
+
+        self.btn_hk1 = QPushButton(self.config.settings["hotkey"])
+        self.btn_hk1.clicked.connect(lambda: self.cap_hk(self.btn_hk1, "hotkey"))
+        self.btn_hk1.setToolTip("Toggle dictation on/off.")
+        hotkey_layout.addRow("Toggle Dictation:", self.btn_hk1)
+
+        self.btn_hk_vis = QPushButton(self.config.settings["visibility_hotkey"])
+        self.btn_hk_vis.clicked.connect(lambda: self.cap_hk(self.btn_hk_vis, "visibility_hotkey"))
+        self.btn_hk_vis.setToolTip("Show or hide the main window.")
+        hotkey_layout.addRow("Show/Hide Window:", self.btn_hk_vis)
+
+        self.btn_hk_rollback = QPushButton(self.config.settings["rollback_hotkey"])
+        self.btn_hk_rollback.clicked.connect(lambda: self.cap_hk(self.btn_hk_rollback, "rollback_hotkey"))
+        self.btn_hk_rollback.setToolTip(
+            "Erases the last pasted segment and lowercases the first\n"
+            "letter of the next transcription (for smooth sentence joining)."
+        )
+        hotkey_layout.addRow("Rollback Last:", self.btn_hk_rollback)
 
         self.btn_hk2 = QPushButton(self.config.settings["ptt_key"])
         self.btn_hk2.clicked.connect(lambda: self.cap_hk(self.btn_hk2, "ptt_key"))
-        hotkey_layout.addRow("Push-to-Talk Key:", self.btn_hk2)
-        
+        self.btn_hk2.setToolTip(
+            "Hold this key/combo to record (Push-To-Talk).\n"
+            "Works regardless of Dictation Mode. Keys are suppressed\n"
+            "while held so they don't reach other apps."
+        )
+        hotkey_layout.addRow("Push-to-Talk:", self.btn_hk2)
+
         hotkey_group.setLayout(hotkey_layout)
         main_layout.addWidget(hotkey_group)
-        
-        # --- Output & Behavior ---
-        output_group = QGroupBox("Output & Behavior")
-        output_layout = QFormLayout()
-        
-        self.cfg_p_win = QDoubleSpinBox()
-        self.cfg_p_win.setRange(0.1, 5.0)
-        self.cfg_p_win.setValue(self.config.settings["paste_delay"])
-        self.cfg_p_win.setSuffix(" sec")
-        output_layout.addRow("Paste Delay:", self.cfg_p_win)
-        
-        self.cfg_space = QCheckBox("Auto-append space after paste")
-        self.cfg_space.setChecked(self.config.settings["auto_space"])
-        output_layout.addRow(self.cfg_space)
-        
-        self.cfg_tray = QCheckBox("Minimize to system tray")
-        self.cfg_tray.setChecked(self.config.settings["min_to_tray"])
-        output_layout.addRow(self.cfg_tray)
-        
-        output_group.setLayout(output_layout)
-        main_layout.addWidget(output_group)
-        
+
+        # --- Visual Indicators ---
+        visual_group = QGroupBox("Visual Indicators")
+        visual_layout = QFormLayout()
+
+        self.cfg_ind_show = QCheckBox("Show status indicator overlay")
+        self.cfg_ind_show.setChecked(self.config.settings.get("ind_show", True))
+        self.cfg_ind_show.setToolTip("Show/hide the floating dot or bar that shows recording state.")
+        visual_layout.addRow(self.cfg_ind_show)
+
+        self.cfg_ind_type = QComboBox()
+        self.cfg_ind_type.addItems(["Dot", "Bar", "Both"])
+        self.cfg_ind_type.setCurrentText(self.config.settings.get("ind_type", "Both"))
+        self.cfg_ind_type.setToolTip("Dot: small circle. Bar: thin edge bar. Both: show both.")
+        visual_layout.addRow("Indicator Type:", self.cfg_ind_type)
+
+        self.cfg_ind_pos = QComboBox()
+        self.cfg_ind_pos.addItems(["Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right"])
+        self.cfg_ind_pos.setCurrentText(self.config.settings.get("ind_pos", "Top-Right"))
+        visual_layout.addRow("Dot Position:", self.cfg_ind_pos)
+
+        self.cfg_bar_edge = QComboBox()
+        self.cfg_bar_edge.addItems(["Top", "Bottom", "Left", "Right"])
+        self.cfg_bar_edge.setCurrentText(self.config.settings.get("bar_edge", "Top"))
+        visual_layout.addRow("Bar Edge:", self.cfg_bar_edge)
+
+        self.cfg_ind_sz = SpinWidget(min_v=8, max_v=128, step=2,
+                               value=self.config.settings.get("ind_size", 32))
+        self.cfg_ind_sz.setToolTip("Size of the dot indicator in pixels.")
+        visual_layout.addRow("Dot Size (px):", self.cfg_ind_sz)
+
+        self.cfg_ind_off = SpinWidget(min_v=0, max_v=200, step=2,
+                               value=self.config.settings.get("ind_off", 20))
+        self.cfg_ind_off.setToolTip("Pixel offset from the screen edge.")
+        visual_layout.addRow("Dot Offset (px):", self.cfg_ind_off)
+
+        self.cfg_bar_thickness = SpinWidget(min_v=1, max_v=30, step=1,
+                               value=self.config.settings.get("bar_thickness", 5))
+        visual_layout.addRow("Bar Thickness (px):", self.cfg_bar_thickness)
+
+        self.cfg_ind_hide_idle = QCheckBox("Hide indicator when idle")
+        self.cfg_ind_hide_idle.setChecked(self.config.settings.get("ind_hide_idle", True))
+        self.cfg_ind_hide_idle.setToolTip("Auto-hides the overlay when the app is not recording.")
+        visual_layout.addRow(self.cfg_ind_hide_idle)
+
+        visual_group.setLayout(visual_layout)
+        main_layout.addWidget(visual_group)
+
         # --- File Storage ---
         storage_group = QGroupBox("File Storage")
         storage_layout = QFormLayout()
-        
+
         rec_row = QHBoxLayout()
         self.cfg_folder = QLineEdit(self.config.settings["audio_folder"])
+        self.cfg_folder.setToolTip("Where live dictation WAV recordings are saved.")
         b_f = QPushButton("Browse")
         b_f.clicked.connect(lambda: self.browse_f(self.cfg_folder))
         rec_row.addWidget(self.cfg_folder)
         rec_row.addWidget(b_f)
         storage_layout.addRow("Recordings Folder:", rec_row)
-        
-        mon_row = QHBoxLayout()
-        self.cfg_mon = QLineEdit(self.config.settings["mon_folder"])
-        b_m = QPushButton("Browse")
-        b_m.clicked.connect(lambda: self.browse_f(self.cfg_mon))
-        mon_row.addWidget(self.cfg_mon)
-        mon_row.addWidget(b_m)
-        storage_layout.addRow("Monitor Folder:", mon_row)
-        
-        self.cfg_ram = QCheckBox("RAM-only mode (no disk writes)")
+
+        self.cfg_ram = QCheckBox("RAM-only mode (no disk writes for recordings)")
         self.cfg_ram.setChecked(not self.config.settings["save_to_disk"])
+        self.cfg_ram.setToolTip(
+            "Keeps recordings in memory only — never written to disk.\n"
+            "Reduces SSD wear. Transcription still works normally."
+        )
         storage_layout.addRow(self.cfg_ram)
-        
+
         self.cfg_clear = QCheckBox("Clear recordings on exit")
         self.cfg_clear.setChecked(self.config.settings["clear_exit"])
+        self.cfg_clear.setToolTip("Deletes all WAV files from the recordings folder when the app closes.")
         storage_layout.addRow(self.cfg_clear)
-        
+
+        self.cfg_tray = QCheckBox("Minimize to system tray")
+        self.cfg_tray.setChecked(self.config.settings["min_to_tray"])
+        self.cfg_tray.setToolTip(
+            "Closing the window hides to tray instead of quitting.\n"
+            "Right-click the tray icon to quit."
+        )
+        storage_layout.addRow(self.cfg_tray)
+
         storage_group.setLayout(storage_layout)
         main_layout.addWidget(storage_group)
-        
-        # --- Visual Indicators ---
-        visual_group = QGroupBox("Visual Indicators")
-        visual_layout = QFormLayout()
-        
-        self.cfg_ind_show = QCheckBox("Enable status indicators")
-        self.cfg_ind_show.setChecked(self.config.settings["ind_show"])
-        visual_layout.addRow(self.cfg_ind_show)
-        
-        self.cfg_ind_type = QComboBox()
-        self.cfg_ind_type.addItems(["Icons", "Bar", "Both"])
-        self.cfg_ind_type.setCurrentText(self.config.settings["ind_type"])
-        visual_layout.addRow("Indicator Type:", self.cfg_ind_type)
-        
-        self.cfg_ind_pos = QComboBox()
-        self.cfg_ind_pos.addItems(["Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right"])
-        self.cfg_ind_pos.setCurrentText(self.config.settings["ind_pos"])
-        visual_layout.addRow("Icon Position:", self.cfg_ind_pos)
-        
-        self.cfg_bar_edge = QComboBox()
-        self.cfg_bar_edge.addItems(["Top", "Bottom", "Left", "Right"])
-        self.cfg_bar_edge.setCurrentText(self.config.settings["bar_edge"])
-        visual_layout.addRow("Bar Edge:", self.cfg_bar_edge)
-        
-        self.cfg_bar_thickness = QSpinBox()
-        self.cfg_bar_thickness.setRange(1, 50)
-        self.cfg_bar_thickness.setValue(self.config.settings.get("bar_thickness", 5))
-        self.cfg_bar_thickness.setSuffix(" px")
-        self.cfg_bar_thickness.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # Ensure it gets focus
-        visual_layout.addRow("Bar Thickness:", self.cfg_bar_thickness)
-        
-        self.cfg_ind_sz = QSpinBox()
-        self.cfg_ind_sz.setRange(16, 256)
-        self.cfg_ind_sz.setValue(self.config.settings["ind_size"])
-        self.cfg_ind_sz.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        visual_layout.addRow("Icon Size:", self.cfg_ind_sz)
-        
-        self.cfg_ind_off = QSpinBox()
-        self.cfg_ind_off.setRange(0, 256)
-        self.cfg_ind_off.setValue(self.config.settings["ind_off"])
-        self.cfg_ind_off.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        visual_layout.addRow("Corner Offset:", self.cfg_ind_off)
-        
-        self.cfg_ind_hide_idle = QCheckBox("Hide indicators when idle (dictation off)")
-        self.cfg_ind_hide_idle.setChecked(self.config.settings.get("ind_hide_idle", True))
-        visual_layout.addRow(self.cfg_ind_hide_idle)
-        
-        visual_group.setLayout(visual_layout)
-        main_layout.addWidget(visual_group)
-        
+
         # --- Advanced ---
         advanced_group = QGroupBox("Advanced")
         advanced_layout = QFormLayout()
-        
+
+        sk_row = QHBoxLayout()
+        self.cfg_sk_trigger = QLineEdit(self.config.settings.get("sendkeys_trigger", "sendkeys"))
+        self.cfg_sk_trigger.setToolTip(
+            "When this word appears in a Command phrase, the action field\n"
+            "is sent as a key sequence instead of launching a program.\n"
+            "Example — Phrase: \"sendkeys undo\"  Action: \"<CTRL+Z>\""
+        )
+        sk_row.addWidget(self.cfg_sk_trigger)
+        advanced_layout.addRow("Sendkeys Trigger Word:", sk_row)
+
+        # ── WhisperNavigate trigger words ─────────────────────────────────
+        _nav_help = (
+            "Say this word followed by any text from the last dictation to\n"
+            "move the cursor or select that text in the active window.\n"
+            "The app navigates by counting characters in the session buffer\n"
+            "and sending arrow / Shift key presses.\n"
+            "Example: \"WhisperSelect Microsoft Corporation\"\n"
+            "The next dictated word will be lowercased automatically."
+        )
+        self.cfg_sel_trigger = QLineEdit(
+            self.config.settings.get("select_trigger", "whisperselect"))
+        self.cfg_sel_trigger.setToolTip(
+            "Select trigger — navigates to the target text and selects it.\n" + _nav_help)
+        advanced_layout.addRow("WhisperSelect Trigger:", self.cfg_sel_trigger)
+
+        self.cfg_move_trigger = QLineEdit(
+            self.config.settings.get("move_trigger", "whispermove"))
+        self.cfg_move_trigger.setToolTip(
+            "Move-before trigger (synonym for WhisperBefore).\n" + _nav_help)
+        advanced_layout.addRow("WhisperMove Trigger:", self.cfg_move_trigger)
+
+        self.cfg_movebefore_trigger = QLineEdit(
+            self.config.settings.get("movebefore_trigger", "whisperbefore"))
+        self.cfg_movebefore_trigger.setToolTip(
+            "Move-before trigger — places cursor immediately BEFORE the target.\n" + _nav_help)
+        advanced_layout.addRow("WhisperBefore Trigger:", self.cfg_movebefore_trigger)
+
+        self.cfg_moveafter_trigger = QLineEdit(
+            self.config.settings.get("moveafter_trigger", "whisperafter"))
+        self.cfg_moveafter_trigger.setToolTip(
+            "Move-after trigger — places cursor immediately AFTER the target.\n" + _nav_help)
+        advanced_layout.addRow("WhisperAfter Trigger:", self.cfg_moveafter_trigger)
+
         self.cfg_log_level = QComboBox()
-        self.cfg_log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
+        self.cfg_log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR", "NONE"])
         self.cfg_log_level.setCurrentText(self.config.settings["log_level"])
+        self.cfg_log_level.setToolTip(
+            "Controls how much is written to app_log.txt.\n"
+            "DEBUG: everything (large file, for troubleshooting).\n"
+            "INFO: normal operation messages.\n"
+            "WARNING/ERROR: only problems.\n"
+            "NONE: no log file written at all (best for SSD longevity)."
+        )
         advanced_layout.addRow("Logging Level:", self.cfg_log_level)
-        
+
         self.cfg_use_vad = QCheckBox("Use VAD (Voice Activity Detection)")
         self.cfg_use_vad.setChecked(self.config.settings.get("use_vad", False))
-        self.cfg_use_vad.setToolTip("Filters out non-speech segments before transcription.\nReduces hallucinations on silence. Recommended for push-to-talk.")
+        self.cfg_use_vad.setToolTip(
+            "Pre-filters audio to remove silence before passing it to Whisper.\n"
+            "Reduces hallucinated words during quiet moments.\n"
+            "NOTE: may cause a DLL conflict in the frozen app — disable if crashes occur."
+        )
         advanced_layout.addRow(self.cfg_use_vad)
-        
+
         self.btn_setup = QPushButton("GPU Acceleration Setup Guide")
         self.btn_setup.setStyleSheet("background-color: #27ae60; color: white;")
         self.btn_setup.clicked.connect(self.setup_deps)
         advanced_layout.addRow(self.btn_setup)
-        
+
         btn_open_log = QPushButton("Open Log File")
         btn_open_log.clicked.connect(self.open_log_file)
         advanced_layout.addRow(btn_open_log)
-        
+
         advanced_group.setLayout(advanced_layout)
         main_layout.addWidget(advanced_group)
         
@@ -2217,6 +2830,83 @@ class WhisperRApp(QMainWindow):
         sc.setWidget(cw)
         sc.setWidgetResizable(True)
         self.tabs.addTab(sc, "Settings")
+
+    def _delete_terms_row(self):
+        row = self.terms_table.currentRow()
+        if row >= 0:
+            self.terms_table.removeRow(row)
+
+    # ── Terms import/export ──────────────────────────────────────────────────
+    # File format: one entry per line, key and value separated by " = "
+    # e.g.:  hexagon software = Hexagon Software
+    def _import_terms(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Terms", "", "Text Files (*.txt)")
+        if not path:
+            return
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+            self.terms_table.setRowCount(0)  # replace, not append
+            for line in lines:
+                if " = " in line:
+                    k, v = line.split(" = ", 1)
+                    r = self.terms_table.rowCount()
+                    self.terms_table.insertRow(r)
+                    self.terms_table.setItem(r, 0, QTableWidgetItem(k.strip()))
+                    self.terms_table.setItem(r, 1, QTableWidgetItem(v.strip()))
+            app_logger.info(f"Terms imported from {path}")
+        except Exception as e:
+            app_logger.error(f"Failed to import terms: {e}")
+
+    def _export_terms(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Terms", "", "Text Files (*.txt)")
+        if not path:
+            return
+        try:
+            lines = []
+            for r in range(self.terms_table.rowCount()):
+                k = self.terms_table.item(r, 0)
+                v = self.terms_table.item(r, 1)
+                if k and v:
+                    lines.append(f"{k.text()} = {v.text()}")
+            Path(path).write_text("\n".join(lines), encoding="utf-8")
+            app_logger.info(f"Terms exported to {path}")
+        except Exception as e:
+            app_logger.error(f"Failed to export terms: {e}")
+
+    # ── Commands import/export ───────────────────────────────────────────────
+    def _import_commands(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Commands", "", "Text Files (*.txt)")
+        if not path:
+            return
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+            self.cmd_table.setRowCount(0)  # replace, not append
+            for line in lines:
+                if " = " in line:
+                    k, v = line.split(" = ", 1)
+                    r = self.cmd_table.rowCount()
+                    self.cmd_table.insertRow(r)
+                    self.cmd_table.setItem(r, 0, QTableWidgetItem(k.strip()))
+                    self.cmd_table.setItem(r, 1, QTableWidgetItem(v.strip()))
+            app_logger.info(f"Commands imported from {path}")
+        except Exception as e:
+            app_logger.error(f"Failed to import commands: {e}")
+
+    def _export_commands(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Commands", "", "Text Files (*.txt)")
+        if not path:
+            return
+        try:
+            lines = []
+            for r in range(self.cmd_table.rowCount()):
+                k = self.cmd_table.item(r, 0)
+                v = self.cmd_table.item(r, 1)
+                if k and v:
+                    lines.append(f"{k.text()} = {v.text()}")
+            Path(path).write_text("\n".join(lines), encoding="utf-8")
+            app_logger.info(f"Commands exported to {path}")
+        except Exception as e:
+            app_logger.error(f"Failed to export commands: {e}")
 
     def delete_command_row(self):
         current_row = self.cmd_table.currentRow()
@@ -2345,7 +3035,6 @@ class WhisperRApp(QMainWindow):
             "lang_name": self.cfg_lang.currentText(),
             "lang_code": LANG_MAP[self.cfg_lang.currentText()],
             "audio_folder": self.cfg_folder.text(),
-            "mon_folder": self.cfg_mon.text(),
             "clear_exit": self.cfg_clear.isChecked(),
             "save_to_disk": not self.cfg_ram.isChecked(),
             "input_device_name": self.cfg_mic.currentText().strip(),
@@ -2361,6 +3050,12 @@ class WhisperRApp(QMainWindow):
             "noise_floor": self.n_spin.value(),
             "speech_vol": self.s_spin.value(),
             "commands": cmds,
+            "terms": {
+                self.terms_table.item(r, 0).text(): self.terms_table.item(r, 1).text()
+                for r in range(self.terms_table.rowCount())
+                if self.terms_table.item(r, 0) and self.terms_table.item(r, 1)
+                and self.terms_table.item(r, 0).text()
+            },
             "initial_prompt": self.prompt_edit.toPlainText(),
             "min_to_tray": self.cfg_tray.isChecked(),
             "auto_space": self.cfg_space.isChecked(),
@@ -2377,7 +3072,17 @@ class WhisperRApp(QMainWindow):
             "timestamps": self.cfg_ts.isChecked(),
             "translate": self.cfg_trans.isChecked(),
             "log_level": self.cfg_log_level.currentText(),
-            "use_vad": self.cfg_use_vad.isChecked()
+            "use_confidence": self.cfg_use_confidence.isChecked(),
+            "min_confidence": round(self.cfg_conf_spin.value(), 2),
+            "ft_output_folder": self.ft_output_folder.text(),
+            "ft_mon_folder": self.ft_mon_folder.text(),
+            "ft_mon_enabled": self.ft_mon_enabled.isChecked(),
+            "use_vad": self.cfg_use_vad.isChecked(),
+            "sendkeys_trigger":   self.cfg_sk_trigger.text().strip() or "sendkeys",
+            "select_trigger":     self.cfg_sel_trigger.text().strip() or "whisperselect",
+            "move_trigger":       self.cfg_move_trigger.text().strip() or "whispermove",
+            "movebefore_trigger": self.cfg_movebefore_trigger.text().strip() or "whisperbefore",
+            "moveafter_trigger":  self.cfg_moveafter_trigger.text().strip() or "whisperafter"
         })
         
         try:
@@ -2480,6 +3185,9 @@ class WhisperRApp(QMainWindow):
             self._rollback_armed   = False
             if self._rollback_pending:
                 app_logger.debug("toggle_rec: rollback armed — will lowercase first result")
+            # Reset session buffer and cursor-ops flag for the new session
+            self._session_buffer = ""
+            self._cursor_ops_pending = False
             # Always kill any existing recorder first, even if it claims inactive.
             # A PTT recorder-storm can leave orphaned recorders with active=False
             # that are still mid-startup — stopping them prevents resource leaks
@@ -2561,11 +3269,79 @@ class WhisperRApp(QMainWindow):
         self.ptt_l = self._ptt_timer  # keep ptt_l set so setup_logic doesn't re-run
         app_logger.debug(f"  PTT poll timer started (30ms interval)")
 
-    def _poll_ptt(self):
-        """Poll Win32 GetAsyncKeyState for the PTT combo. Called by QTimer."""
-        try:
-            if self.config.settings.get("live_mode") != "Push-To-Talk":
+    def _install_ptt_hook(self, parts):
+        """Install a WH_KEYBOARD_LL hook that consumes the PTT combo keys
+        so they are never forwarded to the active application."""
+        import ctypes, ctypes.wintypes, threading
+        if getattr(self, '_ptt_hook_installed', False):
+            return
+        ptt_vks = {self._VK_MAP[p] for p in parts if p in self._VK_MAP}
+
+        WH_KEYBOARD_LL = 13
+        WM_KEYDOWN     = 0x0100
+        WM_SYSKEYDOWN  = 0x0104
+        WM_KEYUP       = 0x0101
+        WM_SYSKEYUP    = 0x0105
+
+        HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int,
+                                      ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
+
+        class KBDLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [("vkCode",      ctypes.wintypes.DWORD),
+                        ("scanCode",    ctypes.wintypes.DWORD),
+                        ("flags",       ctypes.wintypes.DWORD),
+                        ("time",        ctypes.wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        def hook_proc(nCode, wParam, lParam):
+            if nCode >= 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP):
+                kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                if kb.vkCode in ptt_vks:
+                    return 1  # consume — do not forward to application
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+        self._ptt_hook_cb  = HOOKPROC(hook_proc)
+        self._ptt_hook_handle = None
+
+        def pump():
+            hmod = kernel32.GetModuleHandleW(None)
+            h = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._ptt_hook_cb, hmod, 0)
+            self._ptt_hook_handle = h
+            if not h:
+                app_logger.warning("PTT hook: SetWindowsHookExW failed")
                 return
+            msg = ctypes.wintypes.MSG()
+            while getattr(self, '_ptt_hook_installed', False):
+                r = user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1)
+                if r:
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+                else:
+                    import time as _t; _t.sleep(0.005)
+            if h:
+                user32.UnhookWindowsHookEx(h)
+            self._ptt_hook_handle = None
+
+        self._ptt_hook_installed = True
+        t = threading.Thread(target=pump, daemon=True, name="ptt-hook")
+        t.start()
+        self._ptt_hook_thread = t
+        app_logger.debug("PTT suppression hook installed")
+
+    def _remove_ptt_hook(self):
+        """Signal the hook pump thread to stop and uninstall the hook."""
+        self._ptt_hook_installed = False
+        # The pump loop will call UnhookWindowsHookEx and exit on its own
+        app_logger.debug("PTT suppression hook removed")
+
+    def _poll_ptt(self):
+        """Poll Win32 GetAsyncKeyState for the PTT combo. Called by QTimer.
+        PTT is always available — no mode switch required.
+        Keys are suppressed via a low-level hook while the combo is held."""
+        try:
             ptt_key = self.config.settings.get("ptt_key", "")
             if not ptt_key:
                 return
@@ -2578,15 +3354,15 @@ class WhisperRApp(QMainWindow):
             )
             if combo_held:
                 # Clear the starting guard once the recorder is confirmed running.
-                # recorder.active is set to True inside AudioRecorder.run() which
-                # runs on a separate thread — it won't be True yet on the very next
-                # poll tick after toggle_rec() returns, hence the guard.
                 if self._ptt_starting and self.recorder and self.recorder.active:
                     self._ptt_starting = False
 
+                # Install key-suppression hook on first combo detection so the
+                # PTT keys are eaten and never reach the foreground application.
+                if not getattr(self, '_ptt_hook_installed', False):
+                    self._install_ptt_hook(parts)
+
                 # Only auto-start if not already running AND not mid-start.
-                # Without this guard, every 30ms poll tick would spawn a new
-                # AudioRecorder thread (causing a recorder storm that crashes the app).
                 if not self._ptt_starting and (not self.recorder or not self.recorder.active):
                     app_logger.debug("PTT held — auto-starting recorder session")
                     self._ptt_starting = True
@@ -2596,11 +3372,17 @@ class WhisperRApp(QMainWindow):
                     self.recorder.ptt_pressed = True
                     app_logger.debug("PTT activated (poll)")
             else:
-                # PTT released — clear guard so next press can start fresh
+                # PTT released — remove suppression hook, stop recording, clear guard
+                if getattr(self, '_ptt_hook_installed', False):
+                    self._remove_ptt_hook()
                 self._ptt_starting = False
                 if self.recorder and self.recorder.ptt_pressed:
                     self.recorder.ptt_pressed = False
                     app_logger.debug("PTT deactivated (poll)")
+                    # Stop the recorder: PTT is hold-to-talk, not a toggle.
+                    # Stopping via toggle_rec must happen on the Qt main thread.
+                    if self.recorder and self.recorder.active:
+                        self.sig_toggle_rec.emit()
         except Exception as e:
             app_logger.error(f"PTT poll error: {e}", exc_info=True)
 
@@ -2674,6 +3456,127 @@ class WhisperRApp(QMainWindow):
             )
         except Exception as e:
             app_logger.error(f"rollback error: {e}", exc_info=True)
+
+
+    def _whisper_navigate(self, operation, target_text):
+        """Perform a cursor navigation / selection operation inside the active window.
+
+        The app cannot read the active window's content, so it works purely from
+        the session buffer (all text pasted since the current dictation session
+        started).  It navigates by counting characters and sending arrow / shift
+        key presses — identical to what a user would do manually.
+
+        Parameters
+        ----------
+        operation : str
+            One of: "select" | "move" | "movebefore" | "moveafter"
+        target_text : str
+            The substring to locate in the session buffer.
+
+        Cursor movement strategy
+        ------------------------
+        The cursor is assumed to be AT THE END of the session buffer.
+
+        1.  Find the last occurrence of target_text in the session buffer
+            (case-insensitive).
+        2.  Compute:
+              chars_from_end = len(session_buffer) - match_end_index
+              (how many Left presses to reach just after the match)
+        3.  Depending on operation:
+              "movebefore" / "move":
+                    Left × (chars_from_end + len(target_text))
+                    → cursor lands immediately BEFORE the target
+              "moveafter":
+                    Left × chars_from_end
+                    → cursor lands immediately AFTER the target
+              "select":
+                    Left × chars_from_end                    (no shift)
+                    then Shift+Left × len(target_text)        (select backwards)
+                    … actually: navigate to just before target, then
+                    Shift+Right × len(target_text)
+        """
+        import re as _re
+        import pyautogui as _pag
+        import ctypes as _ct
+        import time as _time
+
+        buf   = self._session_buffer
+        clean = target_text.strip()
+        if not clean:
+            self.scratchpad.append("[Navigate] Empty target — nothing to do.")
+            return
+        if not buf:
+            self.scratchpad.append("[Navigate] Session buffer is empty — start dictation first.")
+            return
+
+        # Case-insensitive search — find the LAST occurrence
+        pattern = _re.compile(_re.escape(clean), _re.IGNORECASE)
+        matches = list(pattern.finditer(buf))
+        if not matches:
+            self.scratchpad.append(f"[Navigate] '{clean}' not found in session buffer.")
+            return
+
+        m           = matches[-1]           # last occurrence
+        match_start = m.start()
+        match_end   = m.end()
+        buf_len     = len(buf)
+
+        # ── Release any held modifier keys before sending arrows ────────────
+        _VK_CONTROL = 0x11; _VK_SHIFT = 0x10; _VK_MENU = 0x12
+        _KEYUP = 0x0002
+        for _vk in (_VK_CONTROL, _VK_SHIFT, _VK_MENU):
+            _ct.windll.user32.keybd_event(_vk, 0, _KEYUP, 0)
+        _time.sleep(0.08)
+
+        paste_delay = self.config.settings.get("paste_delay", 0.5)
+
+        # Chars from current cursor position (end of buffer) to end of match
+        chars_to_match_end   = buf_len - match_end    # Left presses to reach just after match
+        chars_in_match       = match_end - match_start
+
+        try:
+            if operation in ("move", "movebefore"):
+                # Move cursor to just BEFORE the target text
+                lefts = chars_to_match_end + chars_in_match
+                app_logger.info(f"Navigate movebefore '{clean}': {lefts} Left presses")
+                for _ in range(lefts):
+                    _pag.press("left")
+                self.scratchpad.append(
+                    f"[Navigate] Cursor moved before '{clean}' ({lefts} ◀ presses)")
+
+            elif operation == "moveafter":
+                # Move cursor to just AFTER the target text
+                lefts = chars_to_match_end
+                app_logger.info(f"Navigate moveafter '{clean}': {lefts} Left presses")
+                for _ in range(lefts):
+                    _pag.press("left")
+                self.scratchpad.append(
+                    f"[Navigate] Cursor moved after '{clean}' ({lefts} ◀ presses)")
+
+            elif operation == "select":
+                # Move to just before target, then Shift+Right to select it
+                lefts = chars_to_match_end + chars_in_match
+                app_logger.info(
+                    f"Navigate select '{clean}': {lefts} Left, then {chars_in_match} Shift+Right")
+                for _ in range(lefts):
+                    _pag.press("left")
+                # Now select the text forward
+                for _ in range(chars_in_match):
+                    _pag.keyDown("shift")
+                _pag.keyDown("shift")   # make sure shift is held
+                for _ in range(chars_in_match):
+                    _pag.press("right")
+                _pag.keyUp("shift")
+                self.scratchpad.append(
+                    f"[Navigate] Selected '{clean}' "
+                    f"({lefts} ◀ then {chars_in_match} ⇧▶)")
+
+            # Arm lowercase flag so the next dictated segment joins cleanly
+            self._cursor_ops_pending = True
+
+        except Exception as e:
+            app_logger.error(f"Navigate error: {e}", exc_info=True)
+            self.scratchpad.append(f"[Navigate] Error: {e}")
 
     def key_to_string(self, key):
         """Convert pynput key to string format (kept for hotkey capture)."""
@@ -2802,9 +3705,12 @@ class WhisperRApp(QMainWindow):
         if hasattr(self, 'indicator'):
             self.indicator.set_state(state)
 
-        # Tray icon (visible even when window is hidden / minimised to tray)
+        # Tray icon — when idle use the app icon if available, otherwise a dot
         if hasattr(self, 'tray'):
-            self.tray.setIcon(self._make_tray_icon(state))
+            if state == 'idle' and hasattr(self, '_app_icon') and not self._app_icon.isNull():
+                self.tray.setIcon(self._app_icon)
+            else:
+                self.tray.setIcon(self._make_tray_icon(state))
             self.tray.setToolTip(tip)
 
     def on_trans_status(self, active):
@@ -2817,21 +3723,113 @@ class WhisperRApp(QMainWindow):
     def on_text(self, text, src):
         timestamp = datetime.now().strftime('%H:%M:%S')
         app_logger.debug(f"→ on_text: src='{src}', text length={len(text)}, text='{text[:60]}{'...' if len(text)>60 else ''}'")
-        self.scratchpad.append(f"[{timestamp}] {text}")
-        
+        # Route transcript text to Results pane; system messages go to Log pane (scratchpad)
+        _results = getattr(self, "results_area", self.scratchpad)
+        _results.append(f"[{timestamp}] {text}")
+
+        if src != "live":
+            # ── File transcription result ─────────────────────────────────────
+            # Always copy to clipboard so user can paste anywhere.
+            try:
+                pyperclip.copy(text)
+                app_logger.info("File transcription copied to clipboard")
+            except Exception as e:
+                app_logger.error(f"Clipboard copy failed: {e}")
+            # Auto-save to output folder
+            # Read directly from the UI widget so path is current even if user
+            # hasn't clicked Save yet.
+            _ft_out_raw = (self.ft_output_folder.text().strip()
+                           if hasattr(self, 'ft_output_folder') else
+                           self.config.settings.get('ft_output_folder', ''))
+            out_dir = Path(_ft_out_raw).expanduser() if _ft_out_raw else None
+            if out_dir:
+                try:
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    import re as _re2
+                    _words = [_re2.sub(r'[^A-Za-z0-9]', '', w) for w in text.split()[:4]]
+                    _words = [w for w in _words if w]  # drop empty after stripping
+                    first_words = '-'.join(_words) if _words else 'transcription'
+                    fname = datetime.now().strftime('%Y-%m-%d-%H-%M') + f"-{first_words}.txt"
+                    out_path = out_dir / fname
+                    out_path.write_text(text, encoding='utf-8')
+                    src_name = os.path.basename(src) if src else "?"
+                    _results = getattr(self, "results_area", self.scratchpad)
+                    _results.append(f"[File] {src_name}  \u2192  {out_path}")
+                    app_logger.info(f"File transcription saved: {out_path}")
+                    # Remove from the queue list if it's still there
+                    if hasattr(self, 'ft_list'):
+                        for i in range(self.ft_list.count()):
+                            item = self.ft_list.item(i)
+                            if item and os.path.basename(item.text()) in text or True:
+                                pass  # best-effort; remove by tracking in _ft_pending
+                except Exception as e:
+                    app_logger.error(f"Failed to save transcription: {e}", exc_info=True)
+            # Track completed count and update status label
+            self._ft_done  = getattr(self, "_ft_done",  0) + 1
+            self._ft_total = getattr(self, "_ft_total", self._ft_done)
+            if hasattr(self, "ft_status_lbl"):
+                if self._ft_done >= self._ft_total:
+                    self.ft_status_lbl.setText(
+                        f"Done: {self._ft_done} file(s) transcribed successfully.")
+                    self._ft_done  = 0  # reset after full batch
+                    self._ft_total = 0
+                else:
+                    self.ft_status_lbl.setText(
+                        f"Transcribing... {self._ft_done} / {self._ft_total} complete")
+            return
+
         if src == "live":
             # ── Command detection (runs BEFORE paste) ────────────────────────
+            # ── WhisperNavigate: select / move cursor ──────────────────────
+            # Check BEFORE command and paste handling — navigation is its own
+            # operation; we do not paste the trigger phrase itself.
+            _cfg = self.config.settings
+            _tl  = text.lower()
+            _nav_triggers = [
+                ("select",     _cfg.get("select_trigger",     "whisperselect").lower()),
+                ("move",       _cfg.get("move_trigger",       "whispermove").lower()),
+                ("movebefore", _cfg.get("movebefore_trigger", "whisperbefore").lower()),
+                ("moveafter",  _cfg.get("moveafter_trigger",  "whisperafter").lower()),
+            ]
+            _nav_fired = False
+            for _nav_op, _nav_kw in _nav_triggers:
+                if _nav_kw and _tl.startswith(_nav_kw):
+                    _nav_target = text[len(_nav_kw):].strip()
+                    # Strip leading "to" / "before" / "after" filler words
+                    import re as _re_nav
+                    _nav_target = _re_nav.sub(
+                        r"^(to|before|after|the|for)\s+", "",
+                        _nav_target, flags=_re_nav.IGNORECASE).strip()
+                    app_logger.info(
+                        f"WhisperNavigate: op={_nav_op!r}, target={_nav_target!r}")
+                    self._whisper_navigate(_nav_op, _nav_target)
+                    _nav_fired = True
+                    break
+            if _nav_fired:
+                app_logger.debug("  on_text: navigate fired — skipping paste")
+                return
+
             # If the transcribed text matches a voice command, execute it and
             # do NOT paste the text — the spoken phrase was a command, not prose.
             _cmd_fired = False
             app_logger.debug(f"  on_text: Checking {len(self.config.settings['commands'])} voice commands...")
+            sk_trigger = self.config.settings.get("sendkeys_trigger", "sendkeys").lower().strip()
             for phrase, cmd in self.config.settings["commands"].items():
                 if phrase.lower() in text.lower():
                     app_logger.debug(f"  on_text: Command matched: '{phrase}' → '{cmd}'")
                     try:
-                        subprocess.Popen(cmd, shell=True)
-                        app_logger.info(f"Command executed: {cmd}")
-                        self.scratchpad.append(f"[Command] {phrase} → {cmd}")
+                        # If the trigger phrase appears in the spoken text, treat
+                        # the action field as a key sequence rather than a program.
+                        if sk_trigger and sk_trigger in phrase.lower():
+                            _send_keys_sequence(
+                                cmd,
+                                paste_delay=self.config.settings.get("paste_delay", 0.5))
+                            app_logger.info(f"Sendkeys sequence sent: {cmd}")
+                            self.scratchpad.append(f"[Sendkeys] {phrase} → {cmd}")
+                        else:
+                            subprocess.Popen(cmd, shell=True)
+                            app_logger.info(f"Command executed: {cmd}")
+                            self.scratchpad.append(f"[Command] {phrase} → {cmd}")
                         _cmd_fired = True
                     except Exception as e:
                         app_logger.error(f"Command execution failed: {e}", exc_info=True)
@@ -2845,14 +3843,35 @@ class WhisperRApp(QMainWindow):
                 auto_space = self.config.settings["auto_space"]
                 # If a rollback just happened, the next transcription needs its
                 # first letter lowercased — Whisper always capitalises new sentences.
-                if self._rollback_pending and text:
+                # _rollback_pending is set by toggle_rec consuming _rollback_armed,
+                # but rollback can also fire mid-session (recording already running),
+                # in which case toggle_rec never fires and we must consume _rollback_armed here.
+                if not self._rollback_pending and getattr(self, '_rollback_armed', False):
+                    self._rollback_pending = True
+                    self._rollback_armed = False
+                if (self._rollback_pending or self._cursor_ops_pending) and text:
                     text = text[0].lower() + text[1:]
                     self._rollback_pending = False
+                    self._cursor_ops_pending = False
+                # Apply term replacements (case-insensitive, exact output preserved)
+                import re as _re
+                _key_tag_sequences = []  # term replacements that contain <KEY> tags
+                for phrase, replacement in self.config.settings.get("terms", {}).items():
+                    if phrase.strip() and _re.search(_re.escape(phrase), text, _re.IGNORECASE):
+                        if "<" in replacement and ">" in replacement:
+                            # Contains special key tags — collect for sendkeys after paste
+                            _key_tag_sequences.append(replacement)
+                            # Remove the matched phrase from text so it isn't pasted literally
+                            text = _re.sub(_re.escape(phrase), "", text, flags=_re.IGNORECASE).strip()
+                        else:
+                            text = _re.sub(_re.escape(phrase), replacement,
+                                           text, flags=_re.IGNORECASE)
                 p_text = text + " " if auto_space else text
                 # Strip trailing punctuation/spaces to find the last real word,
                 # then record how many characters were actually output.
                 self._last_paste_len = len(p_text)
                 self._last_paste_text = p_text
+                self._session_buffer += p_text  # accumulate for select/move
 
                 paste_delay = self.config.settings["paste_delay"]
                 app_logger.debug(f"  on_text: auto_space={auto_space}, paste_delay={paste_delay}s, p_text length={len(p_text)}")
@@ -2861,6 +3880,12 @@ class WhisperRApp(QMainWindow):
                     time.sleep(paste_delay)
                     pyautogui.hotkey('ctrl', 'v')
                     app_logger.info(f"Text pasted: '{text[:30]}{'...' if len(text)>30 else ''}'")
+                    # Fire any term sendkeys sequences now that the text is pasted
+                    if _key_tag_sequences:
+                        time.sleep(max(paste_delay, 0.1))
+                        for _seq in _key_tag_sequences:
+                            _send_keys_sequence(_seq, paste_delay=paste_delay)
+                            app_logger.info(f"Term sendkeys: {_seq}")
                 except Exception as e:
                     app_logger.error(f"Paste error: {e}", exc_info=True)
         
@@ -2977,23 +4002,17 @@ class WhisperRApp(QMainWindow):
         return result
 
     def monitor_dirs(self):
-        root = Path(self.config.settings["mon_folder"])
-        
+        """Fallback timer-based monitor — catches anything QFileSystemWatcher misses."""
+        if not self.config.settings.get("ft_mon_enabled", False):
+            return
+        mon_path = self.config.settings.get("ft_mon_folder", "").strip()
+        if not mon_path:
+            return
+        root = Path(mon_path)
         if not root.exists():
             return
-        
-        proc_dir = root / "Processed"
-        proc_dir.mkdir(exist_ok=True)
-        
-        for f in root.glob("*.*"):
-            if f.suffix.lower() in ['.wav', '.mp3', '.m4a'] and f.parent != proc_dir:
-                try:
-                    target = proc_dir / f.name
-                    shutil.move(str(f), str(target))
-                    self.transcriber.submit(str(target.absolute()), "file")
-                    app_logger.info(f"File moved to processing: {f.name}")
-                except Exception as e:
-                    app_logger.error(f"Failed to process file {f.name}: {e}")
+        # Reuse the same scan logic as the watcher callback
+        self._ft_mon_scan(str(root))
     
     def setup_deps(self):
         """Show guide for downloading GPU dependencies instead of auto-download (URLs keep breaking)"""
@@ -3055,16 +4074,140 @@ After placing DLL files, check the logs when transcribing:
             QMessageBox.warning(self, "Error", f"Could not open log file:\n{e}")
 
     def import_files(self):
+        """Legacy shim — redirects to the File Transcription tab helper."""
+        self._ft_add_files()
+
+    # ── File Transcription tab helpers ──────────────────────────────────────
+
+    _FT_AUDIO_EXTS = {'.wav', '.mp3', '.m4a', '.mp4', '.ogg', '.flac', '.aac', '.wma'}
+
+    def _ft_add_files(self):
+        """Open file picker and add selected audio files to the queue list."""
         paths, _ = QFileDialog.getOpenFileNames(
-            self, 
-            "Select Audio Files", 
-            "", 
-            "Audio Files (*.wav *.mp3 *.m4a *.mp4)"
+            self, "Select Audio Files", "",
+            "Audio Files (*.wav *.mp3 *.m4a *.mp4 *.ogg *.flac *.aac *.wma)"
         )
-        
         for p in paths:
-            self.transcriber.submit(os.path.abspath(p), "file")
-            app_logger.info(f"File imported for transcription: {p}")
+            p = os.path.abspath(p)
+            # Avoid duplicates
+            existing = [self.ft_list.item(i).text()
+                        for i in range(self.ft_list.count())]
+            if p not in existing:
+                self.ft_list.addItem(p)
+        app_logger.info(f"Added {len(paths)} files to transcription queue")
+
+    def _ft_remove_selected(self):
+        for item in self.ft_list.selectedItems():
+            self.ft_list.takeItem(self.ft_list.row(item))
+
+    def _ft_start_transcription(self):
+        """Submit all queued files to the transcriber."""
+        n = self.ft_list.count()
+        app_logger.debug(f"_ft_start_transcription: ft_list.count()={n}")
+        paths = [self.ft_list.item(i).text() for i in range(n)]
+        if not paths:
+            self.ft_status_lbl.setText("Queue is empty — use Add Files... to add audio files.")
+            self.scratchpad.append("[File] Transcribe button pressed but queue is empty.")
+            return
+        self._ft_pending = list(paths)
+        self._ft_total   = len(paths)
+        self.ft_status_lbl.setText(f"Transcribing {self._ft_total} file(s)...")
+        self.scratchpad.append(f"[File] Starting transcription of {self._ft_total} file(s).")
+        # Submit all, then clear the list
+        for p in paths:
+            if not os.path.isfile(p):
+                self.scratchpad.append(f"[File] Skipped (not found): {p}")
+                app_logger.warning(f"_ft_start_transcription: file not found: {p}")
+                continue
+            self.transcriber.submit(p, p)  # src=path so on_text knows filename
+            app_logger.info(f"_ft_start_transcription: submitted {p}")
+        self.ft_list.clear()
+
+    def _ft_mon_toggled(self, enabled):
+        """Start or stop the QFileSystemWatcher when the monitor toggle changes."""
+        self.config.settings["ft_mon_enabled"] = enabled
+        self.config.settings["ft_mon_folder"]  = self.ft_mon_folder.text()
+        self._setup_ft_watcher()
+
+    def _setup_ft_watcher(self):
+        """Install or remove a QFileSystemWatcher on the monitor folder."""
+        from PyQt6.QtCore import QFileSystemWatcher
+        if not hasattr(self, '_ft_watcher'):
+            self._ft_watcher = QFileSystemWatcher(self)
+            self._ft_watcher.directoryChanged.connect(self._ft_mon_dir_changed)
+        # Remove all existing watched paths
+        if self._ft_watcher.directories():
+            self._ft_watcher.removePaths(self._ft_watcher.directories())
+        if self.config.settings.get("ft_mon_enabled") and self.ft_mon_folder.text().strip():
+            mon = self.ft_mon_folder.text().strip()
+            Path(mon).mkdir(parents=True, exist_ok=True)
+            self._ft_watcher.addPath(mon)
+            app_logger.info(f"Folder watcher active on: {mon}")
+
+    def _ft_mon_dir_changed(self, path):
+        """Called by QFileSystemWatcher when the watched directory changes.
+        We defer the actual scan by 500ms so the OS finishes writing/copying
+        all files in the batch before we try to open them."""
+        QTimer.singleShot(500, lambda: self._ft_mon_scan(path))
+
+    def _ft_mon_scan(self, path):
+        """Scan the monitored folder for new audio files, move each to Processed/,
+        and submit it for transcription immediately (no manual button needed)."""
+        proc_dir = Path(path) / "Processed"
+        try:
+            proc_dir.mkdir(exist_ok=True)
+        except Exception as e:
+            app_logger.error(f"Monitor: cannot create Processed dir: {e}")
+            return
+        added = 0
+        # Snapshot the directory first, then process the snapshot — avoids
+        # the iteration-while-moving race that causes files to be skipped.
+        try:
+            candidates = [f for f in Path(path).iterdir()
+                          if f.is_file() and f.suffix.lower() in self._FT_AUDIO_EXTS]
+        except Exception as e:
+            app_logger.error(f"Monitor: cannot list {path}: {e}")
+            return
+        for f in candidates:
+            dst = proc_dir / f.name
+            try:
+                shutil.move(str(f), str(dst))
+            except Exception as e:
+                app_logger.error(f"Monitor: move failed for {f.name}: {e}")
+                continue
+            # Submit for transcription immediately
+            self.transcriber.submit(str(dst), str(dst))  # src=path
+            # Show in the status label so user can see what's happening
+            added += 1
+            app_logger.info(f"Monitor: auto-transcribing {f.name}")
+        if added:
+            app_logger.info(f"Monitor: submitted {added} file(s) from {path}")
+            # Set _ft_total so the completion counter works correctly
+            self._ft_total = getattr(self, "_ft_total", 0) + added
+            self._ft_done  = getattr(self, "_ft_done",  0)
+            if hasattr(self, 'ft_status_lbl'):
+                self.ft_status_lbl.setText(f"Monitor: auto-transcribing {added} file(s)...")
+
+    def eventFilter(self, obj, event):
+        """Catch drag-and-drop onto ft_list."""
+        from PyQt6.QtCore import QEvent
+        from PyQt6.QtGui import QDragEnterEvent, QDropEvent
+        if hasattr(self, 'ft_list') and obj is self.ft_list:
+            if event.type() == QEvent.Type.DragEnter:
+                if event.mimeData().hasUrls():
+                    event.acceptProposedAction()
+                    return True
+            elif event.type() == QEvent.Type.Drop:
+                for url in event.mimeData().urls():
+                    p = url.toLocalFile()
+                    if Path(p).suffix.lower() in self._FT_AUDIO_EXTS:
+                        existing = [self.ft_list.item(i).text()
+                                    for i in range(self.ft_list.count())]
+                        if p not in existing:
+                            self.ft_list.addItem(p)
+                event.acceptProposedAction()
+                return True
+        return super().eventFilter(obj, event)
 
     def browse_f(self, line_edit):
         path = QFileDialog.getExistingDirectory(self, "Select Folder")
@@ -3309,10 +4452,7 @@ class StatusOverlay(QWidget):
 
 
 if __name__ == "__main__":
-    # PyInstaller + multiprocessing on Windows: must call freeze_support()
-    # before anything else so worker subprocesses are handled correctly.
-    import multiprocessing
-    multiprocessing.freeze_support()
+    # freeze_support() already called at module top — do not call again.
     app_logger.info("="*60)
     app_logger.info(f"{APP_NAME} v{__version__} - Starting")
     app_logger.info(f"Python: {sys.version}")
@@ -3329,7 +4469,7 @@ if __name__ == "__main__":
         app_logger.debug("✓ setQuitOnLastWindowClosed(False) set")
         
         app_logger.debug("→ Applying dark stylesheet...")
-        app.setStyleSheet(DARK_STYLE)
+        app.setStyleSheet(_build_dark_style())
         app_logger.debug("✓ Stylesheet applied")
         
         app_logger.debug("→ Creating WhisperRApp instance...")
