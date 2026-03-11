@@ -859,7 +859,8 @@ class AppConfig:
             "select_trigger":     "whisperselect",
             "move_trigger":       "whispermove",
             "movebefore_trigger": "whisperbefore",
-            "moveafter_trigger":  "whisperafter"
+            "moveafter_trigger":  "whisperafter",
+            "fuzzy_threshold":    0.75
         }
         self._first_run = not os.path.exists(self.path)
         self.load()
@@ -1941,6 +1942,71 @@ def _send_keys_sequence(text, paste_delay=0.0):
                 time.sleep(max(paste_delay, 0.05))
                 _pag.hotkey('ctrl', 'v')
 
+
+# ── Fuzzy trigger matching ────────────────────────────────────────────────────
+# Whisper often mishears single-word trigger commands because they are not
+# natural English (e.g. "whisperselect" → "whispers elect", "whisper select",
+# "whisper's elect").  We use difflib.SequenceMatcher to compare the spoken
+# text's first N words (where N = number of words in the trigger) against the
+# trigger, and accept if similarity ≥ threshold.
+#
+# Returns (matched: bool, remainder: str)
+#   matched   — True if the spoken prefix fuzzy-matches the trigger
+#   remainder — everything after the matched prefix (the target argument)
+
+def _fuzzy_trigger_match(spoken_text, trigger, threshold=0.75):
+    """Check if `spoken_text` starts with something that fuzzy-matches `trigger`.
+
+    Compares the first len(trigger.split()) words of the spoken text against
+    the trigger as a whole string, plus tries a few common Whisper
+    mis-segmentations (joined / space-split variants).
+
+    Returns (matched, remainder_text).
+    """
+    from difflib import SequenceMatcher
+
+    spoken_lower  = spoken_text.lower().strip()
+    trigger_lower = trigger.lower().strip()
+
+    if not trigger_lower:
+        return False, spoken_text
+
+    trigger_words = trigger_lower.split()
+    n = len(trigger_words)
+
+    spoken_words = spoken_lower.split()
+
+    # Build candidate prefixes to test:
+    #  1. First n spoken words joined (handles "whispers elect" → "whispers elect")
+    #  2. First n+1 spoken words joined (trigger may split into one extra word)
+    #  3. Exact prefix chars (same length as trigger) — handles run-together speech
+    candidates = []
+    if len(spoken_words) >= n:
+        candidates.append((' '.join(spoken_words[:n]),   n))
+    if len(spoken_words) >= n + 1:
+        candidates.append((' '.join(spoken_words[:n+1]), n + 1))
+    # char-length match
+    if len(spoken_lower) >= len(trigger_lower):
+        candidates.append((spoken_lower[:len(trigger_lower)], None))
+
+    best_ratio = 0.0
+    best_words_consumed = n
+
+    for candidate, words_consumed in candidates:
+        ratio = SequenceMatcher(None, trigger_lower, candidate).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            if words_consumed is not None:
+                best_words_consumed = words_consumed
+
+    if best_ratio >= threshold:
+        # Reconstruct remainder from original (preserve original casing)
+        orig_words = spoken_text.split()
+        remainder  = ' '.join(orig_words[best_words_consumed:]).strip()
+        return True, remainder
+
+    return False, spoken_text
+
 class WhisperRApp(QMainWindow):
     sig_toggle_vis = pyqtSignal()
     sig_toggle_rec = pyqtSignal()
@@ -2779,6 +2845,20 @@ class WhisperRApp(QMainWindow):
             "Move-after trigger — places cursor immediately AFTER the target.\n" + _nav_help)
         advanced_layout.addRow("WhisperAfter Trigger:", self.cfg_moveafter_trigger)
 
+        self.cfg_fuzzy_threshold = SpinWidget(
+            is_double=True, min_v=0.0, max_v=1.0, step=0.05,
+            value=self.config.settings.get("fuzzy_threshold", 0.75),
+            decimals=2, use_slider=True, spin_width=70)
+        self.cfg_fuzzy_threshold.setToolTip(
+            "How closely a spoken word must match a trigger/command phrase\n"
+            "to be recognised (uses difflib SequenceMatcher ratio).\n"
+            "1.0 = exact match only\n"
+            "0.75 = default — handles most Whisper mis-segmentations\n"
+            "0.5 = very loose — may fire on unrelated speech\n"
+            "0.0 = disabled (exact match only, same as 1.0)"
+        )
+        advanced_layout.addRow("Trigger Fuzzy Match:", self.cfg_fuzzy_threshold)
+
         self.cfg_log_level = QComboBox()
         self.cfg_log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR", "NONE"])
         self.cfg_log_level.setCurrentText(self.config.settings["log_level"])
@@ -3082,7 +3162,8 @@ class WhisperRApp(QMainWindow):
             "select_trigger":     self.cfg_sel_trigger.text().strip() or "whisperselect",
             "move_trigger":       self.cfg_move_trigger.text().strip() or "whispermove",
             "movebefore_trigger": self.cfg_movebefore_trigger.text().strip() or "whisperbefore",
-            "moveafter_trigger":  self.cfg_moveafter_trigger.text().strip() or "whisperafter"
+            "moveafter_trigger":  self.cfg_moveafter_trigger.text().strip() or "whisperafter",
+            "fuzzy_threshold":    self.cfg_fuzzy_threshold.value()
         })
         
         try:
@@ -3783,8 +3864,8 @@ class WhisperRApp(QMainWindow):
             # ── WhisperNavigate: select / move cursor ──────────────────────
             # Check BEFORE command and paste handling — navigation is its own
             # operation; we do not paste the trigger phrase itself.
-            _cfg = self.config.settings
-            _tl  = text.lower()
+            _cfg      = self.config.settings
+            _fuzz_thr = float(_cfg.get("fuzzy_threshold", 0.75))
             _nav_triggers = [
                 ("select",     _cfg.get("select_trigger",     "whisperselect").lower()),
                 ("move",       _cfg.get("move_trigger",       "whispermove").lower()),
@@ -3793,15 +3874,17 @@ class WhisperRApp(QMainWindow):
             ]
             _nav_fired = False
             for _nav_op, _nav_kw in _nav_triggers:
-                if _nav_kw and _tl.startswith(_nav_kw):
-                    _nav_target = text[len(_nav_kw):].strip()
-                    # Strip leading "to" / "before" / "after" filler words
+                if not _nav_kw:
+                    continue
+                _matched, _nav_target = _fuzzy_trigger_match(text, _nav_kw, _fuzz_thr)
+                if _matched:
+                    # Strip leading filler words Whisper loves to add
                     import re as _re_nav
                     _nav_target = _re_nav.sub(
                         r"^(to|before|after|the|for)\s+", "",
                         _nav_target, flags=_re_nav.IGNORECASE).strip()
                     app_logger.info(
-                        f"WhisperNavigate: op={_nav_op!r}, target={_nav_target!r}")
+                        f"WhisperNavigate (fuzzy): op={_nav_op!r}, target={_nav_target!r}")
                     self._whisper_navigate(_nav_op, _nav_target)
                     _nav_fired = True
                     break
@@ -3815,12 +3898,32 @@ class WhisperRApp(QMainWindow):
             app_logger.debug(f"  on_text: Checking {len(self.config.settings['commands'])} voice commands...")
             sk_trigger = self.config.settings.get("sendkeys_trigger", "sendkeys").lower().strip()
             for phrase, cmd in self.config.settings["commands"].items():
-                if phrase.lower() in text.lower():
+                # Exact match first; fall back to fuzzy if threshold > 0
+                _phrase_l = phrase.lower()
+                _exact    = _phrase_l in text.lower()
+                _fuzz_cmd = False
+                if not _exact and _fuzz_thr > 0:
+                    # Slide a window of len(phrase.split()) words across the spoken text
+                    from difflib import SequenceMatcher as _SM
+                    _sw = text.lower().split()
+                    _pw = _phrase_l.split()
+                    _wn = len(_pw)
+                    for _wi in range(max(1, len(_sw) - _wn + 1)):
+                        _window = " ".join(_sw[_wi:_wi + _wn])
+                        if _SM(None, _phrase_l, _window).ratio() >= _fuzz_thr:
+                            _fuzz_cmd = True
+                            app_logger.debug(
+                                f"  on_text: fuzzy command match '{phrase}' ~ '{_window}'")
+                            break
+                if _exact or _fuzz_cmd:
                     app_logger.debug(f"  on_text: Command matched: '{phrase}' → '{cmd}'")
                     try:
-                        # If the trigger phrase appears in the spoken text, treat
-                        # the action field as a key sequence rather than a program.
-                        if sk_trigger and sk_trigger in phrase.lower():
+                        # If the trigger phrase appears (exact or fuzzy) in the phrase,
+                        # treat the action field as a key sequence rather than a program.
+                        _sk_exact = sk_trigger and sk_trigger in phrase.lower()
+                        _sk_fuzzy = (not _sk_exact and sk_trigger and
+                                     _fuzzy_trigger_match(phrase.lower(), sk_trigger, _fuzz_thr)[0])
+                        if _sk_exact or _sk_fuzzy:
                             _send_keys_sequence(
                                 cmd,
                                 paste_delay=self.config.settings.get("paste_delay", 0.5))
