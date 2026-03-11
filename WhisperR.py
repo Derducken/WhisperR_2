@@ -200,13 +200,12 @@ def _ai_worker_process(task_q, result_q, log_q):
 
         # cudnn64_9.dll is a stub that loads the actual compute DLLs.
         # In a frozen subprocess they must be pre-loaded explicitly.
+        # Note: engines_precompiled, engines_runtime_compiled, graph, and
+        # heuristic are training/graph-API DLLs — not needed for Whisper inference.
         _cuda_needed = [
             'cudart64_12.dll', 'cublas64_12.dll', 'cublasLt64_12.dll',
             'cudnn64_9.dll',
             'cudnn_ops64_9.dll', 'cudnn_cnn64_9.dll', 'cudnn_adv64_9.dll',
-            'cudnn_graph64_9.dll', 'cudnn_heuristic64_9.dll',
-            'cudnn_engines_precompiled64_9.dll',
-            'cudnn_engines_runtime_compiled64_9.dll',
         ]
         _cuda_loaded, _cuda_missing = [], []
         for _dll in _cuda_needed:
@@ -281,20 +280,35 @@ def _ai_worker_process(task_q, result_q, log_q):
                 "cudnn_engines_runtime_compiled64_9.dll", "cudnn_graph64_9.dll",
                 "cudnn_heuristic64_9.dll",
             ]
-            # libiomp5md.dll is in _internal/ but ctranslate2.dll is in
-            # _internal/ctranslate2/ — Windows resolves DLL dependencies
-            # relative to the loading DLL's own directory first, so it
-            # can't see libiomp5md.dll one level up. Copy it alongside
-            # ctranslate2.dll so it's found immediately.
-            _iomp_src = os.path.join(_internal_d, 'libiomp5md.dll')
-            _iomp_dst = os.path.join(_ct2_pkg_dir, 'libiomp5md.dll')
-            if os.path.isfile(_iomp_src) and not os.path.isfile(_iomp_dst):
-                try:
-                    import shutil
-                    shutil.copy2(_iomp_src, _iomp_dst)
-                    _log(f"  Copied libiomp5md.dll into ctranslate2 pkg dir")
-                except Exception as _ce:
-                    _log(f"  Could not copy libiomp5md.dll: {_ce}")
+            # ctranslate2.dll lives in _internal/ctranslate2/ but CUDA/cuDNN DLLs
+            # are bundled into _internal/. When ctranslate2 lazily loads sub-DLLs
+            # during inference (e.g. cudnn_ops64_9.dll for the first conv op),
+            # Windows searches relative to ctranslate2.dll's own directory first
+            # and can't find them one level up — causing CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED.
+            # Fix: copy all CUDA + cuDNN DLLs from _internal/ into _internal/ctranslate2/.
+            import shutil as _shutil_dll
+            _cuda_copy_list = [
+                'libiomp5md.dll',
+                'cudart64_12.dll', 'cublas64_12.dll', 'cublasLt64_12.dll',
+                'cudnn64_9.dll', 'cudnn_ops64_9.dll', 'cudnn_cnn64_9.dll', 'cudnn_adv64_9.dll',
+                # engines_runtime_compiled is required by cuDNN 9 for inference (JIT kernel compiler)
+                'cudnn_engines_runtime_compiled64_9.dll',
+                # precompiled is optional (large cache), include if present
+                'cudnn_engines_precompiled64_9.dll',
+                'cudnn_graph64_9.dll', 'cudnn_heuristic64_9.dll',
+            ]
+            _cuda_copied = []
+            for _cdll in _cuda_copy_list:
+                _csrc = os.path.join(_internal_d, _cdll)
+                _cdst = os.path.join(_ct2_pkg_dir, _cdll)
+                if os.path.isfile(_csrc) and not os.path.isfile(_cdst):
+                    try:
+                        _shutil_dll.copy2(_csrc, _cdst)
+                        _cuda_copied.append(_cdll)
+                    except Exception as _ce:
+                        _log(f"  Could not copy {_cdll} to ct2 dir: {_ce}")
+            if _cuda_copied:
+                _log(f"  Copied to ct2 dir: {', '.join(_cuda_copied)}")
             _copied = []
             _found_in_pkg = []
             for _dll in _critical_dlls:
@@ -343,6 +357,8 @@ def _ai_worker_process(task_q, result_q, log_q):
     current_language = None
     WhisperModel = None
 
+    _vad_broken = False  # once VAD fails in this worker session, disable it permanently
+
     while True:
         try:
             msg = task_q.get(timeout=1.0)
@@ -354,6 +370,10 @@ def _ai_worker_process(task_q, result_q, log_q):
             break
 
         model_name, lang_code, compute_pref, audio_data, src, translate, use_vad, prompt = msg
+
+        # If VAD failed in a previous task this session, honour that for all future tasks.
+        if _vad_broken and use_vad:
+            use_vad = False
 
         # Import on first task — by the time we get here, multiprocessing has
         # fully initialized the frozen interpreter so torch.__spec__ is valid.
@@ -516,6 +536,19 @@ def _ai_worker_process(task_q, result_q, log_q):
         try:
             import numpy as np
             audio_np = np.frombuffer(audio_data, dtype=np.float32)
+
+            # onnxruntime (used by VAD/Silero) crashes in frozen apps when it tries
+            # to initialise its CUDA execution provider alongside ctranslate2's
+            # already-loaded CUDA DLLs (access violation in onnxruntime_pybind11_state.dll).
+            # Force CPU-only ORT providers via env var before the first import.
+            # This must be set before faster_whisper touches onnxruntime.
+            if use_vad:
+                import os as _os
+                _os.environ.setdefault('ORT_LOGGING_LEVEL', '3')           # suppress ORT spam
+                _os.environ.setdefault('ORTEP_DISABLE_PROVIDERS', 'CUDA')  # no CUDA provider
+                # Belt-and-suspenders: also set the disable-all-non-CPU flag
+                _os.environ.setdefault('ORT_DISABLE_CUDA', '1')
+
             segments, _ = model.transcribe(
                 audio_np,
                 language=lang_code if lang_code != 'auto' else None,
@@ -525,6 +558,27 @@ def _ai_worker_process(task_q, result_q, log_q):
             )
             text = ' '.join(s.text.strip() for s in segments).strip()
             result_q.put(('text', text, src))
+        except RuntimeError as e:
+            if 'onnxruntime' in str(e).lower() or 'vad' in str(e).lower():
+                # VAD failed — retry without it, disable for this session, warn ONCE
+                _log(f"VAD unavailable ({e}), retrying without VAD filter")
+                if not _vad_broken:
+                    _vad_broken = True
+                    result_q.put(('warn', 'VAD filter unavailable — disabled for this session. (onnxruntime DLL conflict in frozen app)'))
+                try:
+                    segments, _ = model.transcribe(
+                        audio_np,
+                        language=lang_code if lang_code != 'auto' else None,
+                        task='translate' if translate else 'transcribe',
+                        vad_filter=False,
+                        initial_prompt=prompt or None,
+                    )
+                    text = ' '.join(s.text.strip() for s in segments).strip()
+                    result_q.put(('text', text, src))
+                except Exception as e2:
+                    _log(f"Transcription error (no-VAD retry): {e2}\n{traceback.format_exc()}")
+            else:
+                _log(f"Transcription error: {e}\n{traceback.format_exc()}")
         except Exception as e:
             _log(f"Transcription error: {e}\n{traceback.format_exc()}")
         result_q.put(('status', False))
@@ -663,6 +717,14 @@ QProgressBar::chunk { background-color: #0078d7; border-radius: 6px; }
 QHeaderView::section { background-color: #252525; color: white; padding: 4px; border: 1px solid #333; }
 QTableWidget { background-color: #1e1e1e; gridline-color: #333; }
 QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit { background-color: #2a2a2a; border: 1px solid #444; padding: 4px; }
+QSpinBox, QDoubleSpinBox { padding-right: 24px; min-height: 24px; }
+QSpinBox::up-button, QDoubleSpinBox::up-button { subcontrol-origin: border; subcontrol-position: top right; width: 22px; border-left: 1px solid #555; border-bottom: 1px solid #555; background-color: #3a3a3a; border-top-right-radius: 3px; }
+QSpinBox::down-button, QDoubleSpinBox::down-button { subcontrol-origin: border; subcontrol-position: bottom right; width: 22px; border-left: 1px solid #555; border-top: 1px solid #555; background-color: #3a3a3a; border-bottom-right-radius: 3px; }
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { width: 10px; height: 10px; image: none; border-left: 5px solid transparent; border-right: 5px solid transparent; border-bottom: 6px solid #cccccc; }
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow { width: 10px; height: 10px; image: none; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 6px solid #cccccc; }
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover, QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover { background-color: #0078d7; }
+QSpinBox::up-button:hover QSpinBox::up-arrow, QDoubleSpinBox::up-button:hover QDoubleSpinBox::up-arrow { border-bottom-color: #ffffff; }
+QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed, QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed { background-color: #005fa3; }
 """
 
 # --- 4. LOGGING SETUP ---
@@ -723,7 +785,7 @@ class AppConfig:
             "clear_exit": False, "save_to_disk": False, "auto_space": True,
             "min_to_tray": False, "input_device_name": "", "input_device_index": None, "paste_delay": 0.5, 
             "hotkey": "ctrl+alt+r", "ptt_key": "f8", 
-            "visibility_hotkey": "ctrl+shift+w", "live_mode": "Simple", 
+            "visibility_hotkey": "ctrl+shift+w", "rollback_hotkey": "ctrl+shift+z", "live_mode": "Simple", 
             "dict_mode": "Continuous", "auto_pause_sec": 1.5, "noise_floor": 200, 
             "speech_vol": 1500, "commands": {"Launch Notepad": "notepad.exe"},
             "ind_show": True, "ind_type": "Both", "ind_pos": "Top-Right", 
@@ -909,13 +971,14 @@ class CalibrationWorker(QThread):
             noise_level = int(np.percentile(n, 90))
             app_logger.info(f"Noise level calibrated: {noise_level}")
             
-            # Speech calibration phase
+            # Speech calibration phase — reset bar to 0 so pass 2 visually restarts
+            self.progress.emit(0)
             self.status_msg.emit("SPEAK normally (Voice level)...")
             try:
                 for i in range(100):
                     d = stream.read(1024, exception_on_overflow=False)
                     s.append(np.sqrt(np.mean(np.frombuffer(d, dtype=np.int16).astype(np.float64)**2)))
-                    self.progress.emit(i+101)
+                    self.progress.emit(i+1)
                     time.sleep(0.04)
             except Exception as e:
                 app_logger.error(f"Error during speech calibration: {e}")
@@ -1165,6 +1228,10 @@ class TranscriberWorker(QThread):
                         self.finished_text.emit(text, src)
                     else:
                         app_logger.debug("No valid speech / hallucination filtered")
+                elif msg[0] == 'warn':
+                    # Non-fatal worker warning (e.g. VAD unavailable) — show in log panel
+                    app_logger.warning(f"Worker warning: {msg[1]}")
+                    self.log_msg.emit(f"⚠ {msg[1]}")
 
             # Worker crashed mid-task: unblock the UI, circuit-break after 3 failures
             if worker_crashed:
@@ -1203,6 +1270,7 @@ class AudioRecorder(QThread):
         self.config = config
         self.active = False
         self.ptt_pressed = False
+        self.ptt_flush   = False   # set True by poll to trigger immediate dispatch
         app_logger.info("Audio recorder initialized")
     
     def run(self):
@@ -1346,10 +1414,24 @@ class AudioRecorder(QThread):
         _last_state_chg = 0.0
         _DEBOUNCE_SEC   = 0.3
 
+        _ptt_was_pressed = False  # track transition for flush-on-release
+
         while self.active:
-            if self.config.settings["live_mode"] == "Push-To-Talk" and not self.ptt_pressed:
-                time.sleep(0.05)
-                continue
+            if self.config.settings["live_mode"] == "Push-To-Talk":
+                # Detect release edge: was held, now released → flush immediately
+                if _ptt_was_pressed and not self.ptt_pressed:
+                    _ptt_was_pressed = False
+                    if len(frames) > 5:
+                        app_logger.debug(f"PTT released — dispatching {len(frames)} frames")
+                        self.speech_active.emit(False)
+                        self.dispatch(frames, FIXED_RATE, FIXED_CHANNELS)
+                        frames = []
+                        last_speech = time.time()
+                elif self.ptt_pressed:
+                    _ptt_was_pressed = True
+                if not self.ptt_pressed:
+                    time.sleep(0.05)
+                    continue
 
             try:
                 data = stream.read(1024, exception_on_overflow=False)
@@ -1372,11 +1454,21 @@ class AudioRecorder(QThread):
                     app_logger.debug(f"AudioRecorder: speech_active -> {is_speech} (RMS={rms})")
                     self.speech_active.emit(is_speech)
 
-                if is_speech:
+                # In Simple mode, collect every frame — the user controls start/stop
+                # explicitly and wants everything they said, regardless of RMS level.
+                # In Auto-Pause mode, only collect frames during/after detected speech
+                # so silence gaps don't pad out the audio unnecessarily.
+                if self.config.settings["dict_mode"] == "Auto-Pause":
+                    if is_speech:
+                        frames.append(data)
+                        last_speech = now
+                    elif frames:
+                        frames.append(data)  # trailing silence after speech
+                else:
+                    # Simple / Continuous: always collect
                     frames.append(data)
-                    last_speech = now
-                elif frames:
-                    frames.append(data)
+                    if is_speech:
+                        last_speech = now
 
                 if self.config.settings["dict_mode"] == "Auto-Pause":
                     silence_dur = now - last_speech
@@ -1601,15 +1693,23 @@ class WhisperRApp(QMainWindow):
             app_logger.debug(f"  __init__: Looking for icon at: {icon_path}")
             app_logger.debug(f"  __init__: icon.png exists: {os.path.exists(icon_path)}")
             if os.path.exists(icon_path):
-                app_logger.debug(f"  __init__: Loading QIcon from file...")
-                app_icon = QIcon(icon_path)
-                app_logger.debug(f"  __init__: QIcon loaded, isNull={app_icon.isNull()}")
+                # Build a multi-resolution QIcon so Windows taskbar, tray, and
+                # alt-tab all use our image at the right size.
+                app_icon = QIcon()
+                base_pix = QPixmap(icon_path)
+                for sz in (16, 24, 32, 48, 64, 128, 256):
+                    app_icon.addPixmap(
+                        base_pix.scaled(sz, sz,
+                                        Qt.AspectRatioMode.KeepAspectRatio,
+                                        Qt.TransformationMode.SmoothTransformation)
+                    )
+                # Apply to this window AND the QApplication so the taskbar picks it up
                 self.setWindowIcon(app_icon)
+                QApplication.instance().setWindowIcon(app_icon)
                 app_logger.info(f"Loaded icon from: {icon_path}")
             else:
-                app_logger.debug("  __init__: icon.png not found, using theme icon 'audio-input-microphone'")
-                app_icon = QIcon.fromTheme("audio-input-microphone")
-                app_logger.debug(f"  __init__: Theme icon loaded, isNull={app_icon.isNull()}")
+                app_icon = QIcon()
+                app_logger.warning("icon.png not found — no custom icon set")
             
             app_logger.debug("  __init__: Creating QSystemTrayIcon...")
             self.tray = QSystemTrayIcon(self)
@@ -1653,6 +1753,11 @@ class WhisperRApp(QMainWindow):
             self._is_listening    = False
             self._speech_active   = False
             self._is_transcribing = False
+            self._ptt_held: set   = set()  # tracks currently held keys for combo PTT
+            self._last_paste_text: str = ""   # last pasted text (for rollback)
+            self._rollback_pending: bool = False  # lowercase first result of next session
+            self._rollback_armed:   bool = False  # set by rollback hotkey, consumed by toggle_rec
+            self._ptt_starting: bool = False  # guard: recorder start in progress
             app_logger.info("Queueing initial model preload...")
             self.transcriber.preload_model()
             
@@ -1711,11 +1816,9 @@ class WhisperRApp(QMainWindow):
             raise
     
     def paintEvent(self, event):
-        """Override paintEvent to log painting"""
-        app_logger.debug("→ paintEvent: Window painting")
+        """Thin override retained for crash safety only (debug logging removed)."""
         try:
             super().paintEvent(event)
-            app_logger.debug("✓ paintEvent: Painting complete")
         except Exception as e:
             app_logger.error(f"✗ paintEvent crashed: {e}", exc_info=True)
             raise
@@ -1871,6 +1974,7 @@ class WhisperRApp(QMainWindow):
         audio_layout = QFormLayout()
         
         self.cfg_mic = QComboBox()
+        self.cfg_mic.setPlaceholderText("— Select microphone —")
         self.pop_mics()
         # Connect signal to reset meter when device changes
         self.cfg_mic.currentIndexChanged.connect(self.on_mic_changed)
@@ -1934,10 +2038,6 @@ class WhisperRApp(QMainWindow):
         self.btn_hk1.clicked.connect(lambda: self.cap_hk(self.btn_hk1, "hotkey"))
         hotkey_layout.addRow("Toggle Dictation:", self.btn_hk1)
         
-        self.btn_hk2 = QPushButton(self.config.settings["ptt_key"])
-        self.btn_hk2.clicked.connect(lambda: self.cap_hk(self.btn_hk2, "ptt_key"))
-        hotkey_layout.addRow("Push-to-Talk:", self.btn_hk2)
-        
         # Note about PTT
         ptt_info = QLabel("Note: PTT key will also function normally in other apps")
         ptt_info.setStyleSheet("color: #888; font-size: 8pt; font-style: italic;")
@@ -1947,6 +2047,27 @@ class WhisperRApp(QMainWindow):
         self.btn_hk_vis = QPushButton(self.config.settings["visibility_hotkey"])
         self.btn_hk_vis.clicked.connect(lambda: self.cap_hk(self.btn_hk_vis, "visibility_hotkey"))
         hotkey_layout.addRow("Show/Hide Window:", self.btn_hk_vis)
+
+        self.btn_hk_rollback = QPushButton(self.config.settings.get("rollback_hotkey", "ctrl+shift+z"))
+        self.btn_hk_rollback.clicked.connect(lambda: self.cap_hk(self.btn_hk_rollback, "rollback_hotkey"))
+        self.btn_hk_rollback.setToolTip(
+            "Erase trailing punctuation/fragment from the last transcription\n"
+            "and position the cursor for seamless continuation."
+        )
+        hotkey_layout.addRow("Resume Transcription:", self.btn_hk_rollback)
+
+        self.cfg_live_mode = QComboBox()
+        self.cfg_live_mode.addItems(["Simple", "Push-To-Talk"])
+        self.cfg_live_mode.setCurrentText(self.config.settings.get("live_mode", "Simple"))
+        self.cfg_live_mode.setToolTip(
+            "Simple: dictation starts/stops with the Toggle Dictation hotkey.\n"
+            "Push-To-Talk: hold the PTT key to record; release to transcribe."
+        )
+        hotkey_layout.addRow("Dictation Mode:", self.cfg_live_mode)
+
+        self.btn_hk2 = QPushButton(self.config.settings["ptt_key"])
+        self.btn_hk2.clicked.connect(lambda: self.cap_hk(self.btn_hk2, "ptt_key"))
+        hotkey_layout.addRow("Push-to-Talk Key:", self.btn_hk2)
         
         hotkey_group.setLayout(hotkey_layout)
         main_layout.addWidget(hotkey_group)
@@ -2109,69 +2230,86 @@ class WhisperRApp(QMainWindow):
         """Populate microphone dropdown with better device matching"""
         p = pyaudio.PyAudio()
         self.cfg_mic.clear()
-        sel = 0
+        sel = -1  # -1 shows placeholder until a real device is matched
         saved_device = self.config.settings.get("input_device_name", "")
-        
+
         app_logger.debug("Scanning audio input devices:")
-        
+
         try:
             device_count = p.get_device_count()
         except Exception as e:
             app_logger.error(f"Failed to get device count: {e}")
             p.terminate()
             return
-        
-        devices_added = []
-        
+
+        # First pass: collect all valid input devices grouped by host API
+        from collections import defaultdict
+        groups = defaultdict(list)   # api_name -> [(pyaudio_idx, device_name)]
+        seen_names = {}              # device_name -> api_name (for dedup)
+
         for i in range(device_count):
             try:
                 info = p.get_device_info_by_index(i)
-                
-                # Only add input devices
                 if info["maxInputChannels"] <= 0:
                     continue
-                
-                # Get host API name safely
                 try:
                     h = p.get_host_api_info_by_index(info["hostApi"])["name"]
-                except:
+                except Exception:
                     h = "Unknown"
-                
-                # Create device display name
-                device_name = info['name']
-                full_name = f"{device_name} ({h})"
-                
-                # Skip duplicate entries (prefer WASAPI/MME over DirectSound)
-                if any(device_name in d for d in devices_added):
-                    # If we already have this device with WASAPI, skip DirectSound
+                device_name = info["name"]
+                # Prefer WASAPI/MME over DirectSound for the same device
+                if device_name in seen_names:
                     if "DirectSound" in h:
-                        app_logger.debug(f"  Skipping duplicate DirectSound: {full_name}")
+                        app_logger.debug(f"  Skipping duplicate DirectSound: {device_name}")
                         continue
-                
-                self.cfg_mic.addItem(full_name, i)
-                devices_added.append(device_name)
-                app_logger.debug(f"  Device {i}: {full_name}")
-                
-                # Check if this matches the saved device (match by base name, not full string)
+                    # Replace the existing entry if the new one is WASAPI
+                    prev_api = seen_names[device_name]
+                    if "DirectSound" in prev_api:
+                        groups[prev_api] = [(idx, n) for idx, n in groups[prev_api] if n != device_name]
+                seen_names[device_name] = h
+                groups[h].append((i, device_name))
+                app_logger.debug(f"  Device {i}: {device_name} ({h})")
+            except Exception as e:
+                app_logger.warning(f"Error reading device {i}: {e}")
+
+        # Second pass: populate combo with group headers + items
+        # Sort groups: WASAPI first, then MME, then others, then DirectSound last
+        def _api_sort_key(api):
+            order = {"Windows WASAPI": 0, "MME": 1, "Windows DirectSound": 99}
+            return order.get(api, 50)
+
+        for api_name in sorted(groups.keys(), key=_api_sort_key):
+            devices = groups[api_name]
+            if not devices:
+                continue
+            # Add a disabled header item for this group
+            header_idx = self.cfg_mic.count()
+            self.cfg_mic.addItem(f"── {api_name} ──", -1)
+            header_item = self.cfg_mic.model().item(header_idx)
+            header_item.setEnabled(False)
+            from PyQt6.QtGui import QFont
+            f = header_item.font()
+            f.setBold(True)
+            header_item.setFont(f)
+
+            for pyaudio_idx, device_name in devices:
+                full_name = f"{device_name} ({api_name})"
+                self.cfg_mic.addItem(f"  {device_name}", pyaudio_idx)
+                app_logger.debug(f"  Added: {device_name} [{api_name}]")
+                # Selection matching uses full_name for backward compat with saved settings
                 if saved_device:
-                    # Try exact match first
-                    if saved_device == full_name:
+                    if saved_device == full_name or saved_device == f"  {device_name}":
                         sel = self.cfg_mic.count() - 1
                         app_logger.debug(f"  ✓ Exact match for saved device")
-                    # Then try partial match on device name
                     elif device_name in saved_device or saved_device in device_name:
                         sel = self.cfg_mic.count() - 1
                         app_logger.debug(f"  ✓ Partial match for saved device")
-                
-            except Exception as e:
-                app_logger.warning(f"Error reading device {i}: {e}")
-                continue
         
         if self.cfg_mic.count() == 0:
             app_logger.error("No input devices found!")
             self.cfg_mic.addItem("No microphone detected", -1)
         else:
-            self.cfg_mic.setCurrentIndex(sel)
+            self.cfg_mic.setCurrentIndex(sel)  # -1 shows placeholder if no match
             app_logger.info(f"Selected device index: {sel}, name: {self.cfg_mic.currentText()}")
         
         p.terminate()
@@ -2210,13 +2348,15 @@ class WhisperRApp(QMainWindow):
             "mon_folder": self.cfg_mon.text(),
             "clear_exit": self.cfg_clear.isChecked(),
             "save_to_disk": not self.cfg_ram.isChecked(),
-            "input_device_name": self.cfg_mic.currentText(),
-            "input_device_index": self.cfg_mic.currentData(),
+            "input_device_name": self.cfg_mic.currentText().strip(),
+            "input_device_index": self.cfg_mic.currentData() if self.cfg_mic.currentData() != -1 else None,
             "dict_mode": self.cfg_dict_m.currentText(),
             "auto_pause_sec": self.cfg_p_sec.value(),
             "paste_delay": self.cfg_p_win.value(),
             "hotkey": self.btn_hk1.text(),
             "ptt_key": self.btn_hk2.text(),
+            "live_mode": self.cfg_live_mode.currentText(),
+            "rollback_hotkey": self.btn_hk_rollback.text(),
             "visibility_hotkey": self.btn_hk_vis.text(),
             "noise_floor": self.n_spin.value(),
             "speech_vol": self.s_spin.value(),
@@ -2301,6 +2441,13 @@ class WhisperRApp(QMainWindow):
     
     def on_mic_changed(self):
         """Handle microphone device change - reset meter stream"""
+        # Skip group header items (they have pyaudio_idx == -1)
+        if self.cfg_mic.currentData() == -1:
+            # Jump forward to the next real device
+            next_idx = self.cfg_mic.currentIndex() + 1
+            if next_idx < self.cfg_mic.count():
+                self.cfg_mic.setCurrentIndex(next_idx)
+            return
         app_logger.info(f"Microphone changed to: {self.cfg_mic.currentText()}")
         
         # Close existing meter stream
@@ -2325,6 +2472,24 @@ class WhisperRApp(QMainWindow):
             app_logger.info("Dictation stopped")
         else:
             app_logger.info("toggle_rec: Starting dictation")
+            # Rollback handshake:
+            # rollback_transcription() sets _rollback_armed (survives this block).
+            # We consume it here and set _rollback_pending for this session only.
+            # Any stale _rollback_pending from a previous no-speech session is cleared.
+            self._rollback_pending = bool(getattr(self, '_rollback_armed', False))
+            self._rollback_armed   = False
+            if self._rollback_pending:
+                app_logger.debug("toggle_rec: rollback armed — will lowercase first result")
+            # Always kill any existing recorder first, even if it claims inactive.
+            # A PTT recorder-storm can leave orphaned recorders with active=False
+            # that are still mid-startup — stopping them prevents resource leaks
+            # and the "stuck on listening" state caused by multiple simultaneous streams.
+            if self.recorder is not None:
+                try:
+                    self.recorder.active = False
+                except Exception:
+                    pass
+                self.recorder = None
             if self.meter_stream:
                 app_logger.debug("toggle_rec: Closing meter stream before starting recorder")
                 self.meter_stream.close()
@@ -2363,44 +2528,155 @@ class WhisperRApp(QMainWindow):
             self._update_app_state()
         app_logger.debug("✓ _on_speech_active: Complete")
 
-    def on_p(self, key):
-        """Handle PTT key press - simplified for reliability"""
+    # ── PTT polling (GetAsyncKeyState) ──────────────────────────────────────
+    # pynput keyboard.Listener uses SetWindowsHookEx which silently fails in
+    # frozen --noconsole apps (hook thread has no Win32 message pump).
+    # GetAsyncKeyState polling on a QTimer is simpler and works everywhere.
+
+    # Map canonical key names to Windows Virtual Key codes
+    _VK_MAP = {
+        'ctrl': 0x11, 'shift': 0x10, 'alt': 0x12,
+        'space': 0x20, 'enter': 0x0D, 'tab': 0x09,
+        'esc': 0x1B, 'backspace': 0x08, 'delete': 0x2E,
+        'f1': 0x70, 'f2': 0x71, 'f3': 0x72, 'f4': 0x73,
+        'f5': 0x74, 'f6': 0x75, 'f7': 0x76, 'f8': 0x77,
+        'f9': 0x78, 'f10': 0x79, 'f11': 0x7A, 'f12': 0x7B,
+        'up': 0x26, 'down': 0x28, 'left': 0x25, 'right': 0x27,
+        'home': 0x24, 'end': 0x23, 'page_up': 0x21, 'page_down': 0x22,
+        'insert': 0x2D, 'cmd': 0x5B,
+        # A-Z
+        **{chr(c): ord(chr(c).upper()) for c in range(ord('a'), ord('z')+1)},
+        # 0-9
+        **{str(d): ord(str(d)) for d in range(10)},
+    }
+
+    def _setup_ptt_poll(self):
+        """Create and start the QTimer that polls PTT key state."""
+        if hasattr(self, '_ptt_timer') and self._ptt_timer is not None:
+            self._ptt_timer.stop()
+        self._ptt_timer = QTimer(self)
+        self._ptt_timer.setInterval(30)  # 30ms poll = ~33 checks/sec, negligible CPU
+        self._ptt_timer.timeout.connect(self._poll_ptt)
+        self._ptt_timer.start()
+        self.ptt_l = self._ptt_timer  # keep ptt_l set so setup_logic doesn't re-run
+        app_logger.debug(f"  PTT poll timer started (30ms interval)")
+
+    def _poll_ptt(self):
+        """Poll Win32 GetAsyncKeyState for the PTT combo. Called by QTimer."""
         try:
-            key_str = self.key_to_string(key)
-            ptt_key = self.config.settings["ptt_key"]
-            is_ptt = (key_str == ptt_key)
-            app_logger.debug(f"→ on_p: key='{key_str}', ptt_key='{ptt_key}', is_ptt={is_ptt}, recorder={self.recorder is not None}, recorder.active={self.recorder.active if self.recorder else 'N/A'}")
-            
-            # Check if this is the PTT key
-            if is_ptt and self.recorder:
-                prev = self.recorder.ptt_pressed
-                self.recorder.ptt_pressed = True
-                app_logger.debug(f"  on_p: PTT activated (was {prev} → True)")
-        except Exception as e:
-            app_logger.error(f"PTT press error: {e}", exc_info=True)
-    
-    def on_r(self, key):
-        """Handle PTT key release"""
-        try:
-            if not self.recorder:
-                app_logger.debug("→ on_r: no recorder, ignoring")
+            if self.config.settings.get("live_mode") != "Push-To-Talk":
                 return
-                
-            key_str = self.key_to_string(key)
-            ptt_key = self.config.settings["ptt_key"]
-            is_ptt = (key_str == ptt_key)
-            app_logger.debug(f"→ on_r: key='{key_str}', ptt_key='{ptt_key}', is_ptt={is_ptt}")
-            
-            # Check if this is the PTT key being released
-            if is_ptt:
-                prev = self.recorder.ptt_pressed
-                self.recorder.ptt_pressed = False
-                app_logger.debug(f"  on_r: PTT deactivated (was {prev} → False)")
+            ptt_key = self.config.settings.get("ptt_key", "")
+            if not ptt_key:
+                return
+            parts = [p.strip().lower() for p in ptt_key.split('+')]
+            import ctypes
+            user32 = ctypes.windll.user32
+            combo_held = all(
+                user32.GetAsyncKeyState(self._VK_MAP.get(p, 0)) & 0x8000
+                for p in parts if p in self._VK_MAP
+            )
+            if combo_held:
+                # Clear the starting guard once the recorder is confirmed running.
+                # recorder.active is set to True inside AudioRecorder.run() which
+                # runs on a separate thread — it won't be True yet on the very next
+                # poll tick after toggle_rec() returns, hence the guard.
+                if self._ptt_starting and self.recorder and self.recorder.active:
+                    self._ptt_starting = False
+
+                # Only auto-start if not already running AND not mid-start.
+                # Without this guard, every 30ms poll tick would spawn a new
+                # AudioRecorder thread (causing a recorder storm that crashes the app).
+                if not self._ptt_starting and (not self.recorder or not self.recorder.active):
+                    app_logger.debug("PTT held — auto-starting recorder session")
+                    self._ptt_starting = True
+                    self.toggle_rec()
+
+                if self.recorder and not self.recorder.ptt_pressed:
+                    self.recorder.ptt_pressed = True
+                    app_logger.debug("PTT activated (poll)")
+            else:
+                # PTT released — clear guard so next press can start fresh
+                self._ptt_starting = False
+                if self.recorder and self.recorder.ptt_pressed:
+                    self.recorder.ptt_pressed = False
+                    app_logger.debug("PTT deactivated (poll)")
         except Exception as e:
-            app_logger.error(f"PTT release error: {e}", exc_info=True)
-    
+            app_logger.error(f"PTT poll error: {e}", exc_info=True)
+
+    def rollback_transcription(self):
+        """Strip trailing punctuation/ellipsis from the last pasted transcription
+        so the user can speak again and continue the sentence seamlessly.
+
+        Use case: Whisper outputs "I was going to..." → user presses rollback →
+        app sends 4 backspaces (erasing "...") leaving "I was going to " →
+        user speaks "finish the thought" → gets pasted as "finish the thought"
+        (lowercased) → final text: "I was going to finish the thought".
+
+        Only trailing punctuation and whitespace are erased.  If the transcription
+        ended cleanly (no trailing punct), the trailing space is still removed so
+        the next paste joins without a double-space — but NO words are deleted.
+        """
+        import re, time as _time
+        txt = self._last_paste_text
+        if not txt:
+            app_logger.debug("rollback: nothing to roll back")
+            return
+
+        # Strip only trailing whitespace + punctuation/ellipsis.
+        # We NEVER delete words — if there is no trailing junk, we just
+        # remove the trailing space so the next paste joins cleanly.
+        stripped = txt.rstrip()                                    # drop trailing whitespace
+        stripped = re.sub(r'[.,;:!?…\-]+$', '', stripped)         # drop trailing punctuation
+        stripped = stripped.rstrip()                               # drop any whitespace before punct
+
+        # chars to delete = everything we pasted after the clean word boundary
+        chars_to_delete = len(txt) - len(stripped)
+
+        # Always delete at least the trailing space even if no punct was found,
+        # so the next dictation doesn't double-space. But never delete words.
+        if chars_to_delete == 0:
+            # txt had no trailing punct and no trailing space (shouldn't happen,
+            # but guard anyway — nothing useful to do)
+            app_logger.debug("rollback: no trailing junk to erase — nothing to do")
+            return
+
+        app_logger.info(f"rollback: erasing {chars_to_delete} chars — '{txt[-chars_to_delete:]!r}'")
+        try:
+            import pyautogui as _pag
+            import ctypes as _ct
+            # The rollback hotkey (e.g. ctrl+shift+z) fires this callback while
+            # ctrl and shift are still physically held down by the user.
+            # Sending bare backspaces in that state causes apps to interpret them
+            # as ctrl+backspace (delete whole word) or ctrl+shift+backspace
+            # (delete line / undo), wiping far more than intended.
+            #
+            # Fix: release all modifier keys via Win32 keybd_event before sending
+            # backspaces, then give the target window a moment to settle.
+            _VK_CONTROL = 0x11
+            _VK_SHIFT   = 0x10
+            _VK_MENU    = 0x12   # Alt
+            _KEYEVENTF_KEYUP = 0x0002
+            for _vk in (_VK_CONTROL, _VK_SHIFT, _VK_MENU):
+                _ct.windll.user32.keybd_event(_vk, 0, _KEYEVENTF_KEYUP, 0)
+            _time.sleep(0.08)   # let the target window process the key-ups
+
+            for _ in range(chars_to_delete):
+                _pag.press('backspace')
+            # Leave one space so the next paste joins as "word nextword"
+            _pag.press('space')
+            self._last_paste_text = stripped + " "
+            # Arm the lowercase flag for the next recording session.
+            self._rollback_armed = True
+            self._rollback_pending = False  # consumed by toggle_rec on session start
+            self.scratchpad.append(
+                f"[Rollback] Removed trailing {chars_to_delete} char(s): '{txt[-chars_to_delete:]!r}'"
+            )
+        except Exception as e:
+            app_logger.error(f"rollback error: {e}", exc_info=True)
+
     def key_to_string(self, key):
-        """Convert pynput key to string format"""
+        """Convert pynput key to string format (kept for hotkey capture)."""
         if hasattr(key, 'char') and key.char:
             return key.char.lower()
         elif hasattr(key, 'name'):
@@ -2544,35 +2820,49 @@ class WhisperRApp(QMainWindow):
         self.scratchpad.append(f"[{timestamp}] {text}")
         
         if src == "live":
-            auto_space = self.config.settings["auto_space"]
-            p_text = text + " " if auto_space else text
-            paste_delay = self.config.settings["paste_delay"]
-            app_logger.debug(f"  on_text: auto_space={auto_space}, paste_delay={paste_delay}s, p_text length={len(p_text)}")
-            
-            try:
-                app_logger.debug("  on_text: Copying to clipboard via pyperclip...")
-                pyperclip.copy(p_text)
-                app_logger.debug(f"  on_text: Clipboard set. Sleeping {paste_delay}s...")
-                time.sleep(paste_delay)
-                app_logger.debug("  on_text: Sleep done. Sending Ctrl+V via pyautogui...")
-                pyautogui.hotkey('ctrl', 'v')
-                app_logger.info(f"Text pasted: '{text[:30]}{'...' if len(text)>30 else ''}'")
-            except Exception as e:
-                app_logger.error(f"Paste error: {e}", exc_info=True)
-            
-            # Check for voice commands
+            # ── Command detection (runs BEFORE paste) ────────────────────────
+            # If the transcribed text matches a voice command, execute it and
+            # do NOT paste the text — the spoken phrase was a command, not prose.
+            _cmd_fired = False
             app_logger.debug(f"  on_text: Checking {len(self.config.settings['commands'])} voice commands...")
             for phrase, cmd in self.config.settings["commands"].items():
-                match = phrase.lower() in text.lower()
-                app_logger.debug(f"  on_text: Command check: phrase='{phrase}' in text → {match}")
-                if match:
+                if phrase.lower() in text.lower():
+                    app_logger.debug(f"  on_text: Command matched: '{phrase}' → '{cmd}'")
                     try:
-                        app_logger.info(f"  on_text: Executing command: '{cmd}'")
                         subprocess.Popen(cmd, shell=True)
                         app_logger.info(f"Command executed: {cmd}")
-                        self.scratchpad.append(f"[Command] Executed: {cmd}")
+                        self.scratchpad.append(f"[Command] {phrase} → {cmd}")
+                        _cmd_fired = True
                     except Exception as e:
                         app_logger.error(f"Command execution failed: {e}", exc_info=True)
+
+            if _cmd_fired:
+                app_logger.debug("  on_text: Command fired — skipping paste")
+            else:
+                # ── Rollback buffer ───────────────────────────────────────────
+                # Store the last transcription so the resume-transcription hotkey
+                # can send backspaces to erase it and rejoin the previous sentence.
+                auto_space = self.config.settings["auto_space"]
+                # If a rollback just happened, the next transcription needs its
+                # first letter lowercased — Whisper always capitalises new sentences.
+                if self._rollback_pending and text:
+                    text = text[0].lower() + text[1:]
+                    self._rollback_pending = False
+                p_text = text + " " if auto_space else text
+                # Strip trailing punctuation/spaces to find the last real word,
+                # then record how many characters were actually output.
+                self._last_paste_len = len(p_text)
+                self._last_paste_text = p_text
+
+                paste_delay = self.config.settings["paste_delay"]
+                app_logger.debug(f"  on_text: auto_space={auto_space}, paste_delay={paste_delay}s, p_text length={len(p_text)}")
+                try:
+                    pyperclip.copy(p_text)
+                    time.sleep(paste_delay)
+                    pyautogui.hotkey('ctrl', 'v')
+                    app_logger.info(f"Text pasted: '{text[:30]}{'...' if len(text)>30 else ''}'")
+                except Exception as e:
+                    app_logger.error(f"Paste error: {e}", exc_info=True)
         
         app_logger.debug("✓ on_text: Complete")
 
@@ -2604,17 +2894,21 @@ class WhisperRApp(QMainWindow):
             raw_vis = self.config.settings["visibility_hotkey"]
             app_logger.debug(f"  setup_logic: Raw hotkeys: toggle='{raw_toggle}', visibility='{raw_vis}'")
             
-            toggle_hotkey = self.normalize_hotkey(raw_toggle)
+            toggle_hotkey     = self.normalize_hotkey(raw_toggle)
             visibility_hotkey = self.normalize_hotkey(raw_vis)
-            app_logger.debug(f"  setup_logic: Normalized hotkeys: toggle='{toggle_hotkey}', visibility='{visibility_hotkey}'")
+            raw_rollback      = self.config.settings.get("rollback_hotkey", "")
+            rollback_hotkey   = self.normalize_hotkey(raw_rollback) if raw_rollback else None
+            app_logger.debug(f"  setup_logic: Normalized hotkeys: toggle='{toggle_hotkey}', visibility='{visibility_hotkey}', rollback='{rollback_hotkey}'")
             
             # Store hotkeys for conflict checking
             self.toggle_hotkey_normalized = toggle_hotkey
             self.visibility_hotkey_normalized = visibility_hotkey
             app_logger.debug(f"  setup_logic: Stored normalized hotkeys on self")
             
-            hotkey_map[toggle_hotkey] = self.on_toggle_hotkey
+            hotkey_map[toggle_hotkey]     = self.on_toggle_hotkey
             hotkey_map[visibility_hotkey] = self.on_visibility_hotkey
+            if rollback_hotkey:
+                hotkey_map[rollback_hotkey] = self.rollback_transcription
             app_logger.debug(f"  setup_logic: hotkey_map = {list(hotkey_map.keys())}")
             
             app_logger.debug("  setup_logic: Creating GlobalHotKeys listener...")
@@ -2630,33 +2924,20 @@ class WhisperRApp(QMainWindow):
                 f"Failed to register hotkeys:\n{e}\n\nPlease check your hotkey settings."
             )
         
-        # Start PTT listener with suppression capability
+        # PTT polling via GetAsyncKeyState (Win32) or key state query.
+        # We deliberately avoid pynput keyboard.Listener here because it uses
+        # SetWindowsHookEx which requires the hook thread to run its own Win32
+        # message pump — this silently fails in frozen (--noconsole) apps.
+        # GetAsyncKeyState polling on a QTimer runs on the Qt main thread and
+        # works reliably in all deployment modes.
         try:
             ptt_key_setting = self.config.settings.get('ptt_key', 'NOT SET')
-            app_logger.debug(f"  setup_logic: Creating PTT keyboard listener, ptt_key='{ptt_key_setting}'")
-            app_logger.debug(f"  setup_logic: on_p={self.on_p}, on_r={self.on_r}")
-            
-            # Create listener that can suppress keys
-            app_logger.debug("  setup_logic: Instantiating keyboard.Listener (suppress=False)...")
-            self.ptt_l = keyboard.Listener(
-                on_press=self.on_p, 
-                on_release=self.on_r,
-                suppress=False  # We'll handle suppression manually
-            )
-            app_logger.debug(f"  setup_logic: keyboard.Listener instantiated (id={id(self.ptt_l)})")
-            
-            app_logger.debug("  setup_logic: Starting PTT listener thread...")
-            self.ptt_l.start()
-            app_logger.debug(f"  setup_logic: PTT listener thread started, is_alive={self.ptt_l.is_alive()}")
-            
+            app_logger.debug(f"  setup_logic: Setting up PTT polling, ptt_key='{ptt_key_setting}'")
+            self._ptt_held.clear()
+            self._setup_ptt_poll()
             app_logger.info("PTT listener started successfully")
-            
         except Exception as e:
             app_logger.error(f"PTT listener failed to start: {e}", exc_info=True)
-            app_logger.error(f"PTT listener error type: {type(e).__name__}")
-            app_logger.error(f"PTT listener error args: {e.args}")
-            
-            # Try to continue without PTT
             self.ptt_l = None
             app_logger.warning("Continuing without PTT listener")
         
