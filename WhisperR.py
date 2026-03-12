@@ -2139,16 +2139,17 @@ class _MdHighlighter(QSyntaxHighlighter):
                 self.setFormat(m.start(), m.end() - m.start(), fmt)
 
 
-class WhisperEditor(QDialog):
+class WhisperEditor(QWidget):
     """Voice-driven built-in text editor.
 
-    The host (WhisperRApp) calls append_text(text) to pipe dictation in,
-    and may call execute_edit(op, target, replacement) for replace/insert ops.
-    The editor signals paste_requested(text) when the user wants to push text
-    back to the previously active application.
+    Uses QWidget (not QDialog) so it has no implicit reject/close-on-deactivate
+    behavior.  The host (WhisperRApp) calls append_text(text) to pipe dictation
+    in, and may call execute_edit(op, target, replacement) for replace/insert.
+    The editor signals paste_requested(text) when done.
     """
 
     paste_requested = pyqtSignal(str)   # user said "whisper paste" / clicked Paste to App
+    finished = pyqtSignal()             # emitted on close (replaces QDialog.finished)
 
     # ── Construction ─────────────────────────────────────────────────────────
 
@@ -2530,13 +2531,59 @@ class WhisperEditor(QDialog):
         for sc in self._hotkeys_active:
             sc.setEnabled(False)
         self._hotkeys_active.clear()
+        self.finished.emit()   # notify app (replaces QDialog.finished)
         super().closeEvent(event)
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
             self.close()
-        else:
-            super().keyPressEvent(e)
+            return
+        # Suppress keystrokes that match the app's global hotkeys so they
+        # don't land in the text editor.  The app's keyboard listener fires
+        # the action; we just need to eat the Qt key event here.
+        app = QApplication.instance()
+        main = next((w for w in app.topLevelWidgets()
+                     if w.__class__.__name__ == "WhisperRApp"), None)
+        if main is not None:
+            cfg = getattr(main, "config", None)
+            if cfg:
+                _hotkeys_to_suppress = [
+                    cfg.settings.get("hotkey", ""),
+                    cfg.settings.get("ptt_key", ""),
+                    cfg.settings.get("visibility_hotkey", ""),
+                    cfg.settings.get("editor_hotkey", ""),
+                    cfg.settings.get("rollback_hotkey", ""),
+                ]
+                mods = e.modifiers()
+                key  = e.key()
+                # Build a set of (modifier_flags, key_code) pairs to compare
+                _MOD = Qt.KeyboardModifier
+                _mod_map = {
+                    "ctrl":  _MOD.ControlModifier,
+                    "alt":   _MOD.AltModifier,
+                    "shift": _MOD.ShiftModifier,
+                    "win":   _MOD.MetaModifier,
+                    "meta":  _MOD.MetaModifier,
+                }
+                _key_map = {c: getattr(Qt.Key, f"Key_{c.upper()}", None)
+                            for c in "abcdefghijklmnopqrstuvwxyz0123456789"}
+                _key_map.update({"f"+str(i): getattr(Qt.Key, f"Key_F{i}", None)
+                                 for i in range(1, 13)})
+                for hk_str in _hotkeys_to_suppress:
+                    if not hk_str:
+                        continue
+                    parts = [p.strip().lower() for p in hk_str.split("+")]
+                    expected_mods = _MOD.NoModifier
+                    expected_key  = None
+                    for part in parts:
+                        if part in _mod_map:
+                            expected_mods |= _mod_map[part]
+                        elif part in _key_map and _key_map[part]:
+                            expected_key = _key_map[part]
+                    if expected_key and mods == expected_mods and key == expected_key:
+                        e.accept()
+                        return
+        super().keyPressEvent(e)
 
 # ── Voice-guided wizard overlay ───────────────────────────────────────────────
 # A small always-on-top frameless window that prompts the user to speak a
@@ -4875,12 +4922,13 @@ class WhisperRApp(QMainWindow):
         _delay_ms = max(int(self.config.settings.get("paste_delay", 0.5) * 1000), 500)
 
         def _restore_and_exec():
-            if _hwnd:
+            # When the editor is open, ops run directly on the QTextEdit —
+            # no focus change needed or wanted.
+            _ed_open = self._editor and self._editor.isVisible()
+            if _hwnd and not _ed_open:
                 try:
                     import ctypes as _ct_r
                     _u32 = _ct_r.windll.user32
-                    # AttachThreadInput is more reliable than SetForegroundWindow
-                    # alone — Windows blocks focus steals from background processes.
                     _fg   = _u32.GetForegroundWindow()
                     _tFG  = _u32.GetWindowThreadProcessId(_fg, None)
                     _tTGT = _u32.GetWindowThreadProcessId(_hwnd, None)
@@ -4890,9 +4938,10 @@ class WhisperRApp(QMainWindow):
                     _u32.AttachThreadInput(_tFG, _tTGT, False)
                 except Exception:
                     pass
-            # Extra wait after focus restore — window needs to fully activate
+            # For editor ops, execute immediately; for external, wait for focus
             from PyQt6.QtCore import QTimer as _QT2
-            _QT2.singleShot(_delay_ms, _exec_action)
+            _delay = 0 if _ed_open else _delay_ms
+            _QT2.singleShot(_delay, _exec_action)
 
         # Close overlay first, then restore + execute after brief pause
         if self._wizard_overlay:
