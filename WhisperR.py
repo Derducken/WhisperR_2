@@ -866,10 +866,13 @@ class AppConfig:
             "editor_type_trigger":  "whisper type, whisper write",
             "editor_edit_trigger":  "whisper edit, whisper edit this",
             "editor_paste_trigger": "whisper paste, whisper done, whisper okay",
-            "editor_hk_bold":  "Ctrl+B",  "editor_hk_italic": "Ctrl+I",
-            "editor_hk_strike":"Ctrl+Shift+S", "editor_hk_code": "Ctrl+`",
-            "editor_hk_h1":    "Ctrl+1",  "editor_hk_h2": "Ctrl+2",
-            "editor_hk_h3":    "Ctrl+3",  "editor_hk_emdash": "Ctrl+Shift+Minus",
+            "editor_hk_bold":      "Ctrl+B",  "editor_hk_italic":    "Ctrl+I",
+            "editor_hk_strike":    "Ctrl+Shift+S", "editor_hk_highlight": "Ctrl+Shift+H",
+            "editor_hk_code":      "Ctrl+`",
+            "editor_hk_h1":        "Ctrl+1",  "editor_hk_h2":        "Ctrl+2",
+            "editor_hk_h3":        "Ctrl+3",  "editor_hk_emdash":    "Ctrl+Shift+Minus",
+            "editor_hk_bullet":    "Ctrl+Shift+B", "editor_hk_numlist": "Ctrl+Shift+N",
+            "editor_hk_tasklist":  "Ctrl+Shift+T", "editor_hk_link":    "Ctrl+K",
             "sendkeys_trigger":   "whisper send keys",
             "select_trigger":     "whisper select",
             "move_trigger":       "whisper move",
@@ -2084,6 +2087,118 @@ def _any_alias_matches(spoken: str, phrase_field: str, fuzz_thr: float = 0.75) -
     return False
 
 
+
+def _capture_selection_from_hwnd(hwnd) -> str:
+    """Send Ctrl+C to hwnd via SendInput and return whatever lands on the clipboard.
+
+    Uses AttachThreadInput to give the target window keyboard focus just long
+    enough to inject the keystrokes, then detaches.  Returns empty string on
+    any failure or if the clipboard didn't change (nothing was selected).
+    """
+    import ctypes, ctypes.wintypes, time
+    try:
+        import pyperclip as _pcp
+        _old = _pcp.paste()
+    except Exception:
+        _old = ""
+
+    if not hwnd:
+        return _old  # no source window — return whatever is already on clipboard
+
+    try:
+        u32 = ctypes.windll.user32
+
+        VK_CONTROL       = 0x11
+        VK_C             = 0x43
+        KEYEVENTF_KEYUP  = 0x0002
+        INPUT_KEYBOARD   = 1
+
+        class _KI(ctypes.Structure):
+            _fields_ = [
+                ("wVk",         ctypes.wintypes.WORD),
+                ("wScan",       ctypes.wintypes.WORD),
+                ("dwFlags",     ctypes.wintypes.DWORD),
+                ("time",        ctypes.wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ]
+        class _INPUT(ctypes.Structure):
+            class _U(ctypes.Union):
+                _fields_ = [("ki", _KI)]
+            _anonymous_ = ("_u",)
+            _fields_    = [("type", ctypes.wintypes.DWORD), ("_u", _U)]
+
+        def _make(vk, flags=0):
+            i = _INPUT(); i.type = INPUT_KEYBOARD
+            i.ki.wVk = vk; i.ki.dwFlags = flags
+            return i
+
+        fg      = u32.GetForegroundWindow()
+        t_fg    = u32.GetWindowThreadProcessId(fg,   None)
+        t_src   = u32.GetWindowThreadProcessId(hwnd, None)
+
+        u32.AttachThreadInput(t_fg, t_src, True)
+        u32.SetForegroundWindow(hwnd)
+        u32.BringWindowToTop(hwnd)
+        time.sleep(0.12)
+
+        inputs = (_INPUT * 4)(
+            _make(VK_CONTROL),
+            _make(VK_C),
+            _make(VK_C,       KEYEVENTF_KEYUP),
+            _make(VK_CONTROL, KEYEVENTF_KEYUP),
+        )
+        u32.SendInput(4, inputs, ctypes.sizeof(_INPUT))
+        time.sleep(0.25)   # wait for clipboard to update
+
+        u32.AttachThreadInput(t_fg, t_src, False)
+
+        try:
+            new = _pcp.paste()
+        except Exception:
+            new = _old
+
+        # If clipboard didn't change, nothing was selected — return empty
+        # so the editor opens blank rather than with stale clipboard content.
+        return new if new != _old else ""
+
+    except Exception as _e:
+        try:
+            import logging; logging.getLogger("WhisperR").warning(f"_capture_selection_from_hwnd: {_e}")
+        except Exception:
+            pass
+        return ""
+
+
+def _smart_case_punct(original: str, new_text: str) -> str:
+    """Adapt new_text capitalisation and terminal punctuation to match original.
+
+    Rules:
+      • If original starts with an uppercase letter → capitalise first letter of new_text.
+      • If original is a "complete sentence" (ends with . ! ? … or an emoji-stop) AND
+        new_text has no terminal punctuation → append the same terminal character.
+      • "Complete sentence" = original ends with . ! ? or … (after stripping trailing spaces).
+      • If new_text already ends with punctuation, leave it alone.
+    """
+    import re as _re_sc
+    nt = new_text.strip()
+    if not nt:
+        return new_text
+
+    # ── Capitalisation ───────────────────────────────────────────────────────
+    orig_stripped = original.lstrip()
+    if orig_stripped and orig_stripped[0].isupper():
+        nt = nt[0].upper() + nt[1:]
+
+    # ── Terminal punctuation ─────────────────────────────────────────────────
+    _TERMINAL = ".!?…"
+    orig_end = original.rstrip()
+    orig_is_sentence = bool(orig_end) and orig_end[-1] in _TERMINAL
+    new_has_punct    = bool(nt) and nt[-1] in _TERMINAL + ",;:'\")"
+    if orig_is_sentence and not new_has_punct:
+        nt = nt + orig_end[-1]   # replicate the exact terminal char (. vs ! vs ?)
+
+    return nt
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # WhisperEditor — built-in voice-driven text editor
 #
@@ -2173,24 +2288,68 @@ class WhisperEditor(QWidget):
         root.setContentsMargins(10, 8, 10, 8)
         root.setSpacing(6)
 
-        # ── Stats bar ────────────────────────────────────────────────────────
+        # ── Stats bar ─────────────────────────────────────────────────────────
         stats_row = QHBoxLayout()
-        stats_row.setSpacing(10)
+        stats_row.setSpacing(6)
 
-        # Remember-content toggle (leftmost)
-        self.remember_toggle = QPushButton("📌")
-        self.remember_toggle.setCheckable(True)
-        self.remember_toggle.setFixedSize(28, 24)
-        self.remember_toggle.setToolTip(
+        def _toggle_btn(emoji, tip, checked_bg="#5a3a00", checked_border="#cc8800",
+                        checked_color="#ffcc44"):
+            b = QPushButton(emoji)
+            b.setCheckable(True)
+            b.setFixedSize(28, 24)
+            b.setToolTip(tip)
+            b.setStyleSheet(
+                f"QPushButton{{background:#2a2a2a;border:1px solid #444;"
+                f"border-radius:3px;color:#aaa;}}"
+                f"QPushButton:checked{{background:{checked_bg};border-color:{checked_border};"
+                f"color:{checked_color};}}"
+                "QPushButton:hover{border-color:#0078d7;}")
+            return b
+
+        # Three mutually-exclusive memory/clipboard toggles
+        self.remember_toggle = _toggle_btn(
+            "📌",
             "Remember content\n"
-            "When ON: closing and re-opening the editor preserves its text.\n"
-            "When re-opened via \"whisper edit\", new text is appended below.")
-        self.remember_toggle.setStyleSheet(
-            "QPushButton{background:#2a2a2a;border:1px solid #444;border-radius:3px;color:#aaa;}"
-            "QPushButton:checked{background:#5a3a00;border-color:#cc8800;color:#ffcc44;}"
-            "QPushButton:hover{border-color:#0078d7;}")
-        stats_row.addWidget(self.remember_toggle)
+            "Preserves editor text when closed/hidden.\n"
+            "On re-open via \"whisper edit\", new text appends below.\n"
+            "Exclusive with the clipboard toggles.")
+        self.clipboard_prefill_toggle = _toggle_btn(
+            "📋",
+            "Clipboard prefill\n"
+            "Pre-populates editor with current clipboard on open.\n"
+            "Exclusive with the other memory toggles.",
+            checked_bg="#003a5a", checked_border="#0078d7", checked_color="#66bbff")
+        self.clipboard_monitor_toggle = _toggle_btn(
+            "👁",
+            "Clipboard monitor\n"
+            "Continuously watches clipboard; each new copy appends\n"
+            "a new entry below existing text — ideal for research.\n"
+            "Exclusive with the other memory toggles.",
+            checked_bg="#003a1a", checked_border="#00aa44", checked_color="#66ee88")
 
+        def _excl(sender, others):
+            if sender.isChecked():
+                for o in others:
+                    o.setChecked(False)
+
+        self.remember_toggle.toggled.connect(
+            lambda: _excl(self.remember_toggle,
+                [self.clipboard_prefill_toggle, self.clipboard_monitor_toggle]))
+        self.clipboard_prefill_toggle.toggled.connect(
+            lambda: _excl(self.clipboard_prefill_toggle,
+                [self.remember_toggle, self.clipboard_monitor_toggle]))
+        self.clipboard_monitor_toggle.toggled.connect(
+            lambda chk: (
+                self._start_clipboard_monitor() if chk else self._stop_clipboard_monitor(),
+                _excl(self.clipboard_monitor_toggle,
+                    [self.remember_toggle, self.clipboard_prefill_toggle])))
+
+        for tog in (self.remember_toggle,
+                    self.clipboard_prefill_toggle,
+                    self.clipboard_monitor_toggle):
+            stats_row.addWidget(tog)
+
+        stats_row.addSpacing(8)
         self.lbl_words = QLabel("Words: 0")
         self.lbl_chars = QLabel("Chars: 0")
         self.lbl_remain = QLabel("")
@@ -2217,25 +2376,45 @@ class WhisperEditor(QWidget):
         hk = lambda k, d: cfg.get(k, d)
 
         self._fmt_btns = [
-            ("**B**", "Bold",      hk("editor_hk_bold",   "Ctrl+B"), self._fmt_bold),
-            ("*I*",   "Italic",    hk("editor_hk_italic", "Ctrl+I"), self._fmt_italic),
-            ("~~S~~", "Strikethrough", hk("editor_hk_strike","Ctrl+Shift+S"), self._fmt_strike),
-            ("`C`",   "Inline code",   hk("editor_hk_code",  "Ctrl+`"),       self._fmt_code),
-            ("H1",    "Heading 1", hk("editor_hk_h1",    "Ctrl+1"), lambda: self._fmt_heading(1)),
-            ("H2",    "Heading 2", hk("editor_hk_h2",    "Ctrl+2"), lambda: self._fmt_heading(2)),
-            ("H3",    "Heading 3", hk("editor_hk_h3",    "Ctrl+3"), lambda: self._fmt_heading(3)),
-            ("—",     "Em dash",   hk("editor_hk_emdash","Ctrl+Shift+Minus"), self._fmt_emdash),
+            ("**B**", "Bold",           hk("editor_hk_bold",      "Ctrl+B"),         self._fmt_bold),
+            ("*I*",   "Italic",         hk("editor_hk_italic",    "Ctrl+I"),         self._fmt_italic),
+            ("~~S~~", "Strikethrough",  hk("editor_hk_strike",    "Ctrl+Shift+S"),   self._fmt_strike),
+            ("==H==", "Highlight",      hk("editor_hk_highlight", "Ctrl+Shift+H"),   self._fmt_highlight),
+            ("`C`",   "Inline code",    hk("editor_hk_code",      "Ctrl+`"),         self._fmt_code),
+            ("H1",    "Heading 1",      hk("editor_hk_h1",        "Ctrl+1"),         lambda: self._fmt_heading(1)),
+            ("H2",    "Heading 2",      hk("editor_hk_h2",        "Ctrl+2"),         lambda: self._fmt_heading(2)),
+            ("H3",    "Heading 3",      hk("editor_hk_h3",        "Ctrl+3"),         lambda: self._fmt_heading(3)),
+            ("—",     "Em dash",        hk("editor_hk_emdash",    "Ctrl+Shift+Minus"),self._fmt_emdash),
+            ("•",     "Bullet list",    hk("editor_hk_bullet",    "Ctrl+Shift+B"),   self._fmt_bullet),
+            ("1.",    "Numbered list",  hk("editor_hk_numlist",   "Ctrl+Shift+N"),   self._fmt_numlist),
+            ("☐",     "Task list",      hk("editor_hk_tasklist",  "Ctrl+Shift+T"),   self._fmt_tasklist),
         ]
+
+        # Link button — left-click = [text](URL), right-click = [text](clipboard)
+        self._link_btn = QPushButton("🔗")
+        self._link_btn.setFixedSize(36, 28)
+        self._link_btn.setToolTip(
+            "Insert link  [Ctrl+K]\n"
+            "Left-click: [selected](URL)\n"
+            "Right-click or Ctrl+Shift+K: [selected](clipboard URL)")
+        self._link_btn.clicked.connect(self._fmt_link)
+        self._link_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._link_btn.customContextMenuRequested.connect(
+            lambda _: self._fmt_link(use_clipboard=True))
+
+        _btn_ss = ("QPushButton{background:#2a2a2a;border:1px solid #444;border-radius:3px;"
+                   "color:#ddd;font-size:10pt;}"
+                   "QPushButton:hover{background:#0078d7;border-color:#0078d7;color:#fff;}")
+        self._link_btn.setStyleSheet(_btn_ss)
+
         for label, tip, hotkey, slot in self._fmt_btns:
             btn = QPushButton(label)
             btn.setFixedSize(36, 28)
             btn.setToolTip(f"{tip}  [{hotkey}]")
             btn.clicked.connect(slot)
-            btn.setStyleSheet(
-                "QPushButton{background:#2a2a2a;border:1px solid #444;border-radius:3px;"
-                "color:#ddd;font-size:10pt;}"
-                "QPushButton:hover{background:#0078d7;border-color:#0078d7;color:#fff;}")
+            btn.setStyleSheet(_btn_ss)
             fmt_row.addWidget(btn)
+        fmt_row.addWidget(self._link_btn)
 
         fmt_row.addStretch()
 
@@ -2255,9 +2434,13 @@ class WhisperEditor(QWidget):
         self.editor.setAcceptDrops(True)
         self.editor.setPlaceholderText(
             "Start dictating, or drop a .txt / .md file here…")
+        # Install event filter so hotkey key events are suppressed
+        # before they land in the text area (see eventFilter below)
+        self.editor.installEventFilter(self)
         self.editor.setMinimumHeight(360)
-        self.editor.setLineWrapMode(QTextEdit.LineWrapMode.FixedColumnWidth)
-        self.editor.setLineWrapColumnOrWidth(80)
+        self.editor.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        from PyQt6.QtGui import QTextOption as _QTO
+        self.editor.setWordWrapMode(_QTO.WrapMode.WordWrap)
         self.editor.setStyleSheet(
             "QTextEdit{background:#111;color:#e0e0e0;border:1px solid #333;"
             "border-radius:4px;padding:6px;font-family:Consolas,monospace;}")
@@ -2291,8 +2474,13 @@ class WhisperEditor(QWidget):
         self.btn_paste_app = _btn(
             "📤 Paste to App",
             "Paste text back to the previously active application\n"
-            f"Voice: \"whisper paste\" / \"whisper done\" / \"whisper okay\"",
+            "Voice: \"whisper paste\" / \"whisper done\" / \"whisper okay\"\n"
+            "Hotkey: Ctrl+Enter",
             self._paste_to_app)
+        _paste_sc = QShortcut(QKeySequence("Ctrl+Return"), self)
+        _paste_sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        _paste_sc.activated.connect(self._paste_to_app)
+        self._hotkeys_active.append(_paste_sc)
         self.btn_paste_app.setStyleSheet(
             "QPushButton{background:#0078d7;border:1px solid #005fa3;padding:5px 12px;"
             "border-radius:4px;color:#fff;font-weight:bold;}"
@@ -2352,19 +2540,99 @@ class WhisperEditor(QWidget):
         cur.insertText("#" * level + " " + line)
         self.editor.setTextCursor(cur)
 
+    def _fmt_highlight(self):  self._wrap_selection("==")
+
+    def _fmt_link(self, use_clipboard=False):
+        """Wrap selection as a Markdown link.
+        use_clipboard=False → [sel](URL) placeholder
+        use_clipboard=True  → [sel](clipboard contents)
+        """
+        cur = self.editor.textCursor()
+        sel = cur.selectedText() or "link text"
+        if use_clipboard:
+            try:
+                import pyperclip as _pclip
+                url = _pclip.paste().strip() or "URL"
+            except Exception:
+                url = "URL"
+        else:
+            url = "URL"
+        cur.insertText(f"[{sel}]({url})")
+        # Position cursor inside the URL part if we used the placeholder
+        if not use_clipboard:
+            # Move back past the closing ) to select "URL" so user can type over it
+            end = cur.position()
+            cur.setPosition(end - len(url) - 1)
+            cur.setPosition(end - 1, cur.MoveMode.KeepAnchor)
+        self.editor.setTextCursor(cur)
+
+    def _fmt_lines(self, prefix_fn):
+        """Apply prefix_fn(line_index, line_text) → new_line to each selected line."""
+        cur = self.editor.textCursor()
+        # Expand selection to whole lines
+        start = cur.selectionStart()
+        end   = cur.selectionEnd()
+        cur.setPosition(start)
+        cur.movePosition(cur.MoveOperation.StartOfBlock)
+        block_start = cur.position()
+        cur.setPosition(end)
+        cur.movePosition(cur.MoveOperation.EndOfBlock)
+        block_end = cur.position()
+        cur.setPosition(block_start)
+        cur.setPosition(block_end, cur.MoveMode.KeepAnchor)
+        selected = cur.selectedText()
+        # QTextEdit uses \u2029 (paragraph separator) for line breaks in selectedText
+        lines = selected.split("\u2029")
+        new_lines = [prefix_fn(i, ln) for i, ln in enumerate(lines)]
+        cur.insertText("\n".join(new_lines))
+        self.editor.setTextCursor(cur)
+
+    def _fmt_bullet(self):
+        self._fmt_lines(lambda i, ln: "- " + ln)
+
+    def _fmt_numlist(self):
+        self._fmt_lines(lambda i, ln: f"{i+1}. " + ln)
+
+    def _fmt_tasklist(self):
+        self._fmt_lines(lambda i, ln: "- [ ] " + ln)
+
+    # ── Clipboard monitor (delegated to WhisperRApp for persistence) ────────
+
+    def _start_clipboard_monitor(self):
+        """Delegate to the host app so the monitor survives hide/close."""
+        app = QApplication.instance()
+        host = next((w for w in app.topLevelWidgets()
+                     if w.__class__.__name__ == "WhisperRApp"), None)
+        if host:
+            host.start_clipboard_monitor()
+
+    def _stop_clipboard_monitor(self):
+        """Delegate stop to the host app."""
+        app = QApplication.instance()
+        host = next((w for w in app.topLevelWidgets()
+                     if w.__class__.__name__ == "WhisperRApp"), None)
+        if host:
+            host.stop_clipboard_monitor()
+
     def _apply_formatting_hotkeys(self):
         """Register QShortcut hotkeys active only while this window is open."""
         cfg = self.config if isinstance(self.config, dict) else getattr(self.config, 'settings', {})
 
         shortcuts = [
-            (cfg.get("editor_hk_bold",    "Ctrl+B"),            self._fmt_bold),
-            (cfg.get("editor_hk_italic",   "Ctrl+I"),           self._fmt_italic),
-            (cfg.get("editor_hk_strike",   "Ctrl+Shift+S"),     self._fmt_strike),
-            (cfg.get("editor_hk_code",     "Ctrl+`"),           self._fmt_code),
-            (cfg.get("editor_hk_h1",       "Ctrl+1"),           lambda: self._fmt_heading(1)),
-            (cfg.get("editor_hk_h2",       "Ctrl+2"),           lambda: self._fmt_heading(2)),
-            (cfg.get("editor_hk_h3",       "Ctrl+3"),           lambda: self._fmt_heading(3)),
-            (cfg.get("editor_hk_emdash",   "Ctrl+Shift+Minus"), self._fmt_emdash),
+            (cfg.get("editor_hk_bold",      "Ctrl+B"),          self._fmt_bold),
+            (cfg.get("editor_hk_italic",    "Ctrl+I"),          self._fmt_italic),
+            (cfg.get("editor_hk_strike",    "Ctrl+Shift+S"),    self._fmt_strike),
+            (cfg.get("editor_hk_highlight", "Ctrl+Shift+H"),    self._fmt_highlight),
+            (cfg.get("editor_hk_code",      "Ctrl+`"),          self._fmt_code),
+            (cfg.get("editor_hk_h1",        "Ctrl+1"),          lambda: self._fmt_heading(1)),
+            (cfg.get("editor_hk_h2",        "Ctrl+2"),          lambda: self._fmt_heading(2)),
+            (cfg.get("editor_hk_h3",        "Ctrl+3"),          lambda: self._fmt_heading(3)),
+            (cfg.get("editor_hk_emdash",    "Ctrl+Shift+Minus"),self._fmt_emdash),
+            (cfg.get("editor_hk_bullet",    "Ctrl+Shift+B"),    self._fmt_bullet),
+            (cfg.get("editor_hk_numlist",   "Ctrl+Shift+N"),    self._fmt_numlist),
+            (cfg.get("editor_hk_tasklist",  "Ctrl+Shift+T"),    self._fmt_tasklist),
+            (cfg.get("editor_hk_link",      "Ctrl+K"),          self._fmt_link),
+            ("Ctrl+Shift+K",                                     lambda: self._fmt_link(use_clipboard=True)),
         ]
         for keys, slot in shortcuts:
             try:
@@ -2463,6 +2731,7 @@ class WhisperEditor(QWidget):
         idx = (instance - 1) if (1 <= instance <= len(hits)) else len(hits) - 1
         m = hits[idx]
         if op == "replace":
+            new_text = _smart_case_punct(m.group(), new_text)
             new_buf = buf[:m.start()] + new_text + buf[m.end():]
         elif op == "insertbefore":
             new_buf = buf[:m.start()] + new_text + " " + buf[m.start():]
@@ -2525,9 +2794,59 @@ class WhisperEditor(QWidget):
                     pass
                 break
 
+    # ── Event filter (hotkey suppression on child QTextEdit) ─────────────────
+
+    def eventFilter(self, obj, event):
+        """Suppress keystrokes that match the app's global hotkeys so they
+        don't land inside the QTextEdit while the editor window is focused."""
+        if obj is self.editor and event.type() == QEvent.Type.KeyPress:
+            app = QApplication.instance()
+            main = next((w for w in app.topLevelWidgets()
+                         if w.__class__.__name__ == "WhisperRApp"), None)
+            if main is not None:
+                cfg = getattr(main, "config", None)
+                if cfg:
+                    _hotkeys = [
+                        cfg.settings.get("hotkey", ""),
+                        cfg.settings.get("ptt_key", ""),
+                        cfg.settings.get("visibility_hotkey", ""),
+                        cfg.settings.get("editor_hotkey", ""),
+                        cfg.settings.get("rollback_hotkey", ""),
+                    ]
+                    mods = event.modifiers()
+                    key  = event.key()
+                    _MOD = Qt.KeyboardModifier
+                    _mod_map = {
+                        "ctrl":  _MOD.ControlModifier,
+                        "alt":   _MOD.AltModifier,
+                        "shift": _MOD.ShiftModifier,
+                        "win":   _MOD.MetaModifier,
+                        "meta":  _MOD.MetaModifier,
+                    }
+                    _key_map = {c: getattr(Qt.Key, f"Key_{c.upper()}", None)
+                                for c in "abcdefghijklmnopqrstuvwxyz0123456789"}
+                    _key_map.update({"f"+str(i): getattr(Qt.Key, f"Key_F{i}", None)
+                                     for i in range(1, 13)})
+                    for hk_str in _hotkeys:
+                        if not hk_str:
+                            continue
+                        parts = [p.strip().lower() for p in hk_str.split("+")]
+                        exp_mods = _MOD.NoModifier
+                        exp_key  = None
+                        for part in parts:
+                            if part in _mod_map:
+                                exp_mods |= _mod_map[part]
+                            elif part in _key_map and _key_map[part]:
+                                exp_key = _key_map[part]
+                        if exp_key and mods == exp_mods and key == exp_key:
+                            return True  # suppress — event eaten, not passed to QTextEdit
+        return super().eventFilter(obj, event)
+
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        # NOTE: clipboard monitor is NOT stopped here — it lives on the host
+        # app and persists across hide/close. Only turning off the toggle stops it.
         for sc in self._hotkeys_active:
             sc.setEnabled(False)
         self._hotkeys_active.clear()
@@ -2709,6 +3028,80 @@ class WizardOverlay(QDialog):
         else:
             super().keyPressEvent(e)
 
+
+def _score_trigger_match(spoken_text: str, trigger_phrase: str) -> float:
+    """Multi-strategy similarity score between spoken_text and trigger_phrase.
+
+    Returns a float in [0, 1].  Uses four complementary strategies:
+
+    1. Word-level: compare first N spoken words against trigger words.
+    2. Char-concat: join all chars, compare as single strings (catches
+       phonetic approximations that break word boundaries).
+    3. Sliding window: slide a window = len(trigger_chars) over spoken_chars,
+       take best ratio (robust to extra words before/after trigger).
+    4. Subsequence: check if the trigger chars appear as a subsequence in
+       the spoken chars (catches scattered phonetic fragments).
+
+    The final score is the maximum of all four.
+    """
+    from difflib import SequenceMatcher as _SM
+    import re as _re_t
+
+    def _clean(s):
+        return _re_t.sub(r"[^a-z]", "", s.lower())
+
+    s_words = [w for w in _re_t.sub(r"[^\w ]", "", spoken_text.lower()).split() if w]
+    t_words = trigger_phrase.lower().split()
+    n = len(t_words)
+
+    best = 0.0
+
+    # 1. Word-level window (existing approach)
+    if s_words and len(s_words) >= n:
+        for i in range(len(s_words) - n + 1):
+            window = " ".join(s_words[i:i + n])
+            r = _SM(None, trigger_phrase.lower(), window).ratio()
+            if r > best:
+                best = r
+
+    # 2. Full char-concat comparison
+    s_cat = _clean(spoken_text)
+    t_cat = _clean(trigger_phrase)
+    if s_cat and t_cat:
+        r2 = _SM(None, t_cat, s_cat).ratio()
+        if r2 > best:
+            best = r2
+
+    # 3. Sliding char window — slide len(t_cat) chars across s_cat
+    tl = len(t_cat)
+    if tl and len(s_cat) >= tl:
+        for i in range(len(s_cat) - tl + 1):
+            r3 = _SM(None, t_cat, s_cat[i:i + tl]).ratio()
+            if r3 > best:
+                best = r3
+    elif tl and len(s_cat) < tl:
+        # Spoken shorter than trigger — compare what we have
+        r3 = _SM(None, t_cat[:len(s_cat)], s_cat).ratio() * (len(s_cat) / tl)
+        if r3 > best:
+            best = r3
+
+    # 4. Subsequence bonus — if all trigger chars appear in order in spoken
+    if t_cat:
+        si = 0
+        matched = 0
+        for ch in s_cat:
+            if si < len(t_cat) and ch == t_cat[si]:
+                si += 1
+                matched += 1
+        subseq_ratio = matched / len(t_cat)
+        # Only count as a bonus if it's a strong subsequence (>80% matched)
+        if subseq_ratio > 0.8:
+            r4 = subseq_ratio * 0.85  # discount to avoid false positives
+            if r4 > best:
+                best = r4
+
+    return best
+
 class WhisperRApp(QMainWindow):
     sig_toggle_vis    = pyqtSignal()
     sig_toggle_rec    = pyqtSignal()
@@ -2838,7 +3231,11 @@ class WhisperRApp(QMainWindow):
             self._editor: WhisperEditor | None = None  # built-in text editor window
             self._editor_remember: bool = False      # persist editor content across open/close
             self._editor_saved_content: str = ""     # content preserved when remember is on
+            self._editor_clipboard_prefill: bool = False  # prefill with clipboard on open
             self._editor_return_hwnd = None           # window to restore focus to after paste
+            self._cb_monitor_timer: QTimer | None = None  # app-level clipboard monitor
+            self._cb_monitor_last: str = ""               # last seen clipboard content
+            self._editor_cb_monitor_was_on: bool = False  # persists monitor toggle state
             # ── Wizard state ──────────────────────────────────────────
             # When a multi-step voice command is active, _wizard holds:
             #   op       : str   — "select"|"move"|"movebefore"|"moveafter"|
@@ -4277,6 +4674,8 @@ class WhisperRApp(QMainWindow):
             app_logger.info("Dictation stopped")
         else:
             app_logger.info("toggle_rec: Starting dictation")
+            # _pre_rec_hwnd was already captured in on_toggle_hotkey (keyboard thread)
+            # while the external app still had focus — don't overwrite it here.
             # Rollback handshake:
             # rollback_transcription() sets _rollback_armed (survives this block).
             # We consume it here and set _rollback_pending for this session only.
@@ -4591,6 +4990,67 @@ class WhisperRApp(QMainWindow):
         ("insertafter", "text"):        ("Whisper Insert After",  "Now say the text to insert."),
     }
 
+    # ── App-level clipboard monitor ──────────────────────────────────────────
+    # Lives on WhisperRApp so it persists when the editor is hidden or closed.
+    # The editor's toggle buttons start/stop it via delegation.
+
+    def start_clipboard_monitor(self):
+        """Start (or restart) the app-level clipboard polling timer."""
+        if self._cb_monitor_timer and self._cb_monitor_timer.isActive():
+            return  # already running
+        try:
+            import pyperclip as _pcp
+            self._cb_monitor_last = _pcp.paste()
+        except Exception:
+            self._cb_monitor_last = ""
+        self._cb_monitor_timer = QTimer(self)
+        self._cb_monitor_timer.setInterval(500)
+        self._cb_monitor_timer.timeout.connect(self._cb_monitor_poll)
+        self._cb_monitor_timer.start()
+        app_logger.info("Clipboard monitor started")
+
+    def stop_clipboard_monitor(self):
+        """Stop the clipboard polling timer."""
+        if self._cb_monitor_timer:
+            self._cb_monitor_timer.stop()
+            self._cb_monitor_timer = None
+        app_logger.info("Clipboard monitor stopped")
+
+    def _cb_monitor_poll(self):
+        """Poll clipboard; if changed, append new content to the editor.
+
+        The editor window's VISIBILITY IS NOT CHANGED — if it's hidden it stays
+        hidden, if visible it stays visible.  Text is always appended.
+        """
+        try:
+            import pyperclip as _pcp
+            current = _pcp.paste()
+        except Exception:
+            return
+        if current == self._cb_monitor_last:
+            return
+        self._cb_monitor_last = current
+        if not current.strip():
+            return
+
+        # Ensure editor exists (create silently if it was destroyed)
+        if not self._editor:
+            self._editor = WhisperEditor(config=self.config, parent=None)
+            self._editor.paste_requested.connect(self._editor_paste_to_app)
+            self._editor.finished.connect(self._on_editor_closed)
+            # Restore the monitor toggle state so the user can still turn it off
+            self._editor.clipboard_monitor_toggle.setChecked(True)
+            # Don't show — visibility is unchanged from before
+
+        cur = self._editor.editor.textCursor()
+        cur.movePosition(cur.MoveOperation.End)
+        existing = self._editor.editor.toPlainText()
+        sep = "\n\n" if existing.strip() else ""
+        cur.insertText(sep + current)
+        self._editor.editor.setTextCursor(cur)
+        if self._editor.isVisible():
+            self._editor.editor.ensureCursorVisible()
+
     def _open_editor(self, prefill: str = "", from_clipboard: bool = False):
         """Open the WhisperEditor window.
 
@@ -4610,12 +5070,20 @@ class WhisperRApp(QMainWindow):
 
         if from_clipboard:
             try:
-                import pyautogui as _pag_ed
+                import ctypes as _ct_ed, pyautogui as _pag_ed
+                import pyperclip as _pc_ed, time as _te_ed
+                # Capture hwnd BEFORE hotkey so we know where to return
+                self._editor_return_hwnd = _ct_ed.windll.user32.GetForegroundWindow()
+                # Simple Ctrl+C — source window still has focus at this point
                 _pag_ed.hotkey("ctrl", "c")
-                _te_ed.sleep(0.25)
+                _te_ed.sleep(0.25)   # give clipboard time to update
                 new_text = _pc_ed.paste()
             except Exception:
-                new_text = ""
+                try:
+                    import pyperclip as _pc_ed_fb
+                    new_text = _pc_ed_fb.paste()
+                except Exception:
+                    new_text = ""
             # If remember is on, append below existing content
             if self._editor_remember and self._editor_saved_content:
                 prefill = self._editor_saved_content.rstrip() + "\n\n" + new_text
@@ -4632,13 +5100,27 @@ class WhisperRApp(QMainWindow):
             self._editor.activateWindow()
             return
 
+        # Clipboard prefill: always load CURRENT clipboard on open (not saved).
+        # The toggle state persists; the content is always fresh each open.
+        if not from_clipboard and getattr(self, "_editor_clipboard_prefill", False):
+            try:
+                import pyperclip as _pc_pf
+                prefill = _pc_pf.paste()  # always current, always replaces
+            except Exception:
+                pass
+
         self._editor = WhisperEditor(
             initial_text=prefill,
             config=self.config,
             parent=None)
-        # Restore remember toggle if it was on
+        # Restore toggle states
         if self._editor_remember:
             self._editor.remember_toggle.setChecked(True)
+        elif getattr(self, "_editor_clipboard_prefill", False):
+            self._editor.clipboard_prefill_toggle.setChecked(True)
+        # Restore monitor toggle if it was on (monitor itself already running on app)
+        if getattr(self, "_editor_cb_monitor_was_on", False):
+            self._editor.clipboard_monitor_toggle.setChecked(True)
         self._editor.paste_requested.connect(self._editor_paste_to_app)
         # Save content when editor is closed/hidden
         self._editor.finished.connect(self._on_editor_closed)
@@ -4648,8 +5130,20 @@ class WhisperRApp(QMainWindow):
         self.scratchpad.append("[Editor] Opened — dictation now goes into the editor.")
 
     def _on_editor_closed(self):
-        """Save content when editor window is closed if remember is enabled."""
-        if self._editor and getattr(self._editor, "remember_toggle", None) and \
+        """Save content/state when editor window is closed."""
+        if not self._editor:
+            return
+        # NOTE: clipboard monitor is NOT stopped on close — it persists on the app.
+        # We save the monitor toggle state so it can be restored on next open.
+        self._editor_cb_monitor_was_on = (
+            getattr(self._editor, "clipboard_monitor_toggle", None) and
+            self._editor.clipboard_monitor_toggle.isChecked())
+        # Persist clipboard prefill toggle state
+        self._editor_clipboard_prefill = (
+            getattr(self._editor, "clipboard_prefill_toggle", None) and
+            self._editor.clipboard_prefill_toggle.isChecked())
+        # Persist remember state and content
+        if getattr(self._editor, "remember_toggle", None) and \
                 self._editor.remember_toggle.isChecked():
             self._editor_saved_content = self._editor.editor.toPlainText()
             self._editor_remember = True
@@ -4711,7 +5205,10 @@ class WhisperRApp(QMainWindow):
         self._wizard_overlay.cancelled.connect(self._wizard_cancel)
         self._wizard_overlay.show()
         self._wizard_overlay.raise_()
-        self._wizard_overlay.activateWindow()
+        # Only steal focus when editor is NOT open — when editor is open,
+        # stealing and then returning focus triggers spurious close events.
+        if not (self._editor and self._editor.isVisible()):
+            self._wizard_overlay.activateWindow()
         self.scratchpad.append(f"[Wizard] {op} — step: {first_step}")
         app_logger.info(f"Wizard started: op={op!r}, prev_hwnd={getattr(self, '_wizard_prev_hwnd', None)}")
 
@@ -5401,8 +5898,6 @@ class WhisperRApp(QMainWindow):
             # "move" just because it appears first in the list and scores > 0.75.
             # Instead: require first spoken word ≈ "whisper", then find the
             # HIGHEST-scoring distinctive keyword match across all triggers.
-            import re as _re_trig
-            from difflib import SequenceMatcher as _SM_trig
             _trig_defs = [
                 ("select",       _cfg.get("select_trigger",       "whisper select").lower()),
                 ("move",         _cfg.get("move_trigger",         "whisper move").lower()),
@@ -5412,38 +5907,39 @@ class WhisperRApp(QMainWindow):
                 ("insertbefore", _cfg.get("insertbefore_trigger", "whisper insert before").lower()),
                 ("insertafter",  _cfg.get("insertafter_trigger",  "whisper insert after").lower()),
             ]
-            # Strip punctuation from each spoken word, require first word ≈ "whisper"
-            _sw_raw = [_re_trig.sub(r"[^\w]", "", w)
-                       for w in text.lower().split()]
-            _sw_raw = [w for w in _sw_raw if w]
+            # Multi-strategy trigger detection.
+            # Uses _score_trigger_match which combines word-level, char-concat,
+            # sliding-window, and subsequence scoring — robust to the phonetic
+            # approximations that arise with non-native accents.
+            # Trigger threshold is lower than the general fuzzy threshold
+            # (triggers are known short phrases; we should be aggressive).
+            _trig_threshold = max(0.45, _fuzz_thr - 0.2)
             _trig_fired = False
-            if _sw_raw and _SM_trig(None, _sw_raw[0], "whisper").ratio() >= 0.75:
-                _sw_key = _sw_raw[1:]  # distinctive words after "whisper"
-                _best_score = 0.0
-                _best_op = None
-                for _trig_op, _full_kw in _trig_defs:
-                    if not _full_kw:
-                        continue
-                    # Key = everything after "whisper " in the trigger phrase
-                    _key = " ".join(_full_kw.split()[1:])  # e.g. "replace", "insert before"
-                    _kw  = _key.split()
-                    _n   = len(_kw)
-                    if _sw_key and len(_sw_key) >= _n:
-                        _cand = " ".join(_sw_key[:_n])
-                        _r = _SM_trig(None, _key, _cand).ratio()
-                        if _r > _best_score:
-                            _best_score = _r; _best_op = _trig_op
-                    # Also try joined forms (run-together speech)
-                    if _sw_key:
-                        _joined_s = "".join(_sw_key[:max(_n, len(_sw_key))])
-                        _joined_t = "".join(_kw)
-                        _r2 = _SM_trig(None, _joined_t,
-                                       _joined_s[:len(_joined_t)+2]).ratio()
-                        if _r2 > _best_score:
-                            _best_score = _r2; _best_op = _trig_op
-                if _best_op and _best_score >= _fuzz_thr:
+            _best_score = 0.0
+            _best_op    = None
+            for _trig_op, _full_kw in _trig_defs:
+                if not _full_kw:
+                    continue
+                # Score against the full trigger phrase (e.g. "whisper replace")
+                _s = _score_trigger_match(text, _full_kw)
+                if _s > _best_score:
+                    _best_score = _s; _best_op = _trig_op
+                # Also score against user-defined aliases (comma-separated)
+                for _alias in _phrase_aliases(_full_kw):
+                    _sa = _score_trigger_match(text, _alias)
+                    if _sa > _best_score:
+                        _best_score = _sa; _best_op = _trig_op
+            if _best_op and _best_score >= _trig_threshold:
+                # Sanity: must score better than the runner-up by at least 0.05
+                # to avoid "whisper move" firing when "whisper replace" scored 0.01 higher
+                _runner_up = max(
+                    (_score_trigger_match(text, kw) for op2, kw in _trig_defs
+                     if op2 != _best_op and kw),
+                    default=0.0)
+                if _best_score - _runner_up >= 0.04:
                     app_logger.info(
-                        f"Wizard trigger: op={_best_op!r} score={_best_score:.3f}")
+                        f"Wizard trigger: op={_best_op!r} score={_best_score:.3f} "
+                        f"runner_up={_runner_up:.3f}")
                     self.scratchpad.append(
                         f"[Wizard] Detected: {_best_op} (score {_best_score:.2f})")
                     self._wizard_start(_best_op)
@@ -5567,6 +6063,12 @@ class WhisperRApp(QMainWindow):
                 paste_delay = self.config.settings["paste_delay"]
                 app_logger.debug(f"  on_text: auto_space={auto_space}, paste_delay={paste_delay}s, p_text length={len(p_text)}")
                 try:
+                    # Capture the target window right before paste for sendkeys restore
+                    try:
+                        import ctypes as _ct_bp
+                        self._last_paste_hwnd = _ct_bp.windll.user32.GetForegroundWindow()
+                    except Exception:
+                        self._last_paste_hwnd = None
                     pyperclip.copy(p_text)
                     time.sleep(paste_delay)
                     pyautogui.hotkey('ctrl', 'v')
@@ -5574,6 +6076,23 @@ class WhisperRApp(QMainWindow):
                     # Fire any term sendkeys sequences now that the text is pasted
                     if _key_tag_sequences:
                         time.sleep(max(paste_delay, 0.1))
+                        # Restore focus to the window that received the paste,
+                        # otherwise keystrokes land in WhisperR itself.
+                        try:
+                            import ctypes as _ct_sk
+                            _u32_sk = _ct_sk.windll.user32
+                            _hwnd_sk = getattr(self, "_last_paste_hwnd", None)
+                            if _hwnd_sk:
+                                _fg_sk  = _u32_sk.GetForegroundWindow()
+                                _tFG_sk = _u32_sk.GetWindowThreadProcessId(_fg_sk, None)
+                                _tTG_sk = _u32_sk.GetWindowThreadProcessId(_hwnd_sk, None)
+                                _u32_sk.AttachThreadInput(_tFG_sk, _tTG_sk, True)
+                                _u32_sk.SetForegroundWindow(_hwnd_sk)
+                                _u32_sk.BringWindowToTop(_hwnd_sk)
+                                _u32_sk.AttachThreadInput(_tFG_sk, _tTG_sk, False)
+                                time.sleep(0.1)
+                        except Exception:
+                            pass
                         for _seq in _key_tag_sequences:
                             _send_keys_sequence(_seq, paste_delay=paste_delay)
                             app_logger.info(f"Term sendkeys: {_seq}")
@@ -5665,8 +6184,19 @@ class WhisperRApp(QMainWindow):
         app_logger.debug("✓ setup_logic: Complete")
     
     def on_toggle_hotkey(self):
-        """Handler for toggle dictation hotkey - prevents subset conflicts"""
+        """Handler for toggle dictation hotkey - prevents subset conflicts.
+        Captures foreground hwnd HERE (keyboard-thread) before Qt shifts focus.
+        """
         app_logger.debug("Toggle dictation hotkey triggered (exact match)")
+        try:
+            import ctypes as _ct_hk
+            _hwnd = _ct_hk.windll.user32.GetForegroundWindow()
+            # Only store if it looks like an external window (not WhisperR itself)
+            _own = int(self.winId()) if hasattr(self, "winId") else 0
+            if _hwnd and _hwnd != _own:
+                self._pre_rec_hwnd = _hwnd
+        except Exception:
+            pass
         self.sig_toggle_rec.emit()
     
     def on_visibility_hotkey(self):
@@ -5695,6 +6225,10 @@ class WhisperRApp(QMainWindow):
             else:
                 self._editor_remember = False
                 self._editor_saved_content = ""
+            # Save monitor toggle state — monitor keeps running after hide
+            self._editor_cb_monitor_was_on = (
+                getattr(self._editor, "clipboard_monitor_toggle", None) and
+                self._editor.clipboard_monitor_toggle.isChecked())
             self._editor.hide()
         else:
             # Restore or open fresh
