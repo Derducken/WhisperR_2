@@ -575,22 +575,6 @@ def _ai_worker_process(task_q, result_q, log_q):
             else:
                 audio_np = np.frombuffer(audio_data, dtype=np.float32)
 
-            # _conf_ok maps min_confidence (0-1 UI slider) to avg_logprob threshold.
-            # avg_logprob is negative: 0.0 = perfect, -1.0 = poor.
-            # We scale the UI value so that:
-            #   0.0 → threshold = -inf (keep everything)
-            #   0.5 → threshold = -0.5  (reasonable default)
-            #   0.9 → threshold = -0.1  (strict but achievable)
-            #   1.0 → threshold =  0.0  (only perfect segments)
-            # Formula: threshold = -(1.0 - min_confidence)
-            _logprob_threshold = -(1.0 - min_confidence) if min_confidence > 0.0 else float('-inf')
-
-            def _conf_ok(s):
-                ok = s.avg_logprob >= _logprob_threshold
-                if not ok:
-                    _log(f"  segment filtered (logprob={s.avg_logprob:.3f} < {_logprob_threshold:.3f}): {s.text!r}")
-                return ok
-
             segments, _ = model.transcribe(
                 audio_np,
                 language=lang_code if lang_code != 'auto' else None,
@@ -598,11 +582,15 @@ def _ai_worker_process(task_q, result_q, log_q):
                 vad_filter=use_vad,
                 initial_prompt=prompt or None,
             )
-            seg_list = list(segments)  # materialise — generator exhausts on iteration
+            seg_list = list(segments)
+            # Emit each segment with its logprob so the main process can filter.
+            # Filtering here would block nav/command triggers from being detected.
             if seg_list:
-                _log(f"  segments={len(seg_list)}, logprobs={[round(s.avg_logprob,3) for s in seg_list]}, threshold={_logprob_threshold:.3f}")
-            text = ' '.join(s.text.strip() for s in seg_list if _conf_ok(s)).strip()
-            result_q.put(('text', text, src))
+                _log(f"  segs={len(seg_list)}, "
+                     f"logprobs={[round(s.avg_logprob,3) for s in seg_list]}")
+            # Send as a list of (text, logprob) pairs so the receiver can filter
+            seg_data = [(s.text.strip(), round(s.avg_logprob, 4)) for s in seg_list]
+            result_q.put(('text', seg_data, src))
         except Exception as e:
             _log(f"Transcription error: {e}\n{traceback.format_exc()}")
         result_q.put(('status', False))
@@ -725,7 +713,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QComboBox, QLabel, QFileDialog, QTabWidget, QCheckBox, 
     QDoubleSpinBox, QProgressBar, QFormLayout, QLineEdit, QGroupBox, QSpinBox, 
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QDialog, QMessageBox,
-    QSystemTrayIcon, QMenu, QSlider, QListWidget, QAbstractItemView, QSplitter
+    QSystemTrayIcon, QMenu, QSlider, QListWidget, QListWidgetItem, QAbstractItemView, QSplitter
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QPoint, QObject, QEvent
 from PyQt6.QtGui import QPainter, QColor, QFont, QIcon, QAction, QKeyEvent, QPixmap, QPen
@@ -733,7 +721,17 @@ from PyQt6.QtGui import QPainter, QColor, QFont, QIcon, QAction, QKeyEvent, QPix
 # --- 3. CONSTANTS ---
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 LANG_MAP = {"Auto": None, "English": "en", "Greek": "el", "German": "de", "French": "fr", "Spanish": "es"}
-HALLUCINATIONS = ["thank you.", "thanks for watching.", "god bless.", "god bless you.", "subtitles by", "Thank you for watching, and I'll see you in the next video"]
+# Known Whisper hallucination patterns — matched as SUBSTRINGS (case-insensitive).
+# A transcription is dropped if its entire text (stripped) is one of these,
+# OR if it STARTS WITH one of these hallucination prefixes.
+HALLUCINATIONS = [
+    "thank you.", "thanks for watching.", "god bless.", "god bless you.",
+    "subtitles by", "amara.org", "translated by", "transcribed by",
+    "please subscribe", "don't forget to subscribe", "like and subscribe",
+    "thanks for watching, and i'll see you",
+    "thank you for watching",
+    "this video was",
+]
 
 DARK_STYLE = """
 QMainWindow, QDialog, QScrollArea, QTabWidget { background-color: #121212; }
@@ -846,6 +844,14 @@ class AppConfig:
             "noise_floor": 50, "speech_vol": 211,
             "commands": {"Launch Notepad": "notepad.exe"},
             "terms": {"hexagon software": "Hexagon Software"},
+            "hallucinations": [
+                "thank you.", "thanks for watching.", "god bless.", "god bless you.",
+                "subtitles by", "amara.org", "translated by", "transcribed by",
+                "please subscribe", "don't forget to subscribe", "like and subscribe",
+                "thanks for watching, and i'll see you",
+                "thank you for watching",
+                "this video was"
+            ],
             "ind_show": True, "ind_type": "Both", "ind_pos": "Top-Left",
             "ind_size": 32, "ind_off": 5, "bar_edge": "Top", "bar_size": 5,
             "bar_thickness": 3, "ind_opacity": 220, "bar_opacity": 220,
@@ -855,12 +861,15 @@ class AppConfig:
             "ft_mon_folder": str(Path.home() / "WhisperR_Watch"),
             "ft_mon_enabled": False,
             "use_confidence": True, "min_confidence": 0.9,
-            "sendkeys_trigger":   "sendkeys",
-            "select_trigger":     "whisperselect",
-            "move_trigger":       "whispermove",
-            "movebefore_trigger": "whisperbefore",
-            "moveafter_trigger":  "whisperafter",
-            "fuzzy_threshold":    0.75
+            "sendkeys_trigger":   "whisper send keys",
+            "select_trigger":     "whisper select",
+            "move_trigger":       "whisper move",
+            "movebefore_trigger": "whisper before",
+            "moveafter_trigger":      "whisper after",
+            "replace_trigger":        "whisper replace",
+            "insertbefore_trigger":   "whisper insert before",
+            "insertafter_trigger":    "whisper insert after",
+            "fuzzy_threshold":        0.75
         }
         self._first_run = not os.path.exists(self.path)
         self.load()
@@ -1107,7 +1116,12 @@ class TranscriberWorker(QThread):
         self._pending     = queue.Queue()
         self._cuda_failed  = False
         self._crash_count  = 0
+        self._last_seg_data = []  # [(text, logprob)] from last transcription
         app_logger.info("Transcriber worker initialized")
+
+    def _cfg_min_confidence(self):
+        """Return the live min_confidence value from config settings."""
+        return float(self.config.settings.get("min_confidence", 0.0))
 
     # ── public API ────────────────────────────────────────────────
 
@@ -1300,13 +1314,27 @@ class TranscriberWorker(QThread):
                         self._crash_count = 0  # successful completion → reset circuit breaker
                         break  # Final status=False means task complete
                 elif msg[0] == 'text':
-                    _, text, src = msg
-                    HALLUCINATIONS_LOCAL = set(h.lower() for h in HALLUCINATIONS) if 'HALLUCINATIONS' in dir() else set()
-                    if text and text.lower() not in HALLUCINATIONS_LOCAL:
-                        app_logger.info(f"Transcription: '{text[:50]}...'")
-                        self.finished_text.emit(text, src)
-                    else:
-                        app_logger.debug("No valid speech / hallucination filtered")
+                    _, seg_data, src = msg
+                    # seg_data is list of (text, logprob) pairs from worker.
+                    # Emit full text to on_text — confidence filtering happens
+                    # there, AFTER wizard/command/trigger checks, so triggers
+                    # are never silently dropped by the confidence gate.
+                    # Hallucination check only — these are never valid speech.
+                    text = ' '.join(st for st, _ in seg_data).strip()
+                    if not text:
+                        continue
+                    _tl = text.lower().strip()
+                    _hall_list = self.config.settings.get("hallucinations", HALLUCINATIONS)
+                    _hall = any(_tl == h.lower() or _tl.startswith(h.lower())
+                                for h in _hall_list)
+                    if _hall:
+                        app_logger.debug(f"  hallucination filtered: {text!r}")
+                        continue
+                    # Stash seg_data so on_text can apply per-segment confidence
+                    # filtering on the paste path only (triggers see full text).
+                    self._last_seg_data = seg_data
+                    app_logger.info(f"Transcription: '{text[:50]}...'")
+                    self.finished_text.emit(text, src)
                 elif msg[0] == 'warn':
                     # Non-fatal worker warning (e.g. VAD unavailable) — show in log panel
                     app_logger.warning(f"Worker warning: {msg[1]}")
@@ -1908,9 +1936,22 @@ def _send_keys_sequence(text, paste_delay=0.0):
         _send_keys_sequence("<CTRL+A><DEL>new content")
         _send_keys_sequence("<WINKEY+R>notepad<ENTER>")
     """
-    import re as _re
     import pyautogui as _pag
     _pag.FAILSAFE = False
+
+    # Normalise tag formats before tokenising:
+    #   <CTRL>Z       → <CTRL+Z>
+    #   <CTRL>+Z      → <CTRL+Z>
+    #   <CTRL><Z>     → <CTRL+Z>   (two consecutive tags)
+    # Strategy: collapse sequences of <TAG> tokens that are immediately
+    # adjacent (no text between them) into a single <TAG+TAG> form.
+    import re as _re
+    # Step 1: <CTRL>+Z → <CTRL+Z>  (tag immediately followed by +key)
+    text = _re.sub(r'<([^>]+)>\+([A-Za-z0-9]+)', r'<\1+\2>', text)
+    # Step 2: <CTRL>Z → <CTRL+Z>   (tag immediately followed by bare key chars)
+    text = _re.sub(r'<([^>]+)>([A-Za-z0-9]+)', r'<\1+\2>', text)
+    # Step 3: <CTRL><Z> → <CTRL+Z> (two adjacent tags, no text between)
+    text = _re.sub(r'<([^>]+)><([^>]+)>', r'<\1+\2>', text)
 
     # Tokenise: split on <...> tags preserving the tags
     tokens = _re.split(r'(<[^>]+>)', text)
@@ -2006,6 +2047,119 @@ def _fuzzy_trigger_match(spoken_text, trigger, threshold=0.75):
         return True, remainder
 
     return False, spoken_text
+
+
+# ── Voice-guided wizard overlay ───────────────────────────────────────────────
+# A small always-on-top frameless window that prompts the user to speak a
+# specific piece of information (e.g. "what to select", "replacement text").
+# It shows live transcription feedback and closes automatically when the
+# wizard step is satisfied.
+
+class WizardOverlay(QDialog):
+    """Non-blocking, always-on-top prompt window for multi-step voice commands.
+
+    The host (WhisperRApp) creates this, shows it, and passes each new
+    transcription result to feed() until the step is done.  The dialog never
+    blocks the event loop — it is purely informational/cosmetic.
+    """
+
+    cancelled = pyqtSignal()   # user pressed Escape / Cancel button
+
+    def __init__(self, title, prompt, parent=None):
+        super().__init__(parent,
+                         Qt.WindowType.Tool |
+                         Qt.WindowType.FramelessWindowHint |
+                         Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setModal(False)
+        self.setFixedWidth(420)
+
+        self._build_ui(title, prompt)
+        self._position_bottom_right()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self, title, prompt):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 10, 14, 10)
+        root.setSpacing(6)
+
+        # Title bar row
+        title_row = QHBoxLayout()
+        lbl_title = QLabel(title)
+        lbl_title.setStyleSheet(
+            "font-size: 11pt; font-weight: bold; color: #0078d7;")
+        title_row.addWidget(lbl_title)
+        title_row.addStretch()
+        btn_cancel = QPushButton("✕")
+        btn_cancel.setFixedSize(22, 22)
+        btn_cancel.setToolTip("Cancel (Escape)")
+        btn_cancel.setStyleSheet(
+            "QPushButton { background: #333; border: none; color: #aaa; "
+            "border-radius: 11px; font-size: 10pt; }"
+            "QPushButton:hover { background: #c0392b; color: #fff; }")
+        btn_cancel.clicked.connect(self._on_cancel)
+        title_row.addWidget(btn_cancel)
+        root.addLayout(title_row)
+
+        # Prompt label
+        self.lbl_prompt = QLabel(prompt)
+        self.lbl_prompt.setWordWrap(True)
+        self.lbl_prompt.setStyleSheet("color: #ddd; font-size: 10pt;")
+        root.addWidget(self.lbl_prompt)
+
+        # Live transcription feedback
+        self.lbl_heard = QLabel("🎙 Listening…")
+        self.lbl_heard.setWordWrap(True)
+        self.lbl_heard.setStyleSheet(
+            "color: #888; font-style: italic; font-size: 9pt; "
+            "border-top: 1px solid #333; padding-top: 4px;")
+        root.addWidget(self.lbl_heard)
+
+        self.setStyleSheet(
+            "WizardOverlay { background-color: #1a1a1a; "
+            "border: 1px solid #0078d7; border-radius: 8px; }")
+
+    def _position_bottom_right(self):
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.adjustSize()
+        x = screen.right()  - self.width()  - 24
+        y = screen.bottom() - self.height() - 48
+        self.move(x, y)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_prompt(self, prompt):
+        """Update the prompt text (used when advancing to the next step)."""
+        self.lbl_prompt.setText(prompt)
+        self.lbl_heard.setText("🎙 Listening…")
+        self.adjustSize()
+        self._position_bottom_right()
+
+    def feed(self, text):
+        """Show the latest transcription result as live feedback."""
+        short = text[:60] + ("…" if len(text) > 60 else "")
+        self.lbl_heard.setText(f"🎙 Heard: \"{short}\"")
+        self.adjustSize()
+        self._position_bottom_right()
+
+    def confirm(self, summary):
+        """Briefly show a confirmation before the caller closes the window."""
+        short = summary[:60] + ("…" if len(summary) > 60 else "")
+        self.lbl_heard.setText(f"✓ {short}")
+        self.adjustSize()
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _on_cancel(self):
+        self.cancelled.emit()
+        self.close()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self._on_cancel()
+        else:
+            super().keyPressEvent(e)
 
 class WhisperRApp(QMainWindow):
     sig_toggle_vis = pyqtSignal()
@@ -2127,7 +2281,19 @@ class WhisperRApp(QMainWindow):
             self._ptt_held: set   = set()  # tracks currently held keys for combo PTT
             self._last_paste_text: str = ""   # last pasted text (for rollback)
             self._session_buffer:  str = ""   # running concat of all pastes this session (for select/move)
+            self._cursor_offset:   int = 0    # chars cursor is LEFT of end of session buffer (0=at end)
             self._cursor_ops_pending: bool = False  # next transcription should be lowercased (select/move used)
+            self._pending_edit = None  # (op, target) set by whisperreplace/insert triggers
+            # ── Wizard state ──────────────────────────────────────────
+            # When a multi-step voice command is active, _wizard holds:
+            #   op       : str   — "select"|"move"|"movebefore"|"moveafter"|
+            #                      "replace"|"insertbefore"|"insertafter"
+            #   step     : str   — current step name (op-specific)
+            #   collected: dict  — data gathered so far
+            # While _wizard is not None, on_text routes transcriptions to
+            # _wizard_step() rather than the normal paste path.
+            self._wizard: dict | None = None
+            self._wizard_overlay: WizardOverlay | None = None
             self._rollback_pending: bool = False  # lowercase first result of next session
             self._rollback_armed:   bool = False  # set by rollback hotkey, consumed by toggle_rec
             self._ptt_starting: bool = False  # guard: recorder start in progress
@@ -2306,6 +2472,16 @@ class WhisperRApp(QMainWindow):
         # Keep self.scratchpad as alias → all existing .append() calls go to log_area
         self.scratchpad = self.log_area
 
+        # Auto-scroll both panes to bottom on any content change
+        from PyQt6.QtGui import QTextCursor as _QTC
+        def _autoscroll(widget):
+            widget.moveCursor(_QTC.MoveOperation.End)
+            widget.ensureCursorVisible()
+        self.results_area.textChanged.connect(
+            lambda: _autoscroll(self.results_area))
+        self.log_area.textChanged.connect(
+            lambda: _autoscroll(self.log_area))
+
         l1.addWidget(self._main_splitter)
         
         # ── Live volume meter (driven by AudioRecorder.volume_out) ────
@@ -2389,11 +2565,15 @@ class WhisperRApp(QMainWindow):
         bd.clicked.connect(self.delete_command_row)
         bi_cmd = QPushButton("Import .txt")
         bi_cmd.clicked.connect(self._import_commands)
+        ba_cmd = QPushButton("Append .txt")
+        ba_cmd.clicked.connect(self._append_commands)
+        ba_cmd.setToolTip("Append from file — skips duplicate phrases")
         be_cmd = QPushButton("Export .txt")
         be_cmd.clicked.connect(self._export_commands)
         btn_row.addWidget(ba)
         btn_row.addWidget(bd)
         btn_row.addWidget(bi_cmd)
+        btn_row.addWidget(ba_cmd)
         btn_row.addWidget(be_cmd)
         l2.addLayout(btn_row)
 
@@ -2424,16 +2604,64 @@ class WhisperRApp(QMainWindow):
         td.clicked.connect(self._delete_terms_row)
         ti = QPushButton("Import .txt")
         ti.clicked.connect(self._import_terms)
+        tap = QPushButton("Append .txt")
+        tap.clicked.connect(self._append_terms)
+        tap.setToolTip("Append from file — skips duplicate phrases")
         te = QPushButton("Export .txt")
         te.clicked.connect(self._export_terms)
         terms_btn_row.addWidget(ta)
         terms_btn_row.addWidget(td)
         terms_btn_row.addWidget(ti)
+        terms_btn_row.addWidget(tap)
         terms_btn_row.addWidget(te)
         l_terms.addLayout(terms_btn_row)
         self.tabs.addTab(t_terms, "Terms")
 
         self.tabs.addTab(t2, "Commands")
+
+        # ===== HALLUCINATIONS TAB =====
+        t_hall = QWidget()
+        l_hall = QVBoxLayout(t_hall)
+        lbl_hall = QLabel(
+            "Hallucination Blocklist — phrases Whisper generates when it hears\n"
+            "silence or background noise instead of real speech.\n"
+            "Each entry is matched as a case-insensitive substring of the\n"
+            "transcription. If the transcription starts with or equals any entry,\n"
+            "it is silently discarded rather than pasted."
+        )
+        lbl_hall.setWordWrap(True)
+        l_hall.addWidget(lbl_hall)
+
+        self.hall_list = QListWidget()
+        self.hall_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.hall_list.setAlternatingRowColors(True)
+        for phrase in self.config.settings.get("hallucinations", []):
+            self.hall_list.addItem(QListWidgetItem(phrase))
+        l_hall.addWidget(self.hall_list)
+
+        hall_btn_row = QHBoxLayout()
+        hall_add = QPushButton("Add Phrase")
+        hall_add.clicked.connect(self._hall_add)
+        hall_edit = QPushButton("Edit Selected")
+        hall_edit.clicked.connect(self._hall_edit)
+        hall_del = QPushButton("Delete Selected")
+        hall_del.clicked.connect(self._hall_delete)
+        hall_imp = QPushButton("Import .txt")
+        hall_imp.clicked.connect(self._hall_import)
+        hall_app = QPushButton("Append .txt")
+        hall_app.clicked.connect(self._hall_append)
+        hall_app.setToolTip("Append from file — skips duplicate phrases")
+        hall_exp = QPushButton("Export .txt")
+        hall_exp.clicked.connect(self._hall_export)
+        hall_btn_row.addWidget(hall_add)
+        hall_btn_row.addWidget(hall_edit)
+        hall_btn_row.addWidget(hall_del)
+        hall_btn_row.addWidget(hall_imp)
+        hall_btn_row.addWidget(hall_app)
+        hall_btn_row.addWidget(hall_exp)
+        l_hall.addLayout(hall_btn_row)
+
+        self.tabs.addTab(t_hall, "Hallucinations")
 
         # ===== FILE TRANSCRIPTION TAB =====
         t_ft = QWidget()
@@ -2803,7 +3031,7 @@ class WhisperRApp(QMainWindow):
         advanced_layout = QFormLayout()
 
         sk_row = QHBoxLayout()
-        self.cfg_sk_trigger = QLineEdit(self.config.settings.get("sendkeys_trigger", "sendkeys"))
+        self.cfg_sk_trigger = QLineEdit(self.config.settings.get("sendkeys_trigger", "whisper send keys"))
         self.cfg_sk_trigger.setToolTip(
             "When this word appears in a Command phrase, the action field\n"
             "is sent as a key sequence instead of launching a program.\n"
@@ -2822,28 +3050,48 @@ class WhisperRApp(QMainWindow):
             "The next dictated word will be lowercased automatically."
         )
         self.cfg_sel_trigger = QLineEdit(
-            self.config.settings.get("select_trigger", "whisperselect"))
+            self.config.settings.get("select_trigger", "whisper select"))
         self.cfg_sel_trigger.setToolTip(
             "Select trigger — navigates to the target text and selects it.\n" + _nav_help)
         advanced_layout.addRow("WhisperSelect Trigger:", self.cfg_sel_trigger)
 
         self.cfg_move_trigger = QLineEdit(
-            self.config.settings.get("move_trigger", "whispermove"))
+            self.config.settings.get("move_trigger", "whisper move"))
         self.cfg_move_trigger.setToolTip(
             "Move-before trigger (synonym for WhisperBefore).\n" + _nav_help)
         advanced_layout.addRow("WhisperMove Trigger:", self.cfg_move_trigger)
 
         self.cfg_movebefore_trigger = QLineEdit(
-            self.config.settings.get("movebefore_trigger", "whisperbefore"))
+            self.config.settings.get("movebefore_trigger", "whisper before"))
         self.cfg_movebefore_trigger.setToolTip(
             "Move-before trigger — places cursor immediately BEFORE the target.\n" + _nav_help)
         advanced_layout.addRow("WhisperBefore Trigger:", self.cfg_movebefore_trigger)
 
         self.cfg_moveafter_trigger = QLineEdit(
-            self.config.settings.get("moveafter_trigger", "whisperafter"))
+            self.config.settings.get("moveafter_trigger", "whisper after"))
         self.cfg_moveafter_trigger.setToolTip(
             "Move-after trigger — places cursor immediately AFTER the target.\n" + _nav_help)
         advanced_layout.addRow("WhisperAfter Trigger:", self.cfg_moveafter_trigger)
+
+        self.cfg_replace_trigger = QLineEdit(
+            self.config.settings.get("replace_trigger", "whisper replace"))
+        self.cfg_replace_trigger.setToolTip(
+            "Say this + a target phrase, then speak replacement text.\n"
+            "Finds the target in the session buffer, replaces it in-memory,\n"
+            "then undoes the last paste and repastes the corrected version.")
+        advanced_layout.addRow("WhisperReplace Trigger:", self.cfg_replace_trigger)
+
+        self.cfg_insertbefore_trigger = QLineEdit(
+            self.config.settings.get("insertbefore_trigger", "whisper insert before"))
+        self.cfg_insertbefore_trigger.setToolTip(
+            "Say this + a target phrase, then speak text to insert BEFORE the target.")
+        advanced_layout.addRow("WhisperInsertBefore Trigger:", self.cfg_insertbefore_trigger)
+
+        self.cfg_insertafter_trigger = QLineEdit(
+            self.config.settings.get("insertafter_trigger", "whisper insert after"))
+        self.cfg_insertafter_trigger.setToolTip(
+            "Say this + a target phrase, then speak text to insert AFTER the target.")
+        advanced_layout.addRow("WhisperInsertAfter Trigger:", self.cfg_insertafter_trigger)
 
         self.cfg_fuzzy_threshold = SpinWidget(
             is_double=True, min_v=0.0, max_v=1.0, step=0.05,
@@ -2910,6 +3158,91 @@ class WhisperRApp(QMainWindow):
         sc.setWidget(cw)
         sc.setWidgetResizable(True)
         self.tabs.addTab(sc, "Settings")
+
+    def _append_terms(self):
+        """Append terms from a .txt file, skipping any whose phrase already exists."""
+        path, _ = QFileDialog.getOpenFileName(self, "Append Terms", "", "Text Files (*.txt)")
+        if not path:
+            return
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+            existing = {
+                self.terms_table.item(r, 0).text().lower()
+                for r in range(self.terms_table.rowCount())
+                if self.terms_table.item(r, 0)
+            }
+            added = 0
+            for line in lines:
+                if " = " in line:
+                    k, v = line.split(" = ", 1)
+                    k = k.strip(); v = v.strip()
+                    if k and k.lower() not in existing:
+                        r = self.terms_table.rowCount()
+                        self.terms_table.insertRow(r)
+                        self.terms_table.setItem(r, 0, QTableWidgetItem(k))
+                        self.terms_table.setItem(r, 1, QTableWidgetItem(v))
+                        existing.add(k.lower())
+                        added += 1
+            app_logger.info(f"Terms: appended {added} new entry/entries from {path}")
+            self.scratchpad.append(f"[Terms] Appended {added} new entry/entries.")
+        except Exception as e:
+            app_logger.error(f"Failed to append terms: {e}")
+            QMessageBox.warning(self, "Append Failed", str(e))
+
+    def _append_commands(self):
+        """Append commands from a .txt file, skipping any whose phrase already exists."""
+        path, _ = QFileDialog.getOpenFileName(self, "Append Commands", "", "Text Files (*.txt)")
+        if not path:
+            return
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+            existing = {
+                self.cmd_table.item(r, 0).text().lower()
+                for r in range(self.cmd_table.rowCount())
+                if self.cmd_table.item(r, 0)
+            }
+            added = 0
+            for line in lines:
+                if " = " in line:
+                    k, v = line.split(" = ", 1)
+                    k = k.strip(); v = v.strip()
+                    if k and k.lower() not in existing:
+                        r = self.cmd_table.rowCount()
+                        self.cmd_table.insertRow(r)
+                        self.cmd_table.setItem(r, 0, QTableWidgetItem(k))
+                        self.cmd_table.setItem(r, 1, QTableWidgetItem(v))
+                        existing.add(k.lower())
+                        added += 1
+            app_logger.info(f"Commands: appended {added} new entry/entries from {path}")
+            self.scratchpad.append(f"[Commands] Appended {added} new entry/entries.")
+        except Exception as e:
+            app_logger.error(f"Failed to append commands: {e}")
+            QMessageBox.warning(self, "Append Failed", str(e))
+
+    def _hall_append(self):
+        """Append hallucination phrases from file, skipping duplicates."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Append Hallucinations", "", "Text Files (*.txt)")
+        if not path:
+            return
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+            existing = {
+                self.hall_list.item(i).text().lower()
+                for i in range(self.hall_list.count())
+            }
+            added = 0
+            for line in lines:
+                phrase = line.strip()
+                if phrase and phrase.lower() not in existing:
+                    self.hall_list.addItem(QListWidgetItem(phrase))
+                    existing.add(phrase.lower())
+                    added += 1
+            app_logger.info(f"Hallucinations: appended {added} phrase(s) from {path}")
+            self.scratchpad.append(f"[Hallucinations] Appended {added} phrase(s).")
+        except Exception as e:
+            app_logger.error(f"Failed to append hallucinations: {e}")
+            QMessageBox.warning(self, "Append Failed", str(e))
 
     def _delete_terms_row(self):
         row = self.terms_table.currentRow()
@@ -2995,6 +3328,80 @@ class WhisperRApp(QMainWindow):
             app_logger.debug(f"Deleted command row {current_row}")
         else:
             QMessageBox.warning(self, "No Selection", "Please select a row to delete.")
+
+    # ── Hallucinations tab methods ───────────────────────────────────────────
+
+    def _hall_add(self):
+        """Prompt for a new hallucination phrase and add it to the list."""
+        from PyQt6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(
+            self, "Add Hallucination Phrase",
+            "Enter phrase (case-insensitive substring to block):")
+        if ok and text.strip():
+            self.hall_list.addItem(QListWidgetItem(text.strip()))
+
+    def _hall_edit(self):
+        """Edit the currently selected hallucination phrase in-place."""
+        from PyQt6.QtWidgets import QInputDialog
+        item = self.hall_list.currentItem()
+        if not item:
+            QMessageBox.warning(self, "No Selection", "Select a phrase to edit.")
+            return
+        text, ok = QInputDialog.getText(
+            self, "Edit Hallucination Phrase", "Phrase:", text=item.text())
+        if ok and text.strip():
+            item.setText(text.strip())
+
+    def _hall_delete(self):
+        """Delete all selected hallucination phrases."""
+        for item in self.hall_list.selectedItems():
+            self.hall_list.takeItem(self.hall_list.row(item))
+
+    def _hall_import(self):
+        """Import hallucination phrases from a .txt file (one phrase per line).
+        Appends to the existing list rather than replacing it.
+        """
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Hallucinations", "", "Text Files (*.txt)")
+        if not path:
+            return
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+            added = 0
+            # Build set of existing phrases for deduplication
+            existing = {
+                self.hall_list.item(i).text().lower()
+                for i in range(self.hall_list.count())
+            }
+            for line in lines:
+                phrase = line.strip()
+                if phrase and phrase.lower() not in existing:
+                    self.hall_list.addItem(QListWidgetItem(phrase))
+                    existing.add(phrase.lower())
+                    added += 1
+            app_logger.info(f"Hallucinations: imported {added} phrase(s) from {path}")
+            self.scratchpad.append(f"[Hallucinations] Imported {added} phrase(s).")
+        except Exception as e:
+            app_logger.error(f"Failed to import hallucinations: {e}")
+            QMessageBox.warning(self, "Import Failed", str(e))
+
+    def _hall_export(self):
+        """Export all hallucination phrases to a .txt file (one phrase per line)."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Hallucinations", "hallucinations.txt", "Text Files (*.txt)")
+        if not path:
+            return
+        try:
+            lines = [
+                self.hall_list.item(i).text()
+                for i in range(self.hall_list.count())
+                if self.hall_list.item(i).text().strip()
+            ]
+            Path(path).write_text("\n".join(lines), encoding="utf-8")
+            app_logger.info(f"Hallucinations exported to {path}")
+        except Exception as e:
+            app_logger.error(f"Failed to export hallucinations: {e}")
+            QMessageBox.warning(self, "Export Failed", str(e))
 
     def pop_mics(self):
         """Populate microphone dropdown with better device matching"""
@@ -3136,6 +3543,11 @@ class WhisperRApp(QMainWindow):
                 if self.terms_table.item(r, 0) and self.terms_table.item(r, 1)
                 and self.terms_table.item(r, 0).text()
             },
+            "hallucinations": [
+                self.hall_list.item(i).text()
+                for i in range(self.hall_list.count())
+                if self.hall_list.item(i).text().strip()
+            ],
             "initial_prompt": self.prompt_edit.toPlainText(),
             "min_to_tray": self.cfg_tray.isChecked(),
             "auto_space": self.cfg_space.isChecked(),
@@ -3158,12 +3570,15 @@ class WhisperRApp(QMainWindow):
             "ft_mon_folder": self.ft_mon_folder.text(),
             "ft_mon_enabled": self.ft_mon_enabled.isChecked(),
             "use_vad": self.cfg_use_vad.isChecked(),
-            "sendkeys_trigger":   self.cfg_sk_trigger.text().strip() or "sendkeys",
-            "select_trigger":     self.cfg_sel_trigger.text().strip() or "whisperselect",
-            "move_trigger":       self.cfg_move_trigger.text().strip() or "whispermove",
-            "movebefore_trigger": self.cfg_movebefore_trigger.text().strip() or "whisperbefore",
-            "moveafter_trigger":  self.cfg_moveafter_trigger.text().strip() or "whisperafter",
-            "fuzzy_threshold":    self.cfg_fuzzy_threshold.value()
+            "sendkeys_trigger":   self.cfg_sk_trigger.text().strip() or "whisper send keys",
+            "select_trigger":     self.cfg_sel_trigger.text().strip() or "whisper select",
+            "move_trigger":       self.cfg_move_trigger.text().strip() or "whisper move",
+            "movebefore_trigger": self.cfg_movebefore_trigger.text().strip() or "whisper before",
+            "moveafter_trigger":      self.cfg_moveafter_trigger.text().strip() or "whisper after",
+            "replace_trigger":        self.cfg_replace_trigger.text().strip() or "whisper replace",
+            "insertbefore_trigger":   self.cfg_insertbefore_trigger.text().strip() or "whisper insert before",
+            "insertafter_trigger":    self.cfg_insertafter_trigger.text().strip() or "whisper insert after",
+            "fuzzy_threshold":        self.cfg_fuzzy_threshold.value()
         })
         
         try:
@@ -3266,9 +3681,11 @@ class WhisperRApp(QMainWindow):
             self._rollback_armed   = False
             if self._rollback_pending:
                 app_logger.debug("toggle_rec: rollback armed — will lowercase first result")
-            # Reset session buffer and cursor-ops flag for the new session
+            # Reset session buffer, cursor offset, and cursor-ops flag for the new session
             self._session_buffer = ""
+            self._cursor_offset  = 0
             self._cursor_ops_pending = False
+            self._pending_edit = None
             # Always kill any existing recorder first, even if it claims inactive.
             # A PTT recorder-storm can leave orphaned recorders with active=False
             # that are still mid-startup — stopping them prevents resource leaks
@@ -3539,42 +3956,302 @@ class WhisperRApp(QMainWindow):
             app_logger.error(f"rollback error: {e}", exc_info=True)
 
 
+
+    # ── Voice wizard: multi-step guided voice commands ────────────────────────
+
+    # Wizard steps per operation:
+    #
+    #  select / move / movebefore / moveafter
+    #      step "target"  → ask "what?" → call navigate
+    #
+    #  replace
+    #      step "target"  → ask "replace what?"
+    #      step "replacement" → ask "replace with what?" → do in-buffer replace
+    #
+    #  insertbefore / insertafter
+    #      step "target"  → ask "insert where?"
+    #      step "text"    → ask "insert what?" → do in-buffer insert
+
+    _WIZARD_PROMPTS = {
+        # (op, step) → (overlay_title, overlay_body)
+        ("select",      "target"):      ("Whisper Select",        "Say what you want to select."),
+        ("move",        "target"):      ("Whisper Move",          "Say what you want to move to."),
+        ("movebefore",  "target"):      ("Whisper Before",        "Say the word to move before."),
+        ("moveafter",   "target"):      ("Whisper After",         "Say the word to move after."),
+        ("replace",     "target"):      ("Whisper Replace",       "Say what you want to replace."),
+        ("replace",     "replacement"): ("Whisper Replace",       "Now say the replacement text."),
+        ("insertbefore","target"):      ("Whisper Insert Before", "Say the word to insert before."),
+        ("insertbefore","text"):        ("Whisper Insert Before", "Now say the text to insert."),
+        ("insertafter", "target"):      ("Whisper Insert After",  "Say the word to insert after."),
+        ("insertafter", "text"):        ("Whisper Insert After",  "Now say the text to insert."),
+    }
+
+    def _wizard_start(self, op):
+        """Launch a new wizard for `op`.  Called when a trigger is detected
+        with no inline argument, or always for replace/insert ops."""
+        self._wizard_cancel(silent=True)   # close any existing wizard first
+
+        # Capture the currently active window BEFORE showing our overlay,
+        # so we can restore focus to it when the wizard is done.
+        try:
+            import ctypes as _ct_wiz
+            self._wizard_prev_hwnd = _ct_wiz.windll.user32.GetForegroundWindow()
+        except Exception:
+            self._wizard_prev_hwnd = None
+
+        first_step = "target"
+        title, prompt = self._WIZARD_PROMPTS[(op, first_step)]
+
+        self._wizard = {"op": op, "step": first_step, "collected": {}}
+        self._wizard_overlay = WizardOverlay(title, prompt, parent=None)
+        self._wizard_overlay.cancelled.connect(self._wizard_cancel)
+        self._wizard_overlay.show()
+        self._wizard_overlay.raise_()
+        self._wizard_overlay.activateWindow()
+        self.scratchpad.append(f"[Wizard] {op} — step: {first_step}")
+        app_logger.info(f"Wizard started: op={op!r}, prev_hwnd={getattr(self, '_wizard_prev_hwnd', None)}")
+
+    def _wizard_step(self, text):
+        """Route a transcription result into the active wizard.
+        Returns True if the text was consumed by the wizard (suppress normal paste).
+        """
+        if self._wizard is None:
+            return False
+
+        op   = self._wizard["op"]
+        step = self._wizard["step"]
+        col  = self._wizard["collected"]
+
+        # Show live feedback
+        if self._wizard_overlay:
+            self._wizard_overlay.feed(text)
+
+        col[step] = text.strip()
+        app_logger.info(f"Wizard step={step!r} heard: {text!r}")
+
+        # ── Decide next step ──────────────────────────────────────────────
+        if op in ("select", "move", "movebefore", "moveafter"):
+            # Single-step: target → execute immediately
+            self._wizard_finish()
+
+        elif op == "replace":
+            if step == "target":
+                self._wizard["step"] = "replacement"
+                title, prompt = self._WIZARD_PROMPTS[(op, "replacement")]
+                if self._wizard_overlay:
+                    self._wizard_overlay.set_prompt(prompt)
+            else:  # step == "replacement"
+                self._wizard_finish()
+
+        elif op in ("insertbefore", "insertafter"):
+            if step == "target":
+                self._wizard["step"] = "text"
+                title, prompt = self._WIZARD_PROMPTS[(op, "text")]
+                if self._wizard_overlay:
+                    self._wizard_overlay.set_prompt(prompt)
+            else:  # step == "text"
+                self._wizard_finish()
+
+        return True   # consumed
+
+    def _wizard_finish(self):
+        """All steps collected — execute the operation and close the overlay."""
+        if self._wizard is None:
+            return
+
+        op  = self._wizard["op"]
+        col = self._wizard["collected"]
+
+        import re as _re_wiz
+
+        def _clean(s):
+            """Strip leading filler words and trailing punctuation Whisper adds."""
+            s = (s or "").strip().rstrip(".,!?;:")
+            s = _re_wiz.sub(
+                r"^(to|before|after|the|for|with|a|an)\s+", "",
+                s, flags=_re_wiz.IGNORECASE)
+            return s.strip()
+
+        # Show confirmation in overlay, then close it and restore focus
+        # before executing the action — the target app must be foreground.
+        def _exec_action():
+            try:
+                if op in ("select", "move", "movebefore", "moveafter"):
+                    target = _clean(col.get("target", ""))
+                    if target:
+                        self._whisper_navigate(op, target)
+                    else:
+                        self.scratchpad.append("[Wizard] Empty target — nothing to do.")
+
+                elif op == "replace":
+                    target      = _clean(col.get("target", ""))
+                    replacement = col.get("replacement", "").strip()
+                    if target and replacement:
+                        self._wizard_in_buffer_edit("replace", target, replacement)
+                    else:
+                        self.scratchpad.append("[Wizard] Replace: missing target or replacement.")
+
+                elif op in ("insertbefore", "insertafter"):
+                    target   = _clean(col.get("target", ""))
+                    ins_text = col.get("text", "").strip()
+                    if target and ins_text:
+                        self._wizard_in_buffer_edit(op, target, ins_text)
+                    else:
+                        self.scratchpad.append("[Wizard] Insert: missing target or text.")
+
+            except Exception as e:
+                app_logger.error(f"Wizard finish error: {e}", exc_info=True)
+                self.scratchpad.append(f"[Wizard] Error: {e}")
+
+        # Build a summary for the confirmation label
+        if op in ("select", "move", "movebefore", "moveafter"):
+            _summary = f"→ {_clean(col.get('target', ''))}"
+        elif op == "replace":
+            _summary = f"{_clean(col.get('target',''))} → {col.get('replacement','')[:30]}"
+        else:
+            _summary = f"{_clean(col.get('target',''))} / {col.get('text','')[:30]}"
+        if self._wizard_overlay:
+            self._wizard_overlay.confirm(_summary)
+
+        # Restore focus to the previously active window, then delay before
+        # sending keystrokes so it has time to fully activate.
+        _hwnd = getattr(self, "_wizard_prev_hwnd", None)
+        _delay_ms = max(int(self.config.settings.get("paste_delay", 0.5) * 1000), 500)
+
+        def _restore_and_exec():
+            if _hwnd:
+                try:
+                    import ctypes as _ct_r
+                    _u32 = _ct_r.windll.user32
+                    # AttachThreadInput is more reliable than SetForegroundWindow
+                    # alone — Windows blocks focus steals from background processes.
+                    _fg   = _u32.GetForegroundWindow()
+                    _tFG  = _u32.GetWindowThreadProcessId(_fg, None)
+                    _tTGT = _u32.GetWindowThreadProcessId(_hwnd, None)
+                    _u32.AttachThreadInput(_tFG, _tTGT, True)
+                    _u32.SetForegroundWindow(_hwnd)
+                    _u32.BringWindowToTop(_hwnd)
+                    _u32.AttachThreadInput(_tFG, _tTGT, False)
+                except Exception:
+                    pass
+            # Extra wait after focus restore — window needs to fully activate
+            from PyQt6.QtCore import QTimer as _QT2
+            _QT2.singleShot(_delay_ms, _exec_action)
+
+        # Close overlay first, then restore + execute after brief pause
+        if self._wizard_overlay:
+            from PyQt6.QtCore import QTimer as _QT
+            _ov = self._wizard_overlay
+            _QT.singleShot(600, _ov.close)
+            _QT.singleShot(650, _restore_and_exec)
+        else:
+            _restore_and_exec()
+
+        self._wizard         = None
+        self._wizard_overlay = None
+        self._cursor_ops_pending = True
+
+    def _wizard_cancel(self, silent=False):
+        """Abort the current wizard without executing anything."""
+        if self._wizard_overlay:
+            self._wizard_overlay.close()
+            self._wizard_overlay = None
+        if self._wizard and not silent:
+            self.scratchpad.append(f"[Wizard] Cancelled ({self._wizard['op']}).")
+        self._wizard = None
+
+    def _wizard_in_buffer_edit(self, op, target, new_text):
+        """Edit the session buffer in-place, then select+delete the original
+        session text in the active app and repaste the corrected version.
+
+        Uses select→delete→paste rather than Ctrl+Z, so it works regardless
+        of the target app's undo history depth.
+        """
+        import re as _re_e
+        import pyautogui as _pag_e
+        import pyperclip as _pc_e
+        import ctypes as _ct_e
+        import time as _te
+
+        buf   = self._session_buffer
+        pat   = _re_e.compile(_re_e.escape(target), _re_e.IGNORECASE)
+        hits  = list(pat.finditer(buf))
+        if not hits:
+            self.scratchpad.append(
+                f"[Wizard] \"{target}\" not found in session buffer.")
+            return
+
+        m = hits[-1]
+        if op == "replace":
+            new_buf = buf[:m.start()] + new_text + buf[m.end():]
+        elif op == "insertbefore":
+            new_buf = buf[:m.start()] + new_text + " " + buf[m.start():]
+        elif op == "insertafter":
+            new_buf = buf[:m.end()] + " " + new_text + buf[m.end():]
+        else:
+            return
+
+        paste_delay = self.config.settings.get("paste_delay", 0.5)
+
+        # Release any held modifier keys
+        for _vk in (0x11, 0x10, 0x12):
+            _ct_e.windll.user32.keybd_event(_vk, 0, 0x0002, 0)
+        _te.sleep(0.06)
+
+        # The cursor may be offset from the end of the session buffer
+        # (if a previous navigate op moved it).  Steps:
+        #   1. Move right _cursor_offset times → back to end of session text
+        #   2. Shift+Left * len(buf) → select all session text
+        #   3. Delete the selection
+        #   4. Paste new_buf
+        if self._cursor_offset > 0:
+            for _ in range(self._cursor_offset):
+                _pag_e.press("right")
+            _te.sleep(0.04)
+
+        buf_len = len(buf)
+        if buf_len > 0:
+            _pag_e.keyDown("shift")
+            try:
+                # Send in chunks with small pauses for long texts
+                for _ in range(buf_len):
+                    _pag_e.press("left")
+            finally:
+                _pag_e.keyUp("shift")
+            _te.sleep(0.04)
+            _pag_e.press("delete")
+            _te.sleep(0.04)
+
+        _pc_e.copy(new_buf)
+        _te.sleep(paste_delay)
+        _pag_e.hotkey("ctrl", "v")
+
+        self._session_buffer = new_buf
+        self._cursor_offset  = 0
+        self.scratchpad.append(
+            f"[Wizard] {op}: \"{target}\" → \"{new_text[:40]}\"")
+        app_logger.info(f"Wizard in-buffer edit {op} on \"{target}\"")
+
+    def _navigate_press_n(self, pag, key, n, interval=0.01):
+        """Send `n` keypresses of `key`, using pyautogui with a small interval."""
+        import time as _t
+        for _ in range(n):
+            pag.press(key)
+            if n > 20:
+                _t.sleep(interval)  # tiny pause for responsiveness on large moves
+
     def _whisper_navigate(self, operation, target_text):
         """Perform a cursor navigation / selection operation inside the active window.
 
-        The app cannot read the active window's content, so it works purely from
-        the session buffer (all text pasted since the current dictation session
-        started).  It navigates by counting characters and sending arrow / shift
-        key presses — identical to what a user would do manually.
+        Works from self._session_buffer and self._cursor_offset.
 
-        Parameters
-        ----------
-        operation : str
-            One of: "select" | "move" | "movebefore" | "moveafter"
-        target_text : str
-            The substring to locate in the session buffer.
+        _cursor_offset tracks how many characters the cursor has been moved
+        LEFTWARD from the end of the session buffer by previous navigate ops.
+        0 = cursor is at end of all pasted text (initial state).
+        N = cursor is N characters before the end.
 
-        Cursor movement strategy
-        ------------------------
-        The cursor is assumed to be AT THE END of the session buffer.
-
-        1.  Find the last occurrence of target_text in the session buffer
-            (case-insensitive).
-        2.  Compute:
-              chars_from_end = len(session_buffer) - match_end_index
-              (how many Left presses to reach just after the match)
-        3.  Depending on operation:
-              "movebefore" / "move":
-                    Left × (chars_from_end + len(target_text))
-                    → cursor lands immediately BEFORE the target
-              "moveafter":
-                    Left × chars_from_end
-                    → cursor lands immediately AFTER the target
-              "select":
-                    Left × chars_from_end                    (no shift)
-                    then Shift+Left × len(target_text)        (select backwards)
-                    … actually: navigate to just before target, then
-                    Shift+Right × len(target_text)
+        This allows chained navigate calls to work correctly even after the
+        cursor has been moved by a previous whispermove/whisperselect.
         """
         import re as _re
         import pyautogui as _pag
@@ -3582,7 +4259,7 @@ class WhisperRApp(QMainWindow):
         import time as _time
 
         buf   = self._session_buffer
-        clean = target_text.strip()
+        clean = target_text.strip().rstrip(".,!?;:")
         if not clean:
             self.scratchpad.append("[Navigate] Empty target — nothing to do.")
             return
@@ -3597,63 +4274,69 @@ class WhisperRApp(QMainWindow):
             self.scratchpad.append(f"[Navigate] '{clean}' not found in session buffer.")
             return
 
-        m           = matches[-1]           # last occurrence
+        m           = matches[-1]
         match_start = m.start()
         match_end   = m.end()
         buf_len     = len(buf)
 
-        # ── Release any held modifier keys before sending arrows ────────────
-        _VK_CONTROL = 0x11; _VK_SHIFT = 0x10; _VK_MENU = 0x12
-        _KEYUP = 0x0002
+        # ── Release held modifiers ──────────────────────────────────────────
+        _VK_CONTROL = 0x11; _VK_SHIFT = 0x10; _VK_MENU = 0x12; _KEYUP = 0x0002
         for _vk in (_VK_CONTROL, _VK_SHIFT, _VK_MENU):
             _ct.windll.user32.keybd_event(_vk, 0, _KEYUP, 0)
-        _time.sleep(0.08)
+        _time.sleep(0.06)
 
-        paste_delay = self.config.settings.get("paste_delay", 0.5)
+        # Current cursor absolute position in buffer (chars from buffer start)
+        cur_abs = buf_len - self._cursor_offset   # where cursor is right now
 
-        # Chars from current cursor position (end of buffer) to end of match
-        chars_to_match_end   = buf_len - match_end    # Left presses to reach just after match
-        chars_in_match       = match_end - match_start
+        # Target positions
+        before_abs = match_start   # just before the match
+        after_abs  = match_end     # just after the match
+        chars_in_match = match_end - match_start
 
         try:
             if operation in ("move", "movebefore"):
-                # Move cursor to just BEFORE the target text
-                lefts = chars_to_match_end + chars_in_match
-                app_logger.info(f"Navigate movebefore '{clean}': {lefts} Left presses")
-                for _ in range(lefts):
-                    _pag.press("left")
+                delta = cur_abs - before_abs   # positive = move left
+                if delta > 0:
+                    self._navigate_press_n(_pag, "left", delta)
+                elif delta < 0:
+                    self._navigate_press_n(_pag, "right", -delta)
+                self._cursor_offset = buf_len - before_abs
                 self.scratchpad.append(
-                    f"[Navigate] Cursor moved before '{clean}' ({lefts} ◀ presses)")
+                    f"[Navigate] Cursor → before '{clean}' (moved {abs(delta)} {'◀' if delta>0 else '▶'})")
 
             elif operation == "moveafter":
-                # Move cursor to just AFTER the target text
-                lefts = chars_to_match_end
-                app_logger.info(f"Navigate moveafter '{clean}': {lefts} Left presses")
-                for _ in range(lefts):
-                    _pag.press("left")
+                delta = cur_abs - after_abs
+                if delta > 0:
+                    self._navigate_press_n(_pag, "left", delta)
+                elif delta < 0:
+                    self._navigate_press_n(_pag, "right", -delta)
+                self._cursor_offset = buf_len - after_abs
                 self.scratchpad.append(
-                    f"[Navigate] Cursor moved after '{clean}' ({lefts} ◀ presses)")
+                    f"[Navigate] Cursor → after '{clean}' (moved {abs(delta)} {'◀' if delta>0 else '▶'})")
 
             elif operation == "select":
-                # Move to just before target, then Shift+Right to select it
-                lefts = chars_to_match_end + chars_in_match
-                app_logger.info(
-                    f"Navigate select '{clean}': {lefts} Left, then {chars_in_match} Shift+Right")
-                for _ in range(lefts):
-                    _pag.press("left")
-                # Now select the text forward
-                for _ in range(chars_in_match):
-                    _pag.keyDown("shift")
-                _pag.keyDown("shift")   # make sure shift is held
-                for _ in range(chars_in_match):
-                    _pag.press("right")
-                _pag.keyUp("shift")
+                # Move to just before match, then Shift+Right through it
+                delta = cur_abs - before_abs
+                if delta > 0:
+                    self._navigate_press_n(_pag, "left", delta)
+                elif delta < 0:
+                    self._navigate_press_n(_pag, "right", -delta)
+                # Now hold shift and press right for each char in the match
+                _pag.keyDown("shift")
+                try:
+                    self._navigate_press_n(_pag, "right", chars_in_match)
+                finally:
+                    _pag.keyUp("shift")
+                # After selection cursor is at match_end, offset unchanged from before
+                self._cursor_offset = buf_len - after_abs
                 self.scratchpad.append(
                     f"[Navigate] Selected '{clean}' "
-                    f"({lefts} ◀ then {chars_in_match} ⇧▶)")
+                    f"(moved {abs(delta)} {'◀' if delta>0 else '▶'}, selected {chars_in_match} ▶)")
 
-            # Arm lowercase flag so the next dictated segment joins cleanly
+            # Arm lowercase for next transcription
             self._cursor_ops_pending = True
+            app_logger.info(
+                f"Navigate '{operation}' → '{clean}': cursor_offset now {self._cursor_offset}")
 
         except Exception as e:
             app_logger.error(f"Navigate error: {e}", exc_info=True)
@@ -3860,61 +4543,105 @@ class WhisperRApp(QMainWindow):
             return
 
         if src == "live":
+            # ── Wizard intercept: multi-step voice commands ──────────────────
+            # If a wizard is active, route this transcription into it instead
+            # of normal paste handling.  The wizard calls back into the app
+            # (_whisper_navigate / _wizard_in_buffer_edit) when complete.
+            if self._wizard is not None:
+                self._wizard_step(text)
+                return
+
             # ── Command detection (runs BEFORE paste) ────────────────────────
             # ── WhisperNavigate: select / move cursor ──────────────────────
             # Check BEFORE command and paste handling — navigation is its own
             # operation; we do not paste the trigger phrase itself.
             _cfg      = self.config.settings
             _fuzz_thr = float(_cfg.get("fuzzy_threshold", 0.75))
-            _nav_triggers = [
-                ("select",     _cfg.get("select_trigger",     "whisperselect").lower()),
-                ("move",       _cfg.get("move_trigger",       "whispermove").lower()),
-                ("movebefore", _cfg.get("movebefore_trigger", "whisperbefore").lower()),
-                ("moveafter",  _cfg.get("moveafter_trigger",  "whisperafter").lower()),
+            # Wizard trigger detection: best-match approach.
+            # All triggers share the "whisper" prefix, so first-match-above-threshold
+            # is unreliable — "whisper a place" (accent for "replace") would fire
+            # "move" just because it appears first in the list and scores > 0.75.
+            # Instead: require first spoken word ≈ "whisper", then find the
+            # HIGHEST-scoring distinctive keyword match across all triggers.
+            import re as _re_trig
+            from difflib import SequenceMatcher as _SM_trig
+            _trig_defs = [
+                ("select",       _cfg.get("select_trigger",       "whisper select").lower()),
+                ("move",         _cfg.get("move_trigger",         "whisper move").lower()),
+                ("movebefore",   _cfg.get("movebefore_trigger",   "whisper before").lower()),
+                ("moveafter",    _cfg.get("moveafter_trigger",    "whisper after").lower()),
+                ("replace",      _cfg.get("replace_trigger",      "whisper replace").lower()),
+                ("insertbefore", _cfg.get("insertbefore_trigger", "whisper insert before").lower()),
+                ("insertafter",  _cfg.get("insertafter_trigger",  "whisper insert after").lower()),
             ]
-            _nav_fired = False
-            for _nav_op, _nav_kw in _nav_triggers:
-                if not _nav_kw:
-                    continue
-                _matched, _nav_target = _fuzzy_trigger_match(text, _nav_kw, _fuzz_thr)
-                if _matched:
-                    # Strip leading filler words Whisper loves to add
-                    import re as _re_nav
-                    _nav_target = _re_nav.sub(
-                        r"^(to|before|after|the|for)\s+", "",
-                        _nav_target, flags=_re_nav.IGNORECASE).strip()
+            # Strip punctuation from each spoken word, require first word ≈ "whisper"
+            _sw_raw = [_re_trig.sub(r"[^\w]", "", w)
+                       for w in text.lower().split()]
+            _sw_raw = [w for w in _sw_raw if w]
+            _trig_fired = False
+            if _sw_raw and _SM_trig(None, _sw_raw[0], "whisper").ratio() >= 0.75:
+                _sw_key = _sw_raw[1:]  # distinctive words after "whisper"
+                _best_score = 0.0
+                _best_op = None
+                for _trig_op, _full_kw in _trig_defs:
+                    if not _full_kw:
+                        continue
+                    # Key = everything after "whisper " in the trigger phrase
+                    _key = " ".join(_full_kw.split()[1:])  # e.g. "replace", "insert before"
+                    _kw  = _key.split()
+                    _n   = len(_kw)
+                    if _sw_key and len(_sw_key) >= _n:
+                        _cand = " ".join(_sw_key[:_n])
+                        _r = _SM_trig(None, _key, _cand).ratio()
+                        if _r > _best_score:
+                            _best_score = _r; _best_op = _trig_op
+                    # Also try joined forms (run-together speech)
+                    if _sw_key:
+                        _joined_s = "".join(_sw_key[:max(_n, len(_sw_key))])
+                        _joined_t = "".join(_kw)
+                        _r2 = _SM_trig(None, _joined_t,
+                                       _joined_s[:len(_joined_t)+2]).ratio()
+                        if _r2 > _best_score:
+                            _best_score = _r2; _best_op = _trig_op
+                if _best_op and _best_score >= _fuzz_thr:
                     app_logger.info(
-                        f"WhisperNavigate (fuzzy): op={_nav_op!r}, target={_nav_target!r}")
-                    self._whisper_navigate(_nav_op, _nav_target)
-                    _nav_fired = True
-                    break
-            if _nav_fired:
-                app_logger.debug("  on_text: navigate fired — skipping paste")
+                        f"Wizard trigger: op={_best_op!r} score={_best_score:.3f}")
+                    self.scratchpad.append(
+                        f"[Wizard] Detected: {_best_op} (score {_best_score:.2f})")
+                    self._wizard_start(_best_op)
+                    _trig_fired = True
+            if _trig_fired:
                 return
 
             # If the transcribed text matches a voice command, execute it and
             # do NOT paste the text — the spoken phrase was a command, not prose.
             _cmd_fired = False
             app_logger.debug(f"  on_text: Checking {len(self.config.settings['commands'])} voice commands...")
-            sk_trigger = self.config.settings.get("sendkeys_trigger", "sendkeys").lower().strip()
+            sk_trigger = self.config.settings.get("sendkeys_trigger", "whisper send keys").lower().strip()
             for phrase, cmd in self.config.settings["commands"].items():
                 # Exact match first; fall back to fuzzy if threshold > 0
                 _phrase_l = phrase.lower()
-                _exact    = _phrase_l in text.lower()
+                _spoken_l = text.lower()
+                # Exact: ALL phrase words must appear in spoken text
+                _phrase_words = _phrase_l.split()
+                _exact = all(w in _spoken_l for w in _phrase_words) and _phrase_l in _spoken_l
                 _fuzz_cmd = False
                 if not _exact and _fuzz_thr > 0:
-                    # Slide a window of len(phrase.split()) words across the spoken text
+                    # Fuzzy: window must match phrase AND window length ≈ phrase length
+                    # to avoid partial matches (e.g. "Launch" matching "Launch Notepad")
                     from difflib import SequenceMatcher as _SM
-                    _sw = text.lower().split()
+                    _sw = _spoken_l.split()
                     _pw = _phrase_l.split()
                     _wn = len(_pw)
-                    for _wi in range(max(1, len(_sw) - _wn + 1)):
-                        _window = " ".join(_sw[_wi:_wi + _wn])
-                        if _SM(None, _phrase_l, _window).ratio() >= _fuzz_thr:
-                            _fuzz_cmd = True
-                            app_logger.debug(
-                                f"  on_text: fuzzy command match '{phrase}' ~ '{_window}'")
-                            break
+                    # Only consider windows exactly _wn words long (same as phrase)
+                    if len(_sw) >= _wn:  # spoken must be at least as long as phrase
+                        for _wi in range(len(_sw) - _wn + 1):
+                            _window = " ".join(_sw[_wi:_wi + _wn])
+                            if _SM(None, _phrase_l, _window).ratio() >= _fuzz_thr:
+                                _fuzz_cmd = True
+                                app_logger.debug(
+                                    f"  on_text: fuzzy command match '{phrase}' ~ '{_window}'")
+                                break
                 if _exact or _fuzz_cmd:
                     app_logger.debug(f"  on_text: Command matched: '{phrase}' → '{cmd}'")
                     try:
@@ -3956,18 +4683,53 @@ class WhisperRApp(QMainWindow):
                     text = text[0].lower() + text[1:]
                     self._rollback_pending = False
                     self._cursor_ops_pending = False
-                # Apply term replacements (case-insensitive, exact output preserved)
+                # ── Confidence gate (paste path only) ────────────────────
+                # Triggers / commands / wizard have already fired above, so
+                # confidence filtering here only blocks actual pasting.
+                if self.config.settings.get("use_confidence", False):
+                    _mc  = float(self.config.settings.get("min_confidence", 0.0))
+                    if _mc > 0.0:
+                        _thr = -_mc
+                        _seg_data = getattr(self.transcriber, "_last_seg_data", [])
+                        if _seg_data:
+                            _kept = [st for st, slp in _seg_data if slp >= _thr]
+                            _dropped = [st for st, slp in _seg_data if slp < _thr]
+                            for _ds in _dropped:
+                                app_logger.debug(
+                                    f"  paste confidence filtered: {_ds!r}")
+                            text = " ".join(_kept).strip()
+                            if not text:
+                                app_logger.debug(
+                                    "  all segments below confidence threshold — not pasting")
+                                return
+
+                # Apply term replacements (case-insensitive + fuzzy)
                 import re as _re
+                from difflib import SequenceMatcher as _SMt
                 _key_tag_sequences = []  # term replacements that contain <KEY> tags
                 for phrase, replacement in self.config.settings.get("terms", {}).items():
-                    if phrase.strip() and _re.search(_re.escape(phrase), text, _re.IGNORECASE):
+                    if not phrase.strip():
+                        continue
+                    # Try exact match first
+                    _texact = bool(_re.search(_re.escape(phrase), text, _re.IGNORECASE))
+                    _tfuzzy_match = None
+                    if not _texact and _fuzz_thr > 0:
+                        # Slide a word-window across the text looking for fuzzy match
+                        _tw = text.split(); _pw2 = phrase.split(); _wn2 = len(_pw2)
+                        for _wi2 in range(max(1, len(_tw) - _wn2 + 1)):
+                            _win2 = " ".join(_tw[_wi2:_wi2 + _wn2])
+                            if _SMt(None, phrase.lower(), _win2.lower()).ratio() >= _fuzz_thr:
+                                _tfuzzy_match = _win2
+                                break
+                    if _texact or _tfuzzy_match:
+                        _pattern = (_re.escape(phrase) if _texact
+                                    else _re.escape(_tfuzzy_match))
                         if "<" in replacement and ">" in replacement:
                             # Contains special key tags — collect for sendkeys after paste
                             _key_tag_sequences.append(replacement)
-                            # Remove the matched phrase from text so it isn't pasted literally
-                            text = _re.sub(_re.escape(phrase), "", text, flags=_re.IGNORECASE).strip()
+                            text = _re.sub(_pattern, "", text, flags=_re.IGNORECASE).strip()
                         else:
-                            text = _re.sub(_re.escape(phrase), replacement,
+                            text = _re.sub(_pattern, replacement,
                                            text, flags=_re.IGNORECASE)
                 p_text = text + " " if auto_space else text
                 # Strip trailing punctuation/spaces to find the last real word,
@@ -3975,6 +4737,7 @@ class WhisperRApp(QMainWindow):
                 self._last_paste_len = len(p_text)
                 self._last_paste_text = p_text
                 self._session_buffer += p_text  # accumulate for select/move
+                self._cursor_offset   = 0       # fresh paste = cursor at new end
 
                 paste_delay = self.config.settings["paste_delay"]
                 app_logger.debug(f"  on_text: auto_space={auto_space}, paste_delay={paste_delay}s, p_text length={len(p_text)}")

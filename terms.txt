@@ -1,0 +1,13 @@
+hexagon software = Hexagon Software
+whisper undo = <CTRL+Z>
+whisper select all = <CTRL+A>
+whisper home = <HOME>
+whisper end = <END>
+whisper up = <UP>
+whisper down = <DOWN>
+whisper left = <LEFT>
+whisper right = <RIGHT>
+whisper select last word = <CTRL+SHIFT+LEFT>
+whisper select next word = <CTRL+SHIFT+RIGHT>
+whisper delete = <DELETE>
+whisper backspace = <BACKSPACE>
