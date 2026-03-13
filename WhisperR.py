@@ -713,7 +713,8 @@ from PyQt6.QtWidgets import (
     QPushButton, QComboBox, QLabel, QFileDialog, QTabWidget, QCheckBox, 
     QDoubleSpinBox, QProgressBar, QFormLayout, QLineEdit, QGroupBox, QSpinBox, 
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QDialog, QMessageBox,
-    QSystemTrayIcon, QMenu, QSlider, QListWidget, QListWidgetItem, QAbstractItemView, QSplitter
+    QSystemTrayIcon, QMenu, QSlider, QListWidget, QListWidgetItem, QAbstractItemView, QSplitter,
+    QFrame
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QPoint, QObject, QEvent
 from PyQt6.QtGui import (QPainter, QColor, QFont, QIcon, QAction, QKeyEvent, QPixmap, QPen,
@@ -872,7 +873,8 @@ class AppConfig:
             "editor_hk_h1":        "Ctrl+1",  "editor_hk_h2":        "Ctrl+2",
             "editor_hk_h3":        "Ctrl+3",  "editor_hk_emdash":    "Ctrl+Shift+Minus",
             "editor_hk_bullet":    "Ctrl+Shift+B", "editor_hk_numlist": "Ctrl+Shift+N",
-            "editor_hk_tasklist":  "Ctrl+Shift+T", "editor_hk_link":    "Ctrl+K",
+            "editor_hk_tasklist":  "Ctrl+Shift+T", "editor_hk_kbd":     "Ctrl+Shift+K",
+            "editor_hk_link":    "Ctrl+K",
             "sendkeys_trigger":   "whisper send keys",
             "select_trigger":     "whisper select",
             "move_trigger":       "whisper move",
@@ -2344,6 +2346,185 @@ class _HotkeyFilteredTextEdit(QTextEdit):
         super().keyPressEvent(e)
 
 
+
+class _CheatsheetWindow(QWidget):
+    """Floating cheatsheet panel that attaches to the right of WhisperEditor.
+
+    Displays three collapsible sections:
+      1. Editor formatting shortcuts (buttons + hotkeys)
+      2. App-level hotkeys from Settings
+      3. User-defined Terms (trigger phrases only, no replacements)
+    """
+
+    def __init__(self, editor: "WhisperEditor"):
+        super().__init__(editor,
+                         Qt.WindowType.Window |
+                         Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowTitle("Cheatsheet")
+        self._editor = editor
+        self._build_ui()
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+
+    def closeEvent(self, event):
+        """Sync toggle button when user closes via the window's X."""
+        super().closeEvent(event)
+        if self._editor and getattr(self._editor, "btn_cheatsheet", None):
+            self._editor.btn_cheatsheet.setChecked(False)
+        # Notify editor so it clears the reference
+        self._editor._cheatsheet = None
+
+    def _build_ui(self):
+        self.setStyleSheet(
+            "QWidget { background: #1a1a1a; color: #ddd; }"
+            "QScrollArea { border: none; }"
+            "QLabel#hdr { color:#aaa; font-size:8pt; padding:2px 4px; }"
+        )
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inner = QWidget()
+        self._inner_layout = QVBoxLayout(inner)
+        self._inner_layout.setContentsMargins(8, 8, 8, 8)
+        self._inner_layout.setSpacing(4)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+
+        self._populate()
+
+    def _populate(self):
+        lay = self._inner_layout
+        # clear existing
+        while lay.count():
+            item = lay.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+        cfg = getattr(self._editor, "config", None)
+        settings = cfg.settings if cfg and hasattr(cfg, "settings") else {}
+        hk = lambda k, d="": settings.get(k, d)
+
+        # ── Section helper ────────────────────────────────────────────────────
+        def _section(title, rows):
+            """Collapsible section. rows = list of (shortcode/key, description)."""
+            grp = QWidget()
+            grp_lay = QVBoxLayout(grp)
+            grp_lay.setContentsMargins(0, 0, 0, 0)
+            grp_lay.setSpacing(0)
+
+            hdr_btn = QPushButton(f"▾  {title}")
+            hdr_btn.setCheckable(True)
+            hdr_btn.setChecked(True)
+            hdr_btn.setStyleSheet(
+                "QPushButton{background:#252525;border:none;border-bottom:1px solid #333;"
+                "color:#ccc;font-weight:bold;font-size:9pt;text-align:left;"
+                "padding:5px 8px;}"
+                "QPushButton:hover{background:#2e2e2e;}"
+                "QPushButton:checked{color:#fff;}")
+            grp_lay.addWidget(hdr_btn)
+
+            body = QWidget()
+            body_lay = QVBoxLayout(body)
+            body_lay.setContentsMargins(6, 4, 6, 4)
+            body_lay.setSpacing(1)
+            body.setStyleSheet("QWidget{background:#1a1a1a;}")
+
+            for shortcode, desc in rows:
+                row_w = QWidget()
+                row_w.setStyleSheet("QWidget{background:transparent;}")
+                row_lay = QHBoxLayout(row_w)
+                row_lay.setContentsMargins(2, 1, 2, 1)
+                row_lay.setSpacing(8)
+
+                lbl_code = QLabel(shortcode)
+                lbl_code.setStyleSheet(
+                    "font-family:Consolas,monospace;font-size:9pt;"
+                    "color:#5bc8f5;background:#111;border:1px solid #333;"
+                    "border-radius:3px;padding:1px 5px;")
+                lbl_code.setFixedWidth(130)
+                lbl_code.setWordWrap(False)
+
+                lbl_desc = QLabel(desc)
+                lbl_desc.setStyleSheet("font-size:9pt;color:#bbb;")
+                lbl_desc.setWordWrap(True)
+
+                row_lay.addWidget(lbl_code)
+                row_lay.addWidget(lbl_desc, 1)
+                body_lay.addWidget(row_w)
+
+            grp_lay.addWidget(body)
+
+            def _toggle(checked):
+                body.setVisible(checked)
+                hdr_btn.setText(("▾  " if checked else "▸  ") + title)
+            hdr_btn.toggled.connect(_toggle)
+
+            lay.addWidget(grp)
+
+        # ── Section 1: Editor shortcuts ───────────────────────────────────────
+        ed_rows = [
+            (hk("editor_hk_bold",      "Ctrl+B"),          "Bold  **text**"),
+            (hk("editor_hk_italic",    "Ctrl+I"),          "Italic  *text*"),
+            (hk("editor_hk_strike",    "Ctrl+Shift+S"),    "Strikethrough  ~~text~~"),
+            (hk("editor_hk_highlight", "Ctrl+Shift+H"),    "Highlight  ==text=="),
+            (hk("editor_hk_code",      "Ctrl+`"),          "Inline code  `text`"),
+            (hk("editor_hk_kbd",       "Ctrl+Shift+K"),    "Keyboard key  <kbd>text</kbd>"),
+            (hk("editor_hk_link",      "Ctrl+K"),          "Link  [text](url)"),
+            ("Right-click 🔗",                              "Link with clipboard URL"),
+            (hk("editor_hk_h1",        "Ctrl+1"),          "Heading 1  # text"),
+            (hk("editor_hk_h2",        "Ctrl+2"),          "Heading 2  ## text"),
+            (hk("editor_hk_h3",        "Ctrl+3"),          "Heading 3  ### text"),
+            (hk("editor_hk_bullet",    "Ctrl+Shift+B"),    "Bullet list  - text"),
+            (hk("editor_hk_numlist",   "Ctrl+Shift+N"),    "Numbered list  1. text"),
+            (hk("editor_hk_tasklist",  "Ctrl+Shift+T"),    "Task list  - [ ] text"),
+            ("Ctrl+Enter",                                  "Paste to App"),
+        ]
+        _section("✏️  Editor shortcuts", ed_rows)
+
+        # ── Section 2: App hotkeys ────────────────────────────────────────────
+        app_hk_rows = []
+        pairs = [
+            (hk("hotkey",           "<ctrl>+<alt>+z"), "Toggle dictation on/off"),
+            (hk("ptt_key",          "ctrl+shift+space"), "Push-to-talk (hold)"),
+            (hk("visibility_hotkey","ctrl+shift+alt+z"), "Show / hide WhisperR window"),
+            (hk("rollback_hotkey",  "ctrl+shift+z"),   "Rollback last dictation"),
+            (hk("editor_hotkey",    "ctrl+shift+e"),   "Toggle editor window"),
+            (hk("editor_edit_hotkey",""),               "Copy & Edit (open editor with selection)"),
+        ]
+        for k, desc in pairs:
+            if k:
+                app_hk_rows.append((k, desc))
+        if app_hk_rows:
+            _section("⌨️  App hotkeys", app_hk_rows)
+
+        # ── Section 3: Voice triggers ─────────────────────────────────────────
+        voice_rows = [
+            (hk("editor_edit_trigger",  "whisper edit"),  "Open editor with selected text"),
+            (hk("editor_type_trigger",  "whisper type"),  "Open blank editor"),
+            (hk("editor_paste_trigger", "whisper paste"), "Paste editor text to app"),
+            (hk("select_trigger",       "whisper select"),"Select / copy text"),
+            (hk("move_trigger",         "whisper move"),  "Move cursor"),
+            (hk("replace_trigger",      "whisper replace"),"Replace text"),
+            (hk("insertbefore_trigger", "whisper insert before"), "Insert before text"),
+            (hk("insertafter_trigger",  "whisper insert after"),  "Insert after text"),
+        ]
+        _section("🎙  Voice triggers", voice_rows)
+
+        # ── Section 4: Terms ──────────────────────────────────────────────────
+        terms = settings.get("terms", {})
+        if terms:
+            term_rows = [(phrase, "(→ replacement)") for phrase in terms]
+            _section("📝  Terms  (say to substitute)", term_rows)
+
+        lay.addStretch()
+
+    def refresh(self):
+        """Rebuild content (call after settings change)."""
+        self._populate()
+
+
 class WhisperEditor(QWidget):
     """Voice-driven built-in text editor.
 
@@ -2375,6 +2556,7 @@ class WhisperEditor(QWidget):
         # Prevent Qt from destroying this object when the window is closed —
         # the app may still hold a reference and the clipboard monitor needs it.
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self._cheatsheet: "_CheatsheetWindow | None" = None
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -2468,46 +2650,53 @@ class WhisperEditor(QWidget):
         cfg = self.config if isinstance(self.config, dict) else getattr(self.config, 'settings', {})
         hk = lambda k, d: cfg.get(k, d)
 
+        # Grouped button definitions: (label, tip, hotkey_key, default_hk, slot)
+        # Groups separated by None entries (rendered as vertical dividers)
         self._fmt_btns = [
-            ("**B**", "Bold",           hk("editor_hk_bold",      "Ctrl+B"),         self._fmt_bold),
-            ("*I*",   "Italic",         hk("editor_hk_italic",    "Ctrl+I"),         self._fmt_italic),
-            ("~~S~~", "Strikethrough",  hk("editor_hk_strike",    "Ctrl+Shift+S"),   self._fmt_strike),
-            ("==H==", "Highlight",      hk("editor_hk_highlight", "Ctrl+Shift+H"),   self._fmt_highlight),
-            ("`C`",   "Inline code",    hk("editor_hk_code",      "Ctrl+`"),         self._fmt_code),
-            ("H1",    "Heading 1",      hk("editor_hk_h1",        "Ctrl+1"),         lambda: self._fmt_heading(1)),
-            ("H2",    "Heading 2",      hk("editor_hk_h2",        "Ctrl+2"),         lambda: self._fmt_heading(2)),
-            ("H3",    "Heading 3",      hk("editor_hk_h3",        "Ctrl+3"),         lambda: self._fmt_heading(3)),
-            ("—",     "Em dash",        hk("editor_hk_emdash",    "Ctrl+Shift+Minus"),self._fmt_emdash),
-            ("•",     "Bullet list",    hk("editor_hk_bullet",    "Ctrl+Shift+B"),   self._fmt_bullet),
-            ("1.",    "Numbered list",  hk("editor_hk_numlist",   "Ctrl+Shift+N"),   self._fmt_numlist),
-            ("☐",     "Task list",      hk("editor_hk_tasklist",  "Ctrl+Shift+T"),   self._fmt_tasklist),
+            ("**B**", "Bold",           "editor_hk_bold",      "Ctrl+B",          self._fmt_bold),
+            ("*I*",   "Italic",         "editor_hk_italic",    "Ctrl+I",          self._fmt_italic),
+            ("~~S~~", "Strikethrough",  "editor_hk_strike",    "Ctrl+Shift+S",    self._fmt_strike),
+            ("==H==", "Highlight",      "editor_hk_highlight", "Ctrl+Shift+H",    self._fmt_highlight),
+            None,  # ── group separator ──
+            ("`C`",   "Inline code",    "editor_hk_code",      "Ctrl+`",          self._fmt_code),
+            ("<kbd>", "Keyboard key",   "editor_hk_kbd",       "Ctrl+Shift+K",    self._fmt_kbd),
+            ("🔗",    "Link",           "editor_hk_link",      "Ctrl+K",          self._fmt_link),
+            None,  # ── group separator ──
+            ("H1",    "Heading 1",      "editor_hk_h1",        "Ctrl+1",          lambda: self._fmt_heading(1)),
+            ("H2",    "Heading 2",      "editor_hk_h2",        "Ctrl+2",          lambda: self._fmt_heading(2)),
+            ("H3",    "Heading 3",      "editor_hk_h3",        "Ctrl+3",          lambda: self._fmt_heading(3)),
+            None,  # ── group separator ──
+            ("•",     "Bullet list",    "editor_hk_bullet",    "Ctrl+Shift+B",    self._fmt_bullet),
+            ("1.",    "Numbered list",  "editor_hk_numlist",   "Ctrl+Shift+N",    self._fmt_numlist),
+            ("☐",     "Task list",      "editor_hk_tasklist",  "Ctrl+Shift+T",    self._fmt_tasklist),
         ]
-
-        # Link button — left-click = [text](URL), right-click = [text](clipboard)
-        self._link_btn = QPushButton("🔗")
-        self._link_btn.setFixedSize(36, 28)
-        self._link_btn.setToolTip(
-            "Insert link  [Ctrl+K]\n"
-            "Left-click: [selected](URL)\n"
-            "Right-click or Ctrl+Shift+K: [selected](clipboard URL)")
-        self._link_btn.clicked.connect(self._fmt_link)
-        self._link_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._link_btn.customContextMenuRequested.connect(
-            lambda _: self._fmt_link(use_clipboard=True))
 
         _btn_ss = ("QPushButton{background:#2a2a2a;border:1px solid #444;border-radius:3px;"
                    "color:#ddd;font-size:10pt;}"
                    "QPushButton:hover{background:#0078d7;border-color:#0078d7;color:#fff;}")
-        self._link_btn.setStyleSheet(_btn_ss)
 
-        for label, tip, hotkey, slot in self._fmt_btns:
+        def _sep():
+            ln = QFrame(); ln.setFrameShape(QFrame.Shape.VLine)
+            ln.setStyleSheet("color:#555;"); ln.setFixedWidth(10)
+            return ln
+
+        for entry in self._fmt_btns:
+            if entry is None:
+                fmt_row.addWidget(_sep())
+                fmt_row.addSpacing(2)
+                continue
+            label, tip, hk_key, hk_default, slot = entry
+            hotkey = hk(hk_key, hk_default)
             btn = QPushButton(label)
             btn.setFixedSize(36, 28)
             btn.setToolTip(f"{tip}  [{hotkey}]")
             btn.clicked.connect(slot)
             btn.setStyleSheet(_btn_ss)
+            if label == "🔗":
+                btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                btn.customContextMenuRequested.connect(
+                    lambda _: self._fmt_link(use_clipboard=True))
             fmt_row.addWidget(btn)
-        fmt_row.addWidget(self._link_btn)
 
         fmt_row.addStretch()
 
@@ -2564,6 +2753,14 @@ class WhisperEditor(QWidget):
         btn_row.addWidget(_btn("📋 Copy", "Copy all text to clipboard", self._copy_all))
         btn_row.addStretch()
 
+        self.btn_cheatsheet = _btn(
+            "📖 Cheatsheet",
+            "Show / hide the shortcut cheatsheet panel",
+            self._toggle_cheatsheet)
+        self.btn_cheatsheet.setCheckable(True)
+        btn_row.addWidget(self.btn_cheatsheet)
+        btn_row.addSpacing(20)
+
         self.btn_paste_app = _btn(
             "📤 Paste to App",
             "Paste text back to the previously active application\n"
@@ -2584,6 +2781,39 @@ class WhisperEditor(QWidget):
         root.addLayout(btn_row)
 
     # ── Positioning ───────────────────────────────────────────────────────────
+
+    # ── Cheatsheet ────────────────────────────────────────────────────────────
+
+    def _toggle_cheatsheet(self):
+        """Show or hide the floating cheatsheet window."""
+        if self._cheatsheet and self._cheatsheet.isVisible():
+            self._cheatsheet.hide()
+            self.btn_cheatsheet.setChecked(False)
+        else:
+            if not self._cheatsheet:
+                self._cheatsheet = _CheatsheetWindow(self)
+            self._reposition_cheatsheet()
+            self._cheatsheet.show()
+            self._cheatsheet.raise_()
+            self.btn_cheatsheet.setChecked(True)
+
+    def _reposition_cheatsheet(self):
+        """Position cheatsheet window flush to the right of this editor."""
+        if not self._cheatsheet:
+            return
+        geo = self.frameGeometry()
+        cs_w = max(self.width() // 2, 360)
+        cs_h = self.height()
+        self._cheatsheet.resize(cs_w, cs_h)
+        self._cheatsheet.move(geo.right() + 2, geo.top())
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._reposition_cheatsheet()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reposition_cheatsheet()
 
     def _centre_on_screen(self):
         screen = QApplication.primaryScreen().availableGeometry()
@@ -2622,6 +2852,7 @@ class WhisperEditor(QWidget):
     def _fmt_italic(self):    self._wrap_selection("*")
     def _fmt_strike(self):    self._wrap_selection("~~")
     def _fmt_code(self):      self._wrap_selection("`")
+    def _fmt_kbd(self):       self._wrap_selection("<kbd>", "</kbd>")
     def _fmt_emdash(self):
         cur = self.editor.textCursor(); cur.insertText("—"); self.editor.setTextCursor(cur)
 
@@ -3356,17 +3587,36 @@ class WhisperRApp(QMainWindow):
             self._editor_saved_content: str = ""     # content preserved when remember is on
             # Load persisted editor content from disk (if "remember" was on last session)
             _ed_persist_path = Path(self.config.path).parent / "whisperr_editor.txt"
+            _ed_state_path   = Path(self.config.path).parent / "whisperr_editor_state.json"
             self._editor_persist_path = _ed_persist_path
-            if _ed_persist_path.exists():
+            self._editor_state_path   = _ed_state_path
+            # Load full editor state (content + target + toggles) from JSON if present
+            if _ed_state_path.exists():
+                try:
+                    import json as _json_es
+                    _st = _json_es.loads(_ed_state_path.read_text(encoding="utf-8"))
+                    if _st.get("remember", False):
+                        self._editor_saved_content      = _st.get("content", "")
+                        self._editor_remember           = True
+                        self._editor_clipboard_prefill  = _st.get("clipboard_prefill", False)
+                        self._editor_cb_monitor_was_on  = _st.get("cb_monitor", False)
+                        self._editor_saved_target       = _st.get("target_words", 0)
+                        app_logger.info(
+                            f"Restored editor state: {len(self._editor_saved_content)}ch, "
+                            f"target={self._editor_saved_target}")
+                except Exception as _e:
+                    app_logger.warning(f"Could not restore editor state: {_e}")
+            elif _ed_persist_path.exists():  # legacy txt-only fallback
                 try:
                     _saved = _ed_persist_path.read_text(encoding="utf-8")
                     if _saved:
                         self._editor_saved_content = _saved
                         self._editor_remember = True
-                        app_logger.info(f"Restored editor content ({len(_saved)} chars) from disk")
+                        app_logger.info(f"Restored editor content ({len(_saved)} chars) from legacy txt")
                 except Exception as _e:
                     app_logger.warning(f"Could not restore editor content: {_e}")
             self._editor_clipboard_prefill: bool = False  # prefill with clipboard on open
+            self._editor_saved_target: int = 0            # persisted target word count
             self._editor_return_hwnd = None           # window to restore focus to after paste
             self._cb_monitor_timer: QTimer | None = None  # app-level clipboard monitor
             self._cb_monitor_last: str = ""               # last seen clipboard content
@@ -5392,6 +5642,9 @@ class WhisperRApp(QMainWindow):
         # Restore monitor toggle if it was on (monitor itself already running on app)
         if getattr(self, "_editor_cb_monitor_was_on", False):
             self._editor.clipboard_monitor_toggle.setChecked(True)
+        # Restore target word count
+        if getattr(self, "_editor_saved_target", 0):
+            self._editor.target_spin.setValue(self._editor_saved_target)
         self._editor.paste_requested.connect(self._editor_paste_to_app)
         # Save content when editor is closed/hidden
         self._editor.finished.connect(self._on_editor_closed)
@@ -5404,21 +5657,44 @@ class WhisperRApp(QMainWindow):
         """Save content/state when editor window is closed."""
         if not self._editor:
             return
-        # Save toggle states
+        # Snapshot all toggle states
         self._editor_cb_monitor_was_on = (
             getattr(self._editor, "clipboard_monitor_toggle", None) and
             self._editor.clipboard_monitor_toggle.isChecked())
         self._editor_clipboard_prefill = (
             getattr(self._editor, "clipboard_prefill_toggle", None) and
             self._editor.clipboard_prefill_toggle.isChecked())
+        _remember_on = (getattr(self._editor, "remember_toggle", None) and
+                        self._editor.remember_toggle.isChecked())
         # Persist remember state and content
-        if getattr(self._editor, "remember_toggle", None) and \
-                self._editor.remember_toggle.isChecked():
+        if _remember_on:
             self._editor_saved_content = self._editor.editor.toPlainText()
             self._editor_remember = True
+            self._editor_saved_target = getattr(self._editor, "target_spin",
+                                                None) and self._editor.target_spin.value() or 0
         else:
             self._editor_remember = False
             self._editor_saved_content = ""
+            self._editor_saved_target = 0
+        # Write full state JSON (includes all fields for future expansion)
+        _state_path = getattr(self, "_editor_state_path", None)
+        if _state_path:
+            try:
+                import json as _json_sv
+                _state = {
+                    "remember":        _remember_on,
+                    "content":         self._editor_saved_content,
+                    "target_words":    self._editor_saved_target,
+                    "clipboard_prefill": self._editor_clipboard_prefill,
+                    "cb_monitor":      self._editor_cb_monitor_was_on,
+                }
+                _state_path.write_text(
+                    _json_sv.dumps(_state, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+                if not _remember_on and _state_path.exists():
+                    _state_path.unlink(missing_ok=True)  # clean up when remember off
+            except Exception as _e_sv:
+                app_logger.warning(f"Could not save editor state: {_e_sv}")
         # Keep the editor object alive if clipboard monitor is running —
         # the poll timer needs the reference to keep appending text.
         # Otherwise null it so _open_editor creates a fresh one next time.
@@ -6581,8 +6857,30 @@ class WhisperRApp(QMainWindow):
                     Path(_path).write_text(_content_to_save, encoding="utf-8")
                     app_logger.info(f"Editor content saved to {_path}")
                 elif _path.exists() and not self._editor_remember:
-                    # Remember was turned off — delete the persisted file
                     Path(_path).unlink(missing_ok=True)
+                # Also save full state JSON on exit
+                _sp = getattr(self, "_editor_state_path", None)
+                if _sp:
+                    try:
+                        import json as _json_quit
+                        _target = 0
+                        if self._editor:
+                            _target = self._editor.target_spin.value()
+                        elif hasattr(self, "_editor_saved_target"):
+                            _target = self._editor_saved_target
+                        _rem = self._editor_remember
+                        if _rem:
+                            _sp.write_text(_json_quit.dumps({
+                                "remember": True,
+                                "content":  _content_to_save,
+                                "target_words": _target,
+                                "clipboard_prefill": getattr(self, "_editor_clipboard_prefill", False),
+                                "cb_monitor": getattr(self, "_editor_cb_monitor_was_on", False),
+                            }, ensure_ascii=False, indent=2), encoding="utf-8")
+                        elif _sp.exists():
+                            _sp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
         except Exception as _e:
             app_logger.warning(f"Could not save editor content: {_e}")
         QApplication.instance().quit()
