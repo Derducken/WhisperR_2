@@ -873,7 +873,7 @@ class AppConfig:
             "editor_hk_h1":        "Ctrl+1",  "editor_hk_h2":        "Ctrl+2",
             "editor_hk_h3":        "Ctrl+3",  "editor_hk_emdash":    "Ctrl+Shift+Minus",
             "editor_hk_bullet":    "Ctrl+Shift+B", "editor_hk_numlist": "Ctrl+Shift+N",
-            "editor_hk_tasklist":  "Ctrl+Shift+T", "editor_hk_kbd":     "Ctrl+Shift+K",
+            "editor_hk_tasklist":  "Ctrl+Shift+T", "editor_hk_kbd":     "Ctrl+Shift+D",
             "editor_hk_link":    "Ctrl+K",
             "sendkeys_trigger":   "whisper send keys",
             "select_trigger":     "whisper select",
@@ -2470,7 +2470,7 @@ class _CheatsheetWindow(QWidget):
             (hk("editor_hk_strike",    "Ctrl+Shift+S"),    "Strikethrough  ~~text~~"),
             (hk("editor_hk_highlight", "Ctrl+Shift+H"),    "Highlight  ==text=="),
             (hk("editor_hk_code",      "Ctrl+`"),          "Inline code  `text`"),
-            (hk("editor_hk_kbd",       "Ctrl+Shift+K"),    "Keyboard key  <kbd>text</kbd>"),
+            (hk("editor_hk_kbd",       "Ctrl+Shift+D"),    "Keyboard key  <kbd>text</kbd>"),
             (hk("editor_hk_link",      "Ctrl+K"),          "Link  [text](url)"),
             ("Right-click 🔗",                              "Link with clipboard URL"),
             (hk("editor_hk_h1",        "Ctrl+1"),          "Heading 1  # text"),
@@ -2515,7 +2515,10 @@ class _CheatsheetWindow(QWidget):
         # ── Section 4: Terms ──────────────────────────────────────────────────
         terms = settings.get("terms", {})
         if terms:
-            term_rows = [(phrase, "(→ replacement)") for phrase in terms]
+            def _fmt_repl(r):
+                r = str(r)
+                return (r[:47] + "…") if len(r) > 50 else r
+            term_rows = [(phrase, f"→ {_fmt_repl(repl)}") for phrase, repl in terms.items()]
             _section("📝  Terms  (say to substitute)", term_rows)
 
         lay.addStretch()
@@ -2659,7 +2662,7 @@ class WhisperEditor(QWidget):
             ("==H==", "Highlight",      "editor_hk_highlight", "Ctrl+Shift+H",    self._fmt_highlight),
             None,  # ── group separator ──
             ("`C`",   "Inline code",    "editor_hk_code",      "Ctrl+`",          self._fmt_code),
-            ("<kbd>", "Keyboard key",   "editor_hk_kbd",       "Ctrl+Shift+K",    self._fmt_kbd),
+            ("<kbd>", "Keyboard key",   "editor_hk_kbd",       "Ctrl+Shift+D",    self._fmt_kbd),
             ("🔗",    "Link",           "editor_hk_link",      "Ctrl+K",          self._fmt_link),
             None,  # ── group separator ──
             ("H1",    "Heading 1",      "editor_hk_h1",        "Ctrl+1",          lambda: self._fmt_heading(1)),
@@ -2955,6 +2958,7 @@ class WhisperEditor(QWidget):
             (cfg.get("editor_hk_bullet",    "Ctrl+Shift+B"),    self._fmt_bullet),
             (cfg.get("editor_hk_numlist",   "Ctrl+Shift+N"),    self._fmt_numlist),
             (cfg.get("editor_hk_tasklist",  "Ctrl+Shift+T"),    self._fmt_tasklist),
+            (cfg.get("editor_hk_kbd",       "Ctrl+Shift+D"),    self._fmt_kbd),
             (cfg.get("editor_hk_link",      "Ctrl+K"),          self._fmt_link),
             ("Ctrl+Shift+K",                                     lambda: self._fmt_link(use_clipboard=True)),
         ]
@@ -3240,7 +3244,8 @@ class WhisperEditor(QWidget):
                 for hk_str in _hotkeys_to_suppress:
                     if not hk_str:
                         continue
-                    parts = [p.strip().lower() for p in hk_str.split("+")]
+                    # Strip pynput angle-bracket format: <ctrl> → ctrl
+                    parts = [p.strip().lower().strip("<>") for p in hk_str.split("+")]
                     expected_mods = _MOD.NoModifier
                     expected_key  = None
                     for part in parts:
@@ -5533,8 +5538,16 @@ class WhisperRApp(QMainWindow):
                         except Exception:
                             return ""
 
-                    # Step 1: save current clipboard
-                    _clip_before = _cb_read()
+                    # Step 1: clear clipboard, then record the (now-empty) state
+                    # This ensures identical re-selections are detected as a change.
+                    try:
+                        import pyperclip as _pcp_clr
+                        _pcp_clr.copy("")
+                        _t_fc.sleep(0.03)
+                    except Exception:
+                        pass
+                    _clip_before = ""   # clipboard is now empty
+                    _clip_original = _cb_read()  # should be "" but keep for safety
                     _fg_now      = _u32.GetForegroundWindow()
                     _src_hwnd    = getattr(self, "_pre_rec_hwnd", None) or 0
                     app_logger.info(
@@ -6940,19 +6953,39 @@ class WhisperRApp(QMainWindow):
         is called instead of this method.
         """
         if self._editor and self._editor.isVisible():
-            # Save content if remember is on
+            # Save content and full state if remember is on
             if getattr(self._editor, "remember_toggle", None) and \
                     self._editor.remember_toggle.isChecked():
                 self._editor_saved_content = self._editor.editor.toPlainText()
                 self._editor_remember = True
+                self._editor_saved_target = self._editor.target_spin.value()
             else:
                 self._editor_remember = False
                 self._editor_saved_content = ""
+                self._editor_saved_target = 0
             # Save monitor toggle state — monitor keeps running after hide
             self._editor_cb_monitor_was_on = (
                 getattr(self._editor, "clipboard_monitor_toggle", None) and
                 self._editor.clipboard_monitor_toggle.isChecked())
+            # Persist to disk so state survives app restart too
+            _sp = getattr(self, "_editor_state_path", None)
+            if _sp and self._editor_remember:
+                try:
+                    import json as _json_tew
+                    _sp.write_text(_json_tew.dumps({
+                        "remember": True,
+                        "content":  self._editor_saved_content,
+                        "target_words": self._editor_saved_target,
+                        "clipboard_prefill": getattr(self, "_editor_clipboard_prefill", False),
+                        "cb_monitor": self._editor_cb_monitor_was_on,
+                    }, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
             self._editor.hide()
+            # Also hide cheatsheet when editor hides
+            if getattr(self._editor, "_cheatsheet", None) and \
+                    self._editor._cheatsheet.isVisible():
+                self._editor._cheatsheet.hide()
         else:
             # Restore or open fresh
             prefill = self._editor_saved_content if self._editor_remember else ""
@@ -6960,26 +6993,29 @@ class WhisperRApp(QMainWindow):
             # Restore remember toggle state
             if self._editor and self._editor_remember:
                 self._editor.remember_toggle.setChecked(True)
+            # Re-show cheatsheet if it was open before
+            if (self._editor and
+                    getattr(self._editor, "_cheatsheet", None) and
+                    getattr(self._editor, "btn_cheatsheet", None) and
+                    self._editor.btn_cheatsheet.isChecked()):
+                self._editor._cheatsheet.show()
+                self._editor._reposition_cheatsheet()
     
     def normalize_hotkey(self, hotkey_str):
-        """Convert our hotkey format to pynput format"""
-        # Our format: "ctrl+shift+w"
-        # pynput format: "<ctrl>+<shift>+w"
-        
-        parts = hotkey_str.lower().split('+')
+        """Convert our hotkey format to pynput format.
+
+        Our format : "ctrl+shift+w"
+        pynput format: "<ctrl>+<shift>+w"
+        """
+        parts = [p.strip().lower() for p in hotkey_str.lower().split('+')]
         normalized = []
-        
         for part in parts:
-            part = part.strip()
             if part in ['ctrl', 'shift', 'alt', 'cmd', 'win']:
                 normalized.append(f'<{part}>')
+            elif part.startswith('f') and len(part) > 1 and part[1:].isdigit():
+                normalized.append(f'<{part}>')
             else:
-                # Check if it's a function key
-                if part.startswith('f') and len(part) > 1 and part[1:].isdigit():
-                    normalized.append(f'<{part}>')
-                else:
-                    normalized.append(part)
-        
+                normalized.append(part)
         result = '+'.join(normalized)
         app_logger.debug(f"Normalized hotkey '{hotkey_str}' to '{result}'")
         return result
