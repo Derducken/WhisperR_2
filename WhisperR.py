@@ -863,7 +863,7 @@ class AppConfig:
             "ft_output_folder": str(Path.home() / "WhisperR_Output"),
             "ft_mon_folder": str(Path.home() / "WhisperR_Watch"),
             "ft_mon_enabled": False,
-            "use_confidence": True, "min_confidence": 0.9,
+            "use_confidence": True, "min_confidence": 0.5,
             "editor_type_trigger":  "whisper type, whisper write",
             "editor_edit_trigger":  "whisper edit, whisper edit this",
             "editor_paste_trigger": "whisper paste, whisper done, whisper okay",
@@ -4161,11 +4161,12 @@ class WhisperRApp(QMainWindow):
             value=self.config.settings.get("min_confidence", 0.5), decimals=2,
             use_slider=True, spin_width=70)
         self.cfg_conf_spin.setToolTip(
-            "Filters out low-confidence segments based on Whisper's avg_logprob score.\n"
-            "Formula: segment kept if avg_logprob >= -(1 - min_confidence)\n"
-            "  0.0 = keep everything   0.5 = threshold -0.5   0.9 = threshold -0.1\n"
-            "Real speech typically scores between -0.1 (clear) and -0.6 (noisy).\n"
-            "Recommended: 0.4-0.6 for most use cases. 0.9 is very strict."
+            "Drop segments where Whisper is less than X% confident.\n"
+            "0.50 = keep if Whisper is ≥50% sure (threshold logprob -0.693)\n"
+            "0.90 = keep only clear speech    (threshold logprob -0.105)\n"
+            "0.00 = disabled (keep everything)\n"
+            "Typical real speech: logprob -0.1 (clear) to -0.6 (noisy).\n"
+            "Recommended starting point: 0.30 – 0.50."
         )
         ai_layout.addRow("Min. Confidence (0-1):", self.cfg_conf_spin)
 
@@ -6736,7 +6737,10 @@ class WhisperRApp(QMainWindow):
                 if self.config.settings.get("use_confidence", False):
                     _mc  = float(self.config.settings.get("min_confidence", 0.0))
                     if _mc > 0.0:
-                        _thr = -_mc
+                        import math as _math_cf
+                        # mc is a probability (0-1); convert to logprob threshold.
+                        # threshold = ln(mc), so mc=0.50 → -0.693, mc=0.90 → -0.105.
+                        _thr = _math_cf.log(max(_mc, 1e-9))
                         _seg_data = getattr(self.transcriber, "_last_seg_data", [])
                         if _seg_data:
                             _kept = [st for st, slp in _seg_data if slp >= _thr]
