@@ -902,6 +902,10 @@ class AppConfig:
                 with open(self.path, 'r', encoding='utf-8') as f:
                     loaded = json.load(f)
                     self.settings.update(loaded)
+                # ── Config migrations ──────────────────────────────────
+                # v2.0.6: editor_hk_kbd Ctrl+Shift+K → Ctrl+Shift+D
+                if self.settings.get("editor_hk_kbd","") == "Ctrl+Shift+K":
+                    self.settings["editor_hk_kbd"] = "Ctrl+Shift+D"
                 app_logger.info("Configuration loaded successfully")
             except Exception as e:
                 app_logger.error(f"Failed to load config: {e}")
@@ -2328,7 +2332,8 @@ class _HotkeyFilteredTextEdit(QTextEdit):
                 for hk_str in _hotkeys:
                     if not hk_str:
                         continue
-                    parts = [p.strip().lower() for p in hk_str.split("+")]
+                    # Strip pynput angle-bracket format <ctrl> → ctrl
+                    parts = [p.strip().lower().strip("<>") for p in hk_str.split("+")]
                     exp_mods = _MOD.NoModifier
                     exp_key  = None
                     for part in parts:
@@ -2358,8 +2363,7 @@ class _CheatsheetWindow(QWidget):
 
     def __init__(self, editor: "WhisperEditor"):
         super().__init__(editor,
-                         Qt.WindowType.Window |
-                         Qt.WindowType.WindowStaysOnTopHint)
+                         Qt.WindowType.Window)
         self.setWindowTitle("Cheatsheet")
         self._editor = editor
         self._build_ui()
@@ -2544,8 +2548,7 @@ class WhisperEditor(QWidget):
 
     def __init__(self, initial_text="", config=None, parent=None):
         super().__init__(parent,
-                         Qt.WindowType.Window |
-                         Qt.WindowType.WindowStaysOnTopHint)
+                         Qt.WindowType.Window)
         self.setWindowTitle("WhisperR Editor")
         self.config = config or {}
         self._hotkeys_active = []   # keyboard listener handles registered here
@@ -2974,20 +2977,21 @@ class WhisperEditor(QWidget):
     # ── Voice operations (called from WhisperRApp.on_text) ────────────────────
 
     def append_text(self, text: str):
-        """Insert dictated text, replacing any current selection.
+        """Insert dictated text at the current cursor position.
 
-        If text is selected, the selection is replaced (like normal typing).
-        If no selection, text is appended after a space if needed.
+        - If text is selected, the selection is replaced.
+        - If cursor is at end of non-empty, non-newline text, a space is prepended.
+        - Otherwise text is inserted exactly at the cursor.
         """
         cur = self.editor.textCursor()
         if cur.hasSelection():
-            # Replace selection — no leading space needed
             cur.insertText(text)
         else:
-            existing = self.editor.toPlainText()
-            if existing and not existing.endswith(" ") and not existing.endswith("\n"):
+            # Peek at the character immediately before the cursor
+            pos = cur.position()
+            doc_text = self.editor.toPlainText()
+            if pos > 0 and doc_text[pos - 1] not in (" ", "\n", "\t"):
                 text = " " + text
-            cur.movePosition(cur.MoveOperation.End)
             cur.insertText(text)
         self.editor.setTextCursor(cur)
         self.editor.ensureCursorVisible()
@@ -3168,7 +3172,8 @@ class WhisperEditor(QWidget):
                     for hk_str in _hotkeys:
                         if not hk_str:
                             continue
-                        parts = [p.strip().lower() for p in hk_str.split("+")]
+                        # Strip pynput angle-bracket format <ctrl> → ctrl
+                        parts = [p.strip().lower().strip("<>") for p in hk_str.split("+")]
                         exp_mods = _MOD.NoModifier
                         exp_key  = None
                         for part in parts:
@@ -3180,7 +3185,7 @@ class WhisperEditor(QWidget):
                             # If this is the rollback hotkey AND it's a KeyPress,
                             # trigger undo in the editor instead of ignoring it.
                             _rk = cfg.settings.get("rollback_hotkey", "")
-                            _rk_parts = [p.strip().lower() for p in _rk.split("+")]
+                            _rk_parts = [p.strip().lower().strip("<>") for p in _rk.split("+")]
                             _rk_mods = _MOD.NoModifier
                             _rk_key  = None
                             for _p in _rk_parts:
@@ -3626,6 +3631,7 @@ class WhisperRApp(QMainWindow):
             self._cb_monitor_timer: QTimer | None = None  # app-level clipboard monitor
             self._cb_monitor_last: str = ""               # last seen clipboard content
             self._editor_cb_monitor_was_on: bool = False  # persists monitor toggle state
+            self._editor_cheatsheet_open: bool = False  # persists cheatsheet visibility
             # ── Wizard state ──────────────────────────────────────────
             # When a multi-step voice command is active, _wizard holds:
             #   op       : str   — "select"|"move"|"movebefore"|"moveafter"|
@@ -4668,6 +4674,36 @@ class WhisperRApp(QMainWindow):
     # ── Terms import/export ──────────────────────────────────────────────────
     # File format: one entry per line, key and value separated by " = "
     # e.g.:  hexagon software = Hexagon Software
+    def _autosave_data(self):
+        """Sync live UI tables into config and persist to disk immediately.
+        Called after any mutation of terms, hallucinations, commands, or prompt
+        so changes are never lost even if the user closes without clicking Save.
+        """
+        try:
+            self.config.settings["terms"] = {
+                self.terms_table.item(r, 0).text(): self.terms_table.item(r, 1).text()
+                for r in range(self.terms_table.rowCount())
+                if self.terms_table.item(r, 0) and self.terms_table.item(r, 1)
+                and self.terms_table.item(r, 0).text()
+            }
+            self.config.settings["hallucinations"] = [
+                self.hall_list.item(i).text()
+                for i in range(self.hall_list.count())
+                if self.hall_list.item(i).text().strip()
+            ]
+            cmds = {}
+            for r in range(self.cmd_table.rowCount()):
+                pi = self.cmd_table.item(r, 0)
+                ci = self.cmd_table.item(r, 1)
+                if pi and ci and pi.text().strip():
+                    cmds[pi.text().strip()] = ci.text().strip()
+            self.config.settings["commands"] = cmds
+            self.config.settings["initial_prompt"] = self.prompt_edit.toPlainText()
+            self.config.save()
+            app_logger.debug("_autosave_data: saved terms/hall/cmds/prompt")
+        except Exception as _e:
+            app_logger.warning(f"_autosave_data failed: {_e}")
+
     def _import_terms(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import Terms", "", "Text Files (*.txt)")
         if not path:
@@ -4682,6 +4718,7 @@ class WhisperRApp(QMainWindow):
                     self.terms_table.insertRow(r)
                     self.terms_table.setItem(r, 0, QTableWidgetItem(k.strip()))
                     self.terms_table.setItem(r, 1, QTableWidgetItem(v.strip()))
+            self._autosave_data()
             app_logger.info(f"Terms imported from {path}")
         except Exception as e:
             app_logger.error(f"Failed to import terms: {e}")
@@ -4717,6 +4754,7 @@ class WhisperRApp(QMainWindow):
                     self.cmd_table.insertRow(r)
                     self.cmd_table.setItem(r, 0, QTableWidgetItem(k.strip()))
                     self.cmd_table.setItem(r, 1, QTableWidgetItem(v.strip()))
+            self._autosave_data()
             app_logger.info(f"Commands imported from {path}")
         except Exception as e:
             app_logger.error(f"Failed to import commands: {e}")
@@ -4755,6 +4793,7 @@ class WhisperRApp(QMainWindow):
             "Enter phrase (case-insensitive substring to block):")
         if ok and text.strip():
             self.hall_list.addItem(QListWidgetItem(text.strip()))
+            self._autosave_data()
 
     def _hall_edit(self):
         """Edit the currently selected hallucination phrase in-place."""
@@ -4772,6 +4811,7 @@ class WhisperRApp(QMainWindow):
         """Delete all selected hallucination phrases."""
         for item in self.hall_list.selectedItems():
             self.hall_list.takeItem(self.hall_list.row(item))
+        self._autosave_data()
 
     def _hall_import(self):
         """Import hallucination phrases from a .txt file (one phrase per line).
@@ -4795,6 +4835,7 @@ class WhisperRApp(QMainWindow):
                     self.hall_list.addItem(QListWidgetItem(phrase))
                     existing.add(phrase.lower())
                     added += 1
+            self._autosave_data()
             app_logger.info(f"Hallucinations: imported {added} phrase(s) from {path}")
             self.scratchpad.append(f"[Hallucinations] Imported {added} phrase(s).")
         except Exception as e:
@@ -5087,6 +5128,14 @@ class WhisperRApp(QMainWindow):
         if self.recorder and self.recorder.active:
             app_logger.info("toggle_rec: Stopping dictation")
             self.recorder.active = False
+            # Disconnect speech_active so the dying thread cannot
+            # re-light the recording indicator after we stop.
+            # data_ready stays connected so any already-buffered
+            # audio is still submitted and transcribed.
+            try:
+                self.recorder.speech_active.disconnect(self._on_speech_active)
+            except Exception:
+                pass
             self.btn_toggle.setText("Start Dictation")
             self._is_listening  = False
             self._speech_active = False
@@ -5128,7 +5177,8 @@ class WhisperRApp(QMainWindow):
             self.recorder = AudioRecorder(self.config)
             app_logger.debug(f"toggle_rec: AudioRecorder created, id={id(self.recorder)}")
             
-            self.recorder.data_ready.connect(lambda d: self.transcriber.submit(d, "live"))
+            self.recorder.data_ready.connect(
+                lambda d: self.transcriber.submit(d, "live"))
             app_logger.debug("toggle_rec: data_ready signal connected")
             
             # FIX: Debounce speech_active signal to prevent rapid mic icon flickering.
@@ -5153,6 +5203,10 @@ class WhisperRApp(QMainWindow):
     
     def _on_speech_active(self, active):
         app_logger.debug(f"→ _on_speech_active: active={active}")
+        # Ignore spurious signals from a recorder that fired just
+        # before its signals were disconnected.
+        if not getattr(self, "_is_listening", False):
+            return
         if active != self._speech_active:
             self._speech_active = active
             self._update_app_state()
@@ -5658,6 +5712,17 @@ class WhisperRApp(QMainWindow):
         # Restore target word count
         if getattr(self, "_editor_saved_target", 0):
             self._editor.target_spin.setValue(self._editor_saved_target)
+        # Restore cheatsheet visibility from last session
+        if getattr(self, "_editor_cheatsheet_open", False):
+            _cs3 = getattr(self._editor, "_cheatsheet", None)
+            _btn3 = getattr(self._editor, "btn_cheatsheet", None)
+            if _cs3 is None and _btn3 is not None:
+                self._editor._toggle_cheatsheet()
+            elif _cs3 is not None and not _cs3.isVisible():
+                _cs3.show()
+                self._editor._reposition_cheatsheet()
+            if _btn3 is not None:
+                _btn3.setChecked(True)
         self._editor.paste_requested.connect(self._editor_paste_to_app)
         # Save content when editor is closed/hidden
         self._editor.finished.connect(self._on_editor_closed)
@@ -5679,33 +5744,36 @@ class WhisperRApp(QMainWindow):
             self._editor.clipboard_prefill_toggle.isChecked())
         _remember_on = (getattr(self._editor, "remember_toggle", None) and
                         self._editor.remember_toggle.isChecked())
-        # Persist remember state and content
+        # Persist state — only when "remember content" is on
         if _remember_on:
+            _ts = getattr(self._editor, "target_spin", None)
+            if _ts: _ts.interpretText()  # commit any uncommitted typed value
+            self._editor_saved_target = _ts.value() if _ts else 0
             self._editor_saved_content = self._editor.editor.toPlainText()
             self._editor_remember = True
-            self._editor_saved_target = getattr(self._editor, "target_spin",
-                                                None) and self._editor.target_spin.value() or 0
         else:
             self._editor_remember = False
             self._editor_saved_content = ""
             self._editor_saved_target = 0
-        # Write full state JSON (includes all fields for future expansion)
+        # Write / delete state JSON
         _state_path = getattr(self, "_editor_state_path", None)
         if _state_path:
             try:
-                import json as _json_sv
-                _state = {
-                    "remember":        _remember_on,
-                    "content":         self._editor_saved_content,
-                    "target_words":    self._editor_saved_target,
-                    "clipboard_prefill": self._editor_clipboard_prefill,
-                    "cb_monitor":      self._editor_cb_monitor_was_on,
-                }
-                _state_path.write_text(
-                    _json_sv.dumps(_state, ensure_ascii=False, indent=2),
-                    encoding="utf-8")
-                if not _remember_on and _state_path.exists():
-                    _state_path.unlink(missing_ok=True)  # clean up when remember off
+                if _remember_on:
+                    import json as _json_sv
+                    _state = {
+                        "remember":        True,
+                        "content":         self._editor_saved_content,
+                        "target_words":    self._editor_saved_target,
+                        "clipboard_prefill": self._editor_clipboard_prefill,
+                        "cb_monitor":      self._editor_cb_monitor_was_on,
+                    }
+                    _state_path.write_text(
+                        _json_sv.dumps(_state, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+                else:
+                    if _state_path.exists():
+                        _state_path.unlink(missing_ok=True)
             except Exception as _e_sv:
                 app_logger.warning(f"Could not save editor state: {_e_sv}")
         # Keep the editor object alive if clipboard monitor is running —
@@ -6638,10 +6706,29 @@ class WhisperRApp(QMainWindow):
                     text = text[0].lower() + text[1:]
                     self._rollback_pending = False
                     self._cursor_ops_pending = False
-                # ── If editor is open, append text there instead of pasting ──
+                # ── If editor is open AND focused, append text there ──────
+                # If the user has clicked away to another app, fall through
+                # to the normal paste path so text lands in that app.
                 if self._editor and self._editor.isVisible():
-                    self._editor.append_text(text)
-                    return
+                    try:
+                        import ctypes as _ct_ed
+                        _fg_ed = _ct_ed.windll.user32.GetForegroundWindow()
+                        _own_ed = int(self._editor.winId())
+                        _main_ed = int(self.winId())
+                        _ed_has_focus = (_fg_ed in (_own_ed, _main_ed))
+                        # Also check cheatsheet window
+                        _cs_ed = getattr(self._editor, "_cheatsheet", None)
+                        if _cs_ed and not _ed_has_focus:
+                            try:
+                                _ed_has_focus = (_fg_ed == int(_cs_ed.winId()))
+                            except Exception:
+                                pass
+                    except Exception:
+                        _ed_has_focus = True  # safe fallback
+                    if _ed_has_focus:
+                        self._editor.append_text(text)
+                        return
+                    # Editor open but another app is focused — fall through to paste
 
                 # ── Confidence gate (paste path only) ────────────────────
                 # Triggers / commands / wizard have already fired above, so
@@ -6958,6 +7045,7 @@ class WhisperRApp(QMainWindow):
                     self._editor.remember_toggle.isChecked():
                 self._editor_saved_content = self._editor.editor.toPlainText()
                 self._editor_remember = True
+                self._editor.target_spin.interpretText()
                 self._editor_saved_target = self._editor.target_spin.value()
             else:
                 self._editor_remember = False
@@ -6981,11 +7069,17 @@ class WhisperRApp(QMainWindow):
                     }, ensure_ascii=False, indent=2), encoding="utf-8")
                 except Exception:
                     pass
+            # Remember cheatsheet open state before hiding
+            _cs = getattr(self._editor, "_cheatsheet", None)
+            _cs_btn = getattr(self._editor, "btn_cheatsheet", None)
+            self._editor_cheatsheet_open = bool(
+                _cs and _cs.isVisible() or
+                _cs_btn and _cs_btn.isChecked()
+            )
             self._editor.hide()
             # Also hide cheatsheet when editor hides
-            if getattr(self._editor, "_cheatsheet", None) and \
-                    self._editor._cheatsheet.isVisible():
-                self._editor._cheatsheet.hide()
+            if _cs and _cs.isVisible():
+                _cs.hide()
         else:
             # Restore or open fresh
             prefill = self._editor_saved_content if self._editor_remember else ""
@@ -6993,13 +7087,18 @@ class WhisperRApp(QMainWindow):
             # Restore remember toggle state
             if self._editor and self._editor_remember:
                 self._editor.remember_toggle.setChecked(True)
-            # Re-show cheatsheet if it was open before
-            if (self._editor and
-                    getattr(self._editor, "_cheatsheet", None) and
-                    getattr(self._editor, "btn_cheatsheet", None) and
-                    self._editor.btn_cheatsheet.isChecked()):
-                self._editor._cheatsheet.show()
-                self._editor._reposition_cheatsheet()
+            # Re-show cheatsheet if it was open in last session
+            if self._editor and getattr(self, "_editor_cheatsheet_open", False):
+                _cs2 = getattr(self._editor, "_cheatsheet", None)
+                _btn2 = getattr(self._editor, "btn_cheatsheet", None)
+                if _cs2 is None and _btn2 is not None:
+                    # Cheatsheet destroyed when editor was closed; recreate
+                    self._editor._toggle_cheatsheet()
+                elif _cs2 is not None and not _cs2.isVisible():
+                    _cs2.show()
+                    self._editor._reposition_cheatsheet()
+                if _btn2 is not None:
+                    _btn2.setChecked(True)
     
     def normalize_hotkey(self, hotkey_str):
         """Convert our hotkey format to pynput format.
