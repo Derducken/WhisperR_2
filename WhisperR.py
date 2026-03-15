@@ -133,6 +133,60 @@ def _ai_worker_process(task_q, result_q, log_q):
                 except Exception:
                     pass
 
+    # ── Pre-emptive cuDNN sub-library handling ──────────────────────────
+    # PyInstaller's frozen import hook loads ALL collected DLLs for a package
+    # the moment it is imported — before any Python code in that package runs.
+    # cudnn_adv64_9.dll etc. are collected into _internal/ctranslate2/ but on
+    # machines with no NVIDIA driver they fail to load, crashing the import.
+    # Fix: try to pre-load them from the nvidia pip package (GPU path); if
+    # that fails (no GPU), temporarily rename the bundle copies so the hook
+    # skips them, then ctranslate2 falls back to CPU cleanly.
+    _cudnn_sub_dlls = [
+        "cudnn_adv64_9.dll", "cudnn_cnn64_9.dll", "cudnn_ops64_9.dll",
+        "cudnn_engines_precompiled64_9.dll", "cudnn_engines_runtime_compiled64_9.dll",
+        "cudnn_graph64_9.dll", "cudnn_heuristic64_9.dll",
+    ]
+    if os.name == "nt":
+        import ctypes as _ct_pre
+        _base_pre = os.path.dirname(sys.executable)
+        _int_pre  = os.path.join(_base_pre, "_internal")
+        _ct2_pre  = os.path.join(_int_pre, "ctranslate2")
+        # Build search path: nvidia pip package bin dirs first
+        _nv_bins = []
+        for _pyroot in [os.path.dirname(os.path.dirname(sys.executable)),
+                        r"C:\Python312", r"C:\Python311"]:
+            _nv = os.path.join(_pyroot, "Lib", "site-packages", "nvidia")
+            if os.path.isdir(_nv):
+                for _pkg in os.listdir(_nv):
+                    _bin = os.path.join(_nv, _pkg, "bin")
+                    if os.path.isdir(_bin):
+                        _nv_bins.append(_bin)
+        _gpu_ok = False
+        for _dll in _cudnn_sub_dlls:
+            for _d in _nv_bins:
+                _fp = os.path.join(_d, _dll)
+                if os.path.isfile(_fp):
+                    try:
+                        _ct_pre.CDLL(_fp)
+                        _gpu_ok = True
+                    except Exception:
+                        pass
+                    break
+        if not _gpu_ok:
+            # No GPU driver found — rename bundle copies so PyInstaller hook skips them
+            _renamed_pre = []
+            for _dll in _cudnn_sub_dlls:
+                _fp = os.path.join(_ct2_pre, _dll)
+                if os.path.isfile(_fp):
+                    try:
+                        os.rename(_fp, _fp + ".disabled")
+                        _renamed_pre.append(_dll)
+                    except Exception:
+                        pass
+            if _renamed_pre:
+                _log(f"  No GPU driver — disabled cuDNN sub-DLLs: {_renamed_pre}")
+            os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
     _log(f"AI worker process started (pid={os.getpid()})")
 
     # Enable faulthandler so crashes write a traceback to stderr
@@ -394,8 +448,28 @@ def _ai_worker_process(task_q, result_q, log_q):
                 _log("faster_whisper imported OK")
             except Exception as e:
                 _log(f"Import error: {type(e).__name__}: {e}")
-                result_q.put(('status', False))
-                continue
+                # ctranslate2 fails on machines with no NVIDIA GPU because
+                # cudnn_adv64_9.dll loads but its sub-dependencies cannot be
+                # satisfied without a working CUDA stack. Retry with CUDA
+                # hidden — ctranslate2 skips all CUDA DLL loading and uses
+                # its pure CPU backend instead.
+                _log("Retrying import with CUDA disabled (CPU-only fallback)...")
+                try:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+                    os.environ["CT2_CUDA_ALLOW_FP16"] = "0"
+                    import sys as _sys_retry
+                    for _mod in list(_sys_retry.modules.keys()):
+                        if "ctranslate2" in _mod or "faster_whisper" in _mod:
+                            del _sys_retry.modules[_mod]
+                    import ctranslate2 as _ct2
+                    _log(f"ctranslate2 {_ct2.__version__} imported OK (CPU-only)")
+                    from faster_whisper import WhisperModel
+                    _log("faster_whisper imported OK (CPU-only)")
+                    compute_pref = "cpu"
+                except Exception as e2:
+                    _log(f"Import error (CPU retry): {type(e2).__name__}: {e2}")
+                    result_q.put(('status', False))
+                    continue
 
         # Load model if needed
         need_load = (
@@ -438,7 +512,9 @@ def _ai_worker_process(task_q, result_q, log_q):
                     else:
                         _log(f"  No snapshots, using name")
                 else:
-                    _log(f"  Not cached, will download")
+                    _log(f"  Not cached: {_repo_dir} — download will be attempted")
+                    # Don't force local_files_only — let WhisperModel download it
+                    _model_path = model_name
             except Exception as _hfe:
                 _log(f"  Path resolve failed: {_hfe}")
 
@@ -472,7 +548,7 @@ def _ai_worker_process(task_q, result_q, log_q):
                                 cpu_threads=4,
                                 num_workers=1,
                                 download_root=None,
-                                local_files_only=True,
+                                local_files_only=os.path.isdir(str(_model_path)),
                             )
                             current_model_name = model_name
                             current_language = lang_code
@@ -509,16 +585,23 @@ def _ai_worker_process(task_q, result_q, log_q):
                 _files_in_model = sorted(os.listdir(_model_path)) if os.path.isdir(_model_path) else []
                 _log(f"  model files: {_files_in_model}")
 
+                _local_only = os.path.isdir(str(_model_path))
+                if not _local_only:
+                    # Model not in local cache — allow download;
+                    # clear offline env vars set earlier
+                    os.environ.pop("HF_HUB_OFFLINE", None)
+                    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+                    os.environ.pop("HF_DATASETS_OFFLINE", None)
                 for ctype in ('float32', 'int8'):
                     try:
-                        _log(f"  Trying CPU {ctype}...")
+                        _log(f"  Trying CPU {ctype} (local_only={_local_only})...")
                         model = WhisperModel(
                             _model_path, device="cpu",
                             compute_type=ctype,
                             cpu_threads=4,
                             num_workers=1,
                             download_root=None,
-                            local_files_only=True,
+                            local_files_only=_local_only,
                         )
                         current_model_name = model_name
                         current_language = lang_code
@@ -736,8 +819,13 @@ HALLUCINATIONS = [
 ]
 
 DARK_STYLE = """
-QMainWindow, QDialog, QScrollArea, QTabWidget { background-color: #121212; }
-QWidget { color: #e0e0e0; font-family: 'Segoe UI'; font-size: 9pt; }
+QMainWindow, QDialog, QScrollArea, QTabWidget, QTabBar, QStackedWidget { background-color: #121212; }
+QWidget { background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI'; font-size: 9pt; }
+QFrame { background-color: #121212; }
+QScrollArea > QWidget > QWidget { background-color: #121212; }
+QTabBar::tab { background-color: #1e1e1e; color: #ccc; padding: 6px 14px; border: 1px solid #333; border-bottom: none; border-radius: 3px 3px 0 0; }
+QTabBar::tab:selected { background-color: #0078d7; color: #fff; }
+QTabBar::tab:hover { background-color: #2a2a2a; }
 QTextEdit { background-color: #1e1e1e; border: 1px solid #333; color: #fff; border-radius: 4px; }
 QPushButton { background-color: #2a2a2a; border: 1px solid #444; padding: 6px; border-radius: 4px; }
 QPushButton:hover { background-color: #353535; border: 1px solid #0078d7; }
@@ -7591,6 +7679,25 @@ if __name__ == "__main__":
         app_logger.debug("✓ setQuitOnLastWindowClosed(False) set")
         
         app_logger.debug("→ Applying dark stylesheet...")
+        # Force dark palette so Windows system theme doesn't
+        # inject white backgrounds into native controls
+        from PyQt6.QtGui import QPalette, QColor as _QColor
+        _pal = QPalette()
+        _dark  = _QColor("#121212")
+        _mid   = _QColor("#1e1e1e")
+        _light = _QColor("#e0e0e0")
+        _acc   = _QColor("#0078d7")
+        for _role in (QPalette.ColorRole.Window, QPalette.ColorRole.Base,
+                      QPalette.ColorRole.AlternateBase, QPalette.ColorRole.ToolTipBase):
+            _pal.setColor(_role, _dark)
+        for _role in (QPalette.ColorRole.Text, QPalette.ColorRole.WindowText,
+                      QPalette.ColorRole.ButtonText, QPalette.ColorRole.ToolTipText,
+                      QPalette.ColorRole.BrightText):
+            _pal.setColor(_role, _light)
+        _pal.setColor(QPalette.ColorRole.Button, _mid)
+        _pal.setColor(QPalette.ColorRole.Highlight, _acc)
+        _pal.setColor(QPalette.ColorRole.HighlightedText, _QColor("#ffffff"))
+        app.setPalette(_pal)
         app.setStyleSheet(_build_dark_style())
         app_logger.debug("✓ Stylesheet applied")
         
