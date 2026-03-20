@@ -3040,18 +3040,18 @@ class _NotesWindow(QWidget):
         root.addLayout(hdr)
 
         # ── scroll area ─────────────────────────────────────────────────────
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet("QScrollArea{background:#1e1e1e;border:none;}")
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setStyleSheet("QScrollArea{background:#1e1e1e;border:none;}")
         self._inner = QWidget()
         self._inner.setStyleSheet("QWidget{background:#1e1e1e;}")
         self._notes_layout = QVBoxLayout(self._inner)
         self._notes_layout.setContentsMargins(4, 4, 4, 4)
         self._notes_layout.setSpacing(20)
         self._notes_layout.addStretch()
-        scroll.setWidget(self._inner)
-        root.addWidget(scroll, 1)
+        self._scroll.setWidget(self._inner)
+        root.addWidget(self._scroll, 1)
         # Drop-indicator line (shown while dragging, hidden otherwise)
         self._drop_line = QFrame(self._inner)
         self._drop_line.setFrameShape(QFrame.Shape.HLine)
@@ -3134,11 +3134,58 @@ class _NotesWindow(QWidget):
                 break
         note = self._add_note(after_idx=focused_idx)
         note.text_edit.setFocus()
+        # Scroll to the new note — retry until it has been laid out
+        QTimer.singleShot(0, lambda: self._scroll_to_note(note))
+
+    def _scroll_to_note(self, note: "_NoteWidget", _attempts: int = 0):
+        """Scroll the outer panel so the given note is fully visible.
+        Retries every 10 ms (up to 20 times) until Qt has finished laying
+        out the widget and it has a non-zero height.
+        """
+        if not hasattr(self, "_scroll") or not note:
+            return
+        if note.height() > 0:
+            self._scroll.ensureWidgetVisible(note, 0, 20)
+        elif _attempts < 20:
+            QTimer.singleShot(10, lambda: self._scroll_to_note(note, _attempts + 1))
+
+    def _scroll_cursor_visible(self, text_edit):
+        """Scroll the outer panel so the cursor line inside text_edit is visible.
+
+        text_edit has its own scrollbars disabled and auto-resizes, so the cursor
+        rect is always relative to the top of the widget.  We map that rect into
+        _inner coordinates, then ask the outer QScrollArea to show it.
+        """
+        if not hasattr(self, "_scroll"):
+            return
+        # Cursor rect in text_edit-local coords
+        cr = text_edit.cursorRect()
+        # Map to _inner coords (the QScrollArea's content widget)
+        top_left = text_edit.mapTo(self._inner, cr.topLeft())
+        bot_right = text_edit.mapTo(self._inner, cr.bottomRight())
+        from PyQt6.QtCore import QRect
+        cursor_rect_inner = QRect(top_left, bot_right)
+        # ensureVisible takes (x, y, xmargin, ymargin) in content-widget coords
+        self._scroll.ensureVisible(
+            cursor_rect_inner.x(),
+            cursor_rect_inner.bottom(),
+            0, 30)   # 30 px margin below cursor so next line is readable
 
     def _add_note(self, text="", color_idx=0, after_idx=-1):
         note = _NoteWidget(text=text, color_idx=color_idx, parent=self._inner)
         note.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         note.deleted.connect(self._on_note_deleted)
+        # Scroll to note when it receives focus (mouse click or Tab)
+        _nw_ref = self
+        _orig_focus = note.text_edit.focusInEvent
+        def _on_focus(ev, _note=note):
+            _orig_focus(ev)
+            # Small delay so the layout has processed the focus change
+            QTimer.singleShot(0, lambda: _nw_ref._scroll_to_note(_note))
+        note.text_edit.focusInEvent = _on_focus
+        # Keep the cursor line visible as the user types
+        note.text_edit.cursorPositionChanged.connect(
+            lambda _te=note.text_edit: _nw_ref._scroll_cursor_visible(_te))
         if after_idx >= 0 and after_idx < len(self._notes):
             # Insert after_idx in both list and layout
             self._notes.insert(after_idx + 1, note)
