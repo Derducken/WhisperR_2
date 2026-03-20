@@ -422,8 +422,7 @@ def _ai_worker_process(task_q, result_q, log_q):
                         try: os.add_dll_directory(_bin)
                         except Exception: pass
         for _fb in [
-            r'C:\Users\koura\AppData\Local\Programs\Ollama\lib\ollama',
-            r'C:\Ducklord\Faster-Whisper-XXL\Faster-Whisper-XXL\_xxl_data\torch\lib',
+            # Add any extra DLL search paths here if needed
         ]:
             if os.path.isdir(_fb):
                 _cuda_search.append(_fb)
@@ -1042,7 +1041,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Application version
-__version__ = "2.0.6"
+__version__ = "2.1.0"
 APP_NAME = "WhisperR"
 
 # --- 1. GLOBAL CRASH LOGGING ---
@@ -1257,7 +1256,7 @@ class AppConfig:
             "model": "tiny", "lang_name": "English", "lang_code": "en",
             "hf_cache_path": "",   # empty = use default HF cache location
             "translate": False, "timestamps": False,
-            "initial_prompt": "An article for a data recovery company's site. The article uses a lot of storage-related terminology, with app and service names like Disk Drill, Recuva, CHKDSK, Windows File History, Windows File Explorer, Google Drive (GDrive), Microsoft OneDrive, Dropbox, companies like CleverFiles, file-system-related words like RAW, FAT8, FAT16, FAT32, NTFS, EXT2, EXT3, EXT4, EXT2/3/4, ReiserFS, ReFS, XFS, JFS, file formats like AVI, MKV, MP4, MOV, ARI, BRAW, R3D, FLV, OSes like Linux, Windows 95/98/NT/2000/XP/Vista/7/8/10/11, OS virtual folders like This PC, Quick Access, Recent Files, Recycle Bin, Trashcan, Libraries, technologies like S.M.A.R.T., Hard Disk Drives (HDDs), Solid State Drives (SSDs), M.2 drives, external drives, internal drives, USB drives, SD cards, TRIM, USB Type-A, USB Type-C, USB-A, USB-C, FireWire, card readers, cameras like GoPro, GoPro HERO, GoPro HERO 13 Black, GoPro MAX2, and more. Extra note: when the user says okay, parse it as OK.",
+            "initial_prompt": "General professional writing. The speaker may use technical terminology across a variety of fields. Software names: Microsoft Word, Excel, PowerPoint, Google Docs, Sheets, Slides, VS Code, GitHub, ChatGPT, WhisperR. Technology terms: API, JSON, XML, HTML, CSS, JavaScript, Python, SQL, GPU, CPU, RAM, SSD, HDD, USB, Wi-Fi, Bluetooth, HTTPS. Business terms: KPI, ROI, B2B, B2C, SaaS, MVP, NDA, CRM. Measurements and abbreviations: GB, TB, MHz, GHz, ms, fps, dpi, OK, AI, ML, AR, VR, UI, UX. When the speaker says 'okay' in a sentence, transcribe it as 'OK'.",
             "audio_folder": str(Path.home() / "WhisperR_Recordings"),
             "mon_folder": str(Path.home() / "WhisperR_Watch"),
             "clear_exit": True, "save_to_disk": False, "auto_space": True,
@@ -1283,7 +1282,7 @@ class AppConfig:
             "dict_mode": "Auto-Pause", "auto_pause_sec": 2.0,
             "noise_floor": 50, "speech_vol": 500,
             "commands": {"Launch Notepad": "notepad.exe"},
-            "terms": {"hexagon software": "Hexagon Software"},
+            "terms": {"whisper ar": "WhisperR", "youre": "you're", "dont": "don't", "cant": "can't", "wont": "won't", "its a": "it's a"},
             "hallucinations": [
                 "thank you.", "thanks for watching.", "god bless.", "god bless you.",
                 "subtitles by", "amara.org", "translated by", "transcribed by",
@@ -1341,7 +1340,7 @@ class AppConfig:
                     loaded = json.load(f)
                     self.settings.update(loaded)
                 # ── Config migrations ──────────────────────────────────
-                # v2.0.6: editor_hk_kbd Ctrl+Shift+K → Ctrl+Shift+D
+                # v2.1.0: editor_hk_kbd Ctrl+Shift+K → Ctrl+Shift+D
                 if self.settings.get("editor_hk_kbd","") == "Ctrl+Shift+K":
                     self.settings["editor_hk_kbd"] = "Ctrl+Shift+D"
                 app_logger.info("Configuration loaded successfully")
@@ -2938,6 +2937,9 @@ class _NoteWidget(QWidget):
     def _set_color(self, idx):
         self._color_idx = idx
         self._apply_color()
+        nw = self._find_notes_win()
+        if nw and nw._color_filter:
+            nw._apply_color_filter()
 
     def _apply_color(self):
         bg, border, tc = self.NOTE_COLORS[self._color_idx]
@@ -2994,6 +2996,7 @@ class _NotesWindow(QWidget):
         self._notes: list[_NoteWidget] = []
         self._undo_stack: list[dict] = []
         self._dragging_note = None   # active drag target
+        self._color_filter: set = set()  # empty = show all colors
         self._build_ui()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
 
@@ -3063,7 +3066,27 @@ class _NotesWindow(QWidget):
         _sc_add = QShortcut(QKeySequence("Ctrl+Return"), self)
         _sc_add.setContext(Qt.ShortcutContext.WindowShortcut)
         _sc_add.activated.connect(self._add_note_after_focused)
+        # Color filter button + hidden-notes indicator
+        self._filter_btn = QPushButton("🎨")
+        self._filter_btn.setFixedSize(28, 28)
+        self._filter_btn.setToolTip(
+            "Filter notes by color\n"
+            "Click color swatches to show/hide notes of that color.\n"
+            "All colors shown = no filter active.")
+        self._filter_btn.setStyleSheet(_ss)
+        self._filter_btn.clicked.connect(self._show_color_filter_menu)
+        self._filter_indicator = QPushButton("!")
+        self._filter_indicator.setFixedSize(22, 22)
+        self._filter_indicator.setToolTip("Some notes are hidden by the color filter")
+        self._filter_indicator.setStyleSheet(
+            "QPushButton{background:#5a3a00;border:1px solid #cc8800;"
+            "color:#ffcc44;border-radius:3px;font-size:9px;font-weight:bold;padding:0;}"
+            "QPushButton:hover{background:#7a5000;}")
+        self._filter_indicator.hide()
+        self._filter_indicator.clicked.connect(self._show_color_filter_menu)
         foot.addStretch()
+        foot.addWidget(self._filter_indicator)
+        foot.addWidget(self._filter_btn)
         btn_col = QPushButton("−")
         btn_col.setToolTip("Collapse all notes (show 3 lines each)")
         btn_col.setFixedSize(28, 28)
@@ -3103,6 +3126,9 @@ class _NotesWindow(QWidget):
             count = self._notes_layout.count()
             self._notes_layout.insertWidget(count - 1, note)
             self._notes.append(note)
+        if self._color_filter and note.get_color_idx() not in self._color_filter:
+            note.hide()
+            self._apply_color_filter()
         return note
 
     def _on_note_deleted(self, note):
@@ -3127,9 +3153,80 @@ class _NotesWindow(QWidget):
     def _expand_all(self):
         for n in self._notes: n.uncollapse()
 
+    # ── Color filter ─────────────────────────────────────────────────────
+
+    _COLOR_NAMES = ["Yellow","Green","Blue","Pink","Orange",
+                    "Purple","White","Light Grey","Dark Grey","Black"]
+
+    def _show_color_filter_menu(self):
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu{background:#1e1e1e;border:1px solid #444;padding:4px;}"
+            "QMenu::item{padding:4px 12px;color:#ddd;}"
+            "QMenu::item:selected{background:#2a2a2a;}")
+        act_all = menu.addAction("Show All Colors")
+        act_all.triggered.connect(lambda: self._set_color_filter(set()))
+        menu.addSeparator()
+        for i, (bg, border, _tc) in enumerate(_NoteWidget.NOTE_COLORS):
+            name = (self._COLOR_NAMES[i]
+                    if i < len(self._COLOR_NAMES) else f"Color {i}")
+            tick = "[x]" if i in self._color_filter else "[ ]"
+            px = QPixmap(14, 14)
+            px.fill(QColor(bg))
+            act = menu.addAction(QIcon(px), f"{tick} {name}")
+            act.triggered.connect(lambda _, idx=i: self._toggle_color_filter(idx))
+        menu.exec(self._filter_btn.mapToGlobal(
+            self._filter_btn.rect().topLeft()))
+
+    def _toggle_color_filter(self, color_idx: int):
+        if color_idx in self._color_filter:
+            self._color_filter.discard(color_idx)
+        else:
+            self._color_filter.add(color_idx)
+        self._apply_color_filter()
+
+    def _set_color_filter(self, new_filter: set):
+        self._color_filter = new_filter
+        self._apply_color_filter()
+
+    def _apply_color_filter(self):
+        hidden = 0
+        for note in self._notes:
+            if self._color_filter and note.get_color_idx() not in self._color_filter:
+                note.hide()
+                hidden += 1
+            else:
+                note.show()
+        if self._color_filter:
+            self._filter_btn.setStyleSheet(
+                "QPushButton{background:#003a1a;border:2px solid #00cc55;"
+                "color:#00ff77;border-radius:4px;font-size:14px;}")
+        else:
+            self._filter_btn.setStyleSheet(
+                "QPushButton{background:#2a2a2a;border:1px solid #444;"
+                "border-radius:4px;color:#ddd;font-size:14px;}"
+                "QPushButton:hover{background:#353535;border-color:#0078d7;}")
+        if hidden > 0:
+            self._filter_indicator.setText(f"+{hidden}")
+            self._filter_indicator.setToolTip(
+                f"{hidden} note(s) hidden by color filter\n"
+                f"Click the palette icon to change filter")
+            self._filter_indicator.show()
+        else:
+            self._filter_indicator.hide()
+
     def get_notes_data(self):
         return [{"text": n.get_text(), "color_idx": n.get_color_idx()}
                 for n in self._notes]
+
+    def get_filter_state(self) -> list:
+        return sorted(self._color_filter)
+
+    def set_filter_state(self, state: list):
+        self._color_filter = set(state) if state else set()
+        self._apply_color_filter()
+
 
     def set_notes_data(self, data):
         # Clear undo stack — undo history is project-specific
@@ -3143,6 +3240,8 @@ class _NotesWindow(QWidget):
             self._add_note(item.get("text", ""), item.get("color_idx", 0))
         if not self._notes:
             self._add_note()
+        if self._color_filter:
+            self._apply_color_filter()
 
     # ── Drag infrastructure (app-level event filter approach) ─────────────
 
@@ -4270,6 +4369,8 @@ class WhisperEditor(QWidget):
             "text":         self.editor.toPlainText(),
             "target_words": _ts.value() if _ts else 0,
             "notes":        _notes,
+            "notes_filter": (self._notes_win.get_filter_state()
+                             if self._notes_win else []),
         }
 
     def _apply_project_data(self, data: dict, project_path=None):
@@ -4292,6 +4393,9 @@ class WhisperEditor(QWidget):
                 self._reposition_panels()
             # Cache so re-opening notes panel shows the data
             self._saved_notes_snapshot = list(notes)
+        _filt = data.get('notes_filter', [])
+        if _filt and self._notes_win:
+            self._notes_win.set_filter_state(_filt)
         self._project_path = Path(project_path) if project_path else None
         self._update_title()
         # Turn on remember so closing doesn't lose the project
