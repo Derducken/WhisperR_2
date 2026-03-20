@@ -12,6 +12,92 @@ import multiprocessing
 # passed as arguments (task_q, result_q, log_q).
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+# ── Direct model downloader (bypasses huggingface_hub SSL issues) ──────────
+# Required files — download fails if any of these 404
+_HF_MODEL_REQUIRED = ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"]
+# Optional files — silently skipped if 404 (not all model sizes have them)
+_HF_MODEL_OPTIONAL = ["tokenizer_config.json", "preprocessor_config.json",
+                       "special_tokens_map.json"]
+
+def _download_model_direct(model_name, hf_home, log_fn):
+    """Download a faster-whisper model directly via urllib, bypassing
+    huggingface_hub (which requires SSL certs that aren't bundled in
+    frozen apps).  Returns the local snapshot path on success, None on fail."""
+    import os, urllib.request, ssl, json, hashlib
+
+    repo_id   = f"Systran/faster-whisper-{model_name}"
+    repo_dir  = os.path.join(hf_home, f"models--Systran--faster-whisper-{model_name}")
+    snap_dir  = os.path.join(repo_dir, "snapshots", "main")
+    os.makedirs(snap_dir, exist_ok=True)
+
+    # Build an SSL context — try certifi bundle, fall back to unverified.
+    # Unverified is acceptable here: we're downloading read-only public model
+    # weights from a known URL, not transmitting secrets.
+    ssl_ctx = ssl.create_default_context()
+    _cert_tried = []
+    for _cert_candidate in [
+        os.path.join(os.path.dirname(os.path.abspath(
+            getattr(__import__("sys"), "executable", ""))),
+            "_internal", "certifi", "cacert.pem"),
+        os.path.join(os.path.dirname(os.path.abspath(
+            getattr(__import__("sys"), "executable", ""))),
+            "certifi", "cacert.pem"),
+    ]:
+        if os.path.isfile(_cert_candidate):
+            try:
+                ssl_ctx.load_verify_locations(_cert_candidate)
+                _cert_tried.append(f"OK:{_cert_candidate}")
+                break
+            except Exception as _ce:
+                _cert_tried.append(f"FAIL:{_cert_candidate}:{_ce}")
+    else:
+        # No cert bundle found — disable verification
+        ssl_ctx = ssl._create_unverified_context()
+        log_fn("  SSL cert bundle not found — using unverified context")
+
+    base_url  = f"https://huggingface.co/{repo_id}/resolve/main"
+    all_files    = [(f, True)  for f in _HF_MODEL_REQUIRED] +                    [(f, False) for f in _HF_MODEL_OPTIONAL]
+
+    for fname, required in all_files:
+        dest = os.path.join(snap_dir, fname)
+        if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+            log_fn(f"  Skip (exists): {fname}")
+            continue
+        url = f"{base_url}/{fname}"
+        log_fn(f"  Downloading: {fname} ...")
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "WhisperR/2.0"})
+            with urllib.request.urlopen(req, timeout=300,
+                                        context=ssl_ctx) as resp, \
+                 open(dest, "wb") as fout:
+                total = int(resp.headers.get("Content-Length", 0))
+                done  = 0
+                while True:
+                    chunk = resp.read(1 << 20)  # 1 MB
+                    if not chunk:
+                        break
+                    fout.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        pct = done * 100 // total
+                        if pct % 10 == 0:
+                            log_fn(f"    {fname}: {pct}%  ({done//(1<<20)}MB / {total//(1<<20)}MB)")
+            log_fn(f"  ✓ {fname}  ({done//(1<<20) if done>1<<20 else done//1024}{'MB' if done>1<<20 else 'KB'})")
+        except Exception as e:
+            if required:
+                log_fn(f"  ✗ {fname} FAILED (required): {e}")
+                # Clean up incomplete file
+                try: os.remove(dest)
+                except Exception: pass
+                return None
+            else:
+                log_fn(f"  ✗ {fname} skipped (optional, 404 is OK): {e}")
+
+    log_fn(f"  All files downloaded to {snap_dir}")
+    return snap_dir
+
 def _ai_worker_process(task_q, result_q, log_q):
     """AI worker — runs in a child process, owns faster-whisper + ctranslate2."""
     import os, sys, traceback
@@ -494,6 +580,8 @@ def _ai_worker_process(task_q, result_q, log_q):
             # and pass an absolute path, bypassing all hub download logic.
             _model_path = model_name  # fallback → name triggers normal download
             try:
+                # Use HF_HOME env var (set by main process before worker start,
+                # inheriting any custom cache path from Settings)
                 _hf_home = os.environ.get(
                     "HF_HOME",
                     os.environ.get(
@@ -509,15 +597,42 @@ def _ai_worker_process(task_q, result_q, log_q):
                               if os.path.isdir(os.path.join(_snaps_dir, s))]
                     if _snaps:
                         _snap_path = os.path.join(_snaps_dir, sorted(_snaps)[-1])
+                        _snap_files = os.listdir(_snap_path)
                         _has_weights = any(f.endswith(('.bin', '.ct2'))
-                                           for f in os.listdir(_snap_path))
-                        if _has_weights:
+                                           for f in _snap_files)
+                        _has_vocab   = "vocabulary.txt" in _snap_files
+                        if _has_weights and _has_vocab:
                             _model_path = _snap_path
                             _log(f"  Resolved: {_model_path}")
+                        elif _has_weights and not _has_vocab:
+                            _log(f"  vocabulary.txt missing from snapshot "
+                                 f"— clearing for re-download")
+                            try:
+                                import shutil as _shu_v
+                                _shu_v.rmtree(_repo_dir)
+                                _log(f"  Cleared: {_repo_dir}")
+                            except Exception as _ve:
+                                _log(f"  Could not clear: {_ve}")
                         else:
-                            _log(f"  Snapshot empty, using name")
+                            # Snapshot dir exists but has no weights — partial/corrupt
+                            # download. Remove it so WhisperModel can re-download cleanly.
+                            _log(f"  Snapshot empty (partial download) — clearing cache")
+                            try:
+                                import shutil as _shu
+                                _shu.rmtree(_repo_dir)
+                                _log(f"  Cleared: {_repo_dir}")
+                            except Exception as _rme:
+                                _log(f"  Could not clear cache: {_rme}")
+                            _model_path = model_name  # fall back to name for download
                     else:
-                        _log(f"  No snapshots, using name")
+                        _log(f"  No snapshots — clearing empty repo dir")
+                        try:
+                            import shutil as _shu2
+                            _shu2.rmtree(_repo_dir)
+                            _log(f"  Cleared: {_repo_dir}")
+                        except Exception as _rme2:
+                            _log(f"  Could not clear cache: {_rme2}")
+                        _model_path = model_name
                 else:
                     _log(f"  Not cached: {_repo_dir} — download will be attempted")
                     # Don't force local_files_only — let WhisperModel download it
@@ -546,24 +661,74 @@ def _ai_worker_process(task_q, result_q, log_q):
                         cuda_device_count = 0
 
                 if cuda_device_count > 0:
-                    for ctype in ('float16', 'int8_float16'):
+                    _is_local_cuda = os.path.isdir(str(_model_path))
+                    # If model not local, download it now before CUDA load
+                    if not _is_local_cuda:
+                        _log(f"  CUDA: model not local, downloading first")
+                        # Use same TCP check as CPU path
+                        _net_ok_cuda = False
                         try:
-                            _log(f"  Trying CUDA {ctype}...")
-                            model = WhisperModel(
-                                _model_path, device="cuda",
-                                compute_type=ctype,
-                                cpu_threads=4,
-                                num_workers=1,
-                                download_root=None,
-                                local_files_only=os.path.isdir(str(_model_path)),
-                            )
+                            import socket as _sc2
+                            _s2 = _sc2.socket(_sc2.AF_INET, _sc2.SOCK_STREAM)
+                            _s2.settimeout(5); _s2.connect(("huggingface.co", 443)); _s2.close()
+                            _net_ok_cuda = True
+                        except Exception: pass
+                        if _net_ok_cuda:
+                            _dl_path_cu = _download_model_direct(model_name, _hf_home, _log)
+                            if _dl_path_cu and os.path.isdir(_dl_path_cu):
+                                _model_path  = _dl_path_cu
+                                _is_local_cuda = True
+                                _log(f"  CUDA download complete: {_dl_path_cu}")
+                            else:
+                                _log("  CUDA download failed — will skip CUDA")
+                                cuda_device_count = 0  # force CPU fallback
+                        else:
+                            _log("  No network for CUDA download — falling back to CPU")
+                            cuda_device_count = 0
+                    _cuda_timeout = 30 if _is_local_cuda else 120
+                    for ctype in ('float16', 'int8_float16'):
+                        _log(f"  Trying CUDA {ctype} (timeout={_cuda_timeout}s)...")
+                        _cuda_result = [None, None]  # [model, exception]
+                        def _cuda_load_thread():
+                            try:
+                                _cuda_result[0] = WhisperModel(
+                                    _model_path, device="cuda",
+                                    compute_type=ctype,
+                                    cpu_threads=4,
+                                    num_workers=1,
+                                    download_root=None,
+                                    local_files_only=_is_local_cuda,
+                                )
+                            except Exception as _e_cl:
+                                _cuda_result[1] = _e_cl
+                        import threading as _thr_cuda
+                        _ct = _thr_cuda.Thread(target=_cuda_load_thread, daemon=True)
+                        _ct.start()
+                        _ct.join(timeout=_cuda_timeout)
+                        if _ct.is_alive():
+                            _log(f"  CUDA {ctype} timed out after {_cuda_timeout}s")
+                            # Report to main thread and give up on CUDA
+                            if not _is_local_cuda:
+                                _cache_dest_cu = os.path.join(
+                                    _hf_home,
+                                    f"models--Systran--faster-whisper-{model_name}")
+                                _hf_url_cu = (f"https://huggingface.co/Systran/"
+                                              f"faster-whisper-{model_name}/tree/main")
+                                result_q.put(("model_not_found",
+                                    model_name, _cache_dest_cu, _hf_url_cu))
+                                result_q.put(('status', False))
+                                loaded = True   # prevent CPU retry
+                            break
+                        elif _cuda_result[1] is not None:
+                            _log(f"  CUDA {ctype} failed: "
+                                 f"{type(_cuda_result[1]).__name__}: {_cuda_result[1]}")
+                        else:
+                            model = _cuda_result[0]
                             current_model_name = model_name
                             current_language = lang_code
                             _log(f"✓ {model_name} loaded on GPU ({ctype})")
                             loaded = True
                             break
-                        except Exception as e:
-                            _log(f"  CUDA {ctype} failed: {type(e).__name__}: {e}")
                 else:
                     if not _skip_cuda:
                         _log("  GPU unavailable — falling back to CPU")
@@ -592,34 +757,124 @@ def _ai_worker_process(task_q, result_q, log_q):
                 _files_in_model = sorted(os.listdir(_model_path)) if os.path.isdir(_model_path) else []
                 _log(f"  model files: {_files_in_model}")
 
+                # _local_only: True when we resolved a real snapshot path
                 _local_only = os.path.isdir(str(_model_path))
-                if not _local_only:
-                    # Model not in local cache — allow download;
-                    # clear offline env vars set earlier
+                # Also check if the repo dir exists at all (snapshot resolve
+                # can fail while the model IS locally cached)
+                _repo_exists = os.path.isdir(
+                    os.path.join(_hf_home,
+                                 f"models--Systran--faster-whisper-{model_name}"))
+                _any_local = _local_only or _repo_exists
+                _net_ok = True   # assume OK; overwritten below if download needed
+                if not _any_local:
+                    # Model not cached at all — must download. Check connectivity
+                    # using a plain TCP connect (not HTTPS) so frozen-app SSL
+                    # issues don't give a false "no network" result.
+                    _net_ok = False
+                    try:
+                        import socket as _sock_nc
+                        _s = _sock_nc.socket(_sock_nc.AF_INET, _sock_nc.SOCK_STREAM)
+                        _s.settimeout(5)
+                        _s.connect(("huggingface.co", 443))
+                        _s.close()
+                        _net_ok = True
+                        _log("  Network TCP check OK (port 443)")
+                    except Exception as _ne:
+                        _log(f"  Network TCP check failed: {_ne}")
+                    if _net_ok:
+                        # Download files directly — huggingface_hub SSL hangs
+                        # in frozen apps because cacert.pem isn't bundled.
+                        _log(f"  Network OK — downloading {model_name} directly")
+                        _dl_path = _download_model_direct(model_name, _hf_home, _log)
+                        if _dl_path and os.path.isdir(_dl_path):
+                            _model_path = _dl_path
+                            _local_only = True
+                            _log(f"  Download complete: {_dl_path}")
+                        else:
+                            _log("  Direct download failed — trying HF hub as fallback")
+                            os.environ.pop("HF_HUB_OFFLINE", None)
+                            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+                            os.environ.pop("HF_DATASETS_OFFLINE", None)
+                    else:
+                        _log(f"  No network — {model_name} not cached, cannot load")
+                        _cache_dest = os.path.join(
+                            _hf_home,
+                            f"models--Systran--faster-whisper-{model_name}")
+                        _hf_url = (f"https://huggingface.co/Systran/"
+                                   f"faster-whisper-{model_name}/tree/main")
+                        result_q.put(("model_not_found",
+                            model_name, _cache_dest, _hf_url))
+                        result_q.put(('status', False))
+                        continue
+                elif _repo_exists and not _local_only:
+                    # Repo dir exists but snapshot resolve failed — try anyway
+                    # with local_files_only so we don't attempt a download
+                    _local_only = True
                     os.environ.pop("HF_HUB_OFFLINE", None)
                     os.environ.pop("TRANSFORMERS_OFFLINE", None)
                     os.environ.pop("HF_DATASETS_OFFLINE", None)
+                    _log(f"  Repo dir exists but snapshot resolve failed "
+                         f"— will try loading with model name directly")
+                    _model_path = model_name   # let WhisperModel find it
                 for ctype in ('float32', 'int8'):
-                    try:
-                        _log(f"  Trying CPU {ctype} (local_only={_local_only})...")
-                        model = WhisperModel(
-                            _model_path, device="cpu",
-                            compute_type=ctype,
-                            cpu_threads=4,
-                            num_workers=1,
-                            download_root=None,
-                            local_files_only=_local_only,
-                        )
+                    _log(f"  Trying CPU {ctype} (local_only={_local_only})...")
+                    # Load in a thread with a hard timeout so a stalled
+                    # download never blocks the worker indefinitely.
+                    _load_result = [None, None]  # [model_or_None, exception_or_None]
+                    def _load_thread():
+                        try:
+                            _load_result[0] = WhisperModel(
+                                _model_path, device="cpu",
+                                compute_type=ctype,
+                                cpu_threads=4,
+                                num_workers=1,
+                                download_root=None,
+                                local_files_only=_local_only,
+                            )
+                        except Exception as _e_lt:
+                            _load_result[1] = _e_lt
+                    import threading as _thr_load
+                    _t = _thr_load.Thread(target=_load_thread, daemon=True)
+                    _t.start()
+                    # Timeout: 30 s for local load, 120 s if downloading
+                    _timeout = 120 if _net_ok and not _local_only else 30
+                    _t.join(timeout=_timeout)
+                    if _t.is_alive():
+                        _log(f"  CPU {ctype} timed out after {_timeout}s — aborting")
+                        result_q.put(("error",
+                            f"Loading '{model_name}' timed out after {_timeout}s.\n\n"
+                            f"The download may be stalled. Options:\n"
+                            f"• Check your internet connection\n"
+                            f"• Copy the model folder to the local HuggingFace cache\n"
+                            f"• Switch to a smaller cached model"
+                        ))
+                        result_q.put(('status', False))
+                        loaded = True   # prevent further ctype attempts
+                        break
+                    elif _load_result[1] is not None:
+                        _log(f"  CPU {ctype} failed: {type(_load_result[1]).__name__}: {_load_result[1]}")
+                    else:
+                        model = _load_result[0]
                         current_model_name = model_name
                         current_language = lang_code
                         _log(f"✓ {model_name} loaded on CPU ({ctype})")
                         loaded = True
                         break
-                    except Exception as e:
-                        _log(f"  CPU {ctype} failed: {type(e).__name__}: {e}")
 
             if not loaded:
                 _log(f"All load attempts failed for {model_name}")
+                # If no local cache either, emit richer error
+                _is_cached = os.path.isdir(str(_model_path)) if "_model_path" in dir() else False
+                if not _is_cached:
+                    _hf_home_fb = os.path.join(
+                        os.path.expanduser("~"), ".cache", "huggingface", "hub")
+                    _cache_dest_fb = os.path.join(
+                        _hf_home_fb,
+                        f"models--Systran--faster-whisper-{model_name}")
+                    _hf_url_fb = (f"https://huggingface.co/Systran/"
+                                  f"faster-whisper-{model_name}/tree/main")
+                    result_q.put(("model_not_found",
+                        model_name, _cache_dest_fb, _hf_url_fb))
                 result_q.put(('status', False))
                 continue
 
@@ -922,7 +1177,8 @@ class AppConfig:
     def __init__(self):
         self.path = os.path.join(BASE_DIR, "config.json")
         self.settings = {
-            "model": "large-v3", "lang_name": "English", "lang_code": "en",
+            "model": "tiny", "lang_name": "English", "lang_code": "en",
+            "hf_cache_path": "",   # empty = use default HF cache location
             "translate": False, "timestamps": False,
             "initial_prompt": "An article for a data recovery company's site. The article uses a lot of storage-related terminology, with app and service names like Disk Drill, Recuva, CHKDSK, Windows File History, Windows File Explorer, Google Drive (GDrive), Microsoft OneDrive, Dropbox, companies like CleverFiles, file-system-related words like RAW, FAT8, FAT16, FAT32, NTFS, EXT2, EXT3, EXT4, EXT2/3/4, ReiserFS, ReFS, XFS, JFS, file formats like AVI, MKV, MP4, MOV, ARI, BRAW, R3D, FLV, OSes like Linux, Windows 95/98/NT/2000/XP/Vista/7/8/10/11, OS virtual folders like This PC, Quick Access, Recent Files, Recycle Bin, Trashcan, Libraries, technologies like S.M.A.R.T., Hard Disk Drives (HDDs), Solid State Drives (SSDs), M.2 drives, external drives, internal drives, USB drives, SD cards, TRIM, USB Type-A, USB Type-C, USB-A, USB-C, FireWire, card readers, cameras like GoPro, GoPro HERO, GoPro HERO 13 Black, GoPro MAX2, and more. Extra note: when the user says okay, parse it as OK.",
             "audio_folder": str(Path.home() / "WhisperR_Recordings"),
@@ -944,7 +1200,7 @@ class AppConfig:
             "auto_backup_enabled": False,
             "auto_backup_interval": 10,
             "auto_backup_keep": 5,
-            "cb_source_tag": False,
+            "cb_source_tag": True,
             "version_history_keep": 20,
             "live_mode": "Auto-Pause",
             "dict_mode": "Auto-Pause", "auto_pause_sec": 2.0,
@@ -978,6 +1234,7 @@ class AppConfig:
             "editor_hk_h3":        "Ctrl+3",  "editor_hk_emdash":    "Ctrl+Shift+Minus",
             "editor_hk_bullet":    "Ctrl+Shift+B", "editor_hk_numlist": "Ctrl+Shift+N",
             "editor_hk_tasklist":  "Ctrl+Shift+T", "editor_hk_kbd":     "Ctrl+Shift+D",
+            "editor_hk_tagwrap": "Ctrl+Shift+W",
             "editor_hk_link":    "Ctrl+K",
             "sendkeys_trigger":   "whisper send keys",
             "select_trigger":     "whisper select",
@@ -1223,9 +1480,10 @@ class TranscriberWorker(QThread):
     The child process owns faster-whisper + ctranslate2. If it crashes,
     this thread detects it and can restart it. IPC via multiprocessing.Queue.
     """
-    finished_text  = pyqtSignal(str, str)
-    status_changed = pyqtSignal(bool)
-    log_msg        = pyqtSignal(str)
+    finished_text       = pyqtSignal(str, str)
+    status_changed      = pyqtSignal(bool)
+    log_msg             = pyqtSignal(str)
+    model_not_found_sig = pyqtSignal(str, str, str)  # model_name, dest_path, hf_url
 
     def __init__(self, config):
         super().__init__()
@@ -1297,6 +1555,12 @@ class TranscriberWorker(QThread):
             self._result_q = ctx.Queue()
             self._log_q    = ctx.Queue()
 
+            # Propagate custom HF cache path to worker via environment
+            _hf_custom = getattr(self.config, "settings", {}).get("hf_cache_path", "")
+            if _hf_custom and os.path.isdir(_hf_custom):
+                os.environ["HF_HOME"] = _hf_custom
+                os.environ["HUGGINGFACE_HUB_CACHE"] = _hf_custom
+                app_logger.info(f"Custom HF cache: {_hf_custom}")
             self._proc = ctx.Process(
                 target=_ai_worker_process,
                 args=(self._task_q, self._result_q, self._log_q),
@@ -1428,7 +1692,12 @@ class TranscriberWorker(QThread):
                     # Model loading: no timeout — just keep waiting
                     continue
 
-                if msg[0] == 'status':
+                if msg[0] == "model_not_found":
+                    _, _mn, _dest, _url = msg
+                    app_logger.warning(f"Emitting model_not_found for {_mn}")
+                    self.model_not_found_sig.emit(_mn, _dest, _url)
+                    continue
+                elif msg[0] == 'status':
                     if msg[1]:
                         transcription_started = True  # model loaded, transcription running
                     self.status_changed.emit(msg[1])
@@ -2609,6 +2878,11 @@ class _NoteWidget(QWidget):
         self.text_edit.setReadOnly(False)
         self._auto_resize()
 
+    def mousePressEvent(self, event):
+        if self._collapsed:
+            self.uncollapse()
+        super().mousePressEvent(event)
+
     def mouseDoubleClickEvent(self, event):
         if self._collapsed:
             self.uncollapse()
@@ -3261,7 +3535,9 @@ class WhisperEditor(QWidget):
             None,  # ── group separator ──
             ("`C`",   "Inline code",    "editor_hk_code",      "Ctrl+`",          self._fmt_code),
             ("<kbd>", "Keyboard key",   "editor_hk_kbd",       "Ctrl+Shift+D",    self._fmt_kbd),
-            ("🔗",    "Link  [left-click: placeholder URL · right-click: paste URL from clipboard]",           "editor_hk_link",      "Ctrl+K",          self._fmt_link),
+            ("<>",    "Wrap in HTML/XML tag\nleft-click: <tag>text</tag>\nright-click: [tag]text[/tag]",
+                      "editor_hk_tagwrap",   "Ctrl+Shift+W",    self._fmt_tagwrap),
+            ("🔗",    "Link\nleft-click [Ctrl+K]: [text](placeholder-url)\nright-click [Ctrl+Shift+K]: [text](clipboard url)",           "editor_hk_link",      "Ctrl+K",          self._fmt_link),
             None,  # ── group separator ──
             ("H1",    "Heading 1",      "editor_hk_h1",        "Ctrl+1",          lambda: self._fmt_heading(1)),
             ("H2",    "Heading 2",      "editor_hk_h2",        "Ctrl+2",          lambda: self._fmt_heading(2)),
@@ -3297,6 +3573,10 @@ class WhisperEditor(QWidget):
                 btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
                 btn.customContextMenuRequested.connect(
                     lambda _: self._fmt_link(use_clipboard=True))
+            if label == "<>":
+                btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                btn.customContextMenuRequested.connect(
+                    lambda _: self._fmt_tagwrap(square=True))
             fmt_row.addWidget(btn)
 
         fmt_row.addStretch()
@@ -3328,6 +3608,7 @@ class WhisperEditor(QWidget):
             "QTextEdit{background:#111;color:#e0e0e0;border:1px solid #333;"
             "border-radius:4px;padding:6px;font-family:Consolas,monospace;}")
         self.editor.textChanged.connect(self._update_stats)
+        self.editor.textChanged.connect(self._autocorrect_terms)
         # Debounced history snapshot
         self._history_timer = QTimer(self)
         self._history_timer.setSingleShot(True)
@@ -3396,6 +3677,14 @@ class WhisperEditor(QWidget):
             self._export_file))
 
         btn_row.addWidget(_btn("📋 Copy", "Copy all text to clipboard", self._copy_all))
+        btn_row.addWidget(_btn("🔍 Find",
+            "Find & Replace  [Ctrl+H]\n"
+            "Close bar by pressing Ctrl+H again or clicking ✕.",
+            self._show_find_replace))
+        btn_row.addWidget(_btn("🕐 History",
+            "Version history  [Ctrl+Alt+H]\n"
+            "Snapshots taken automatically 5s after typing stops and on every save.",
+            self._show_history))
         btn_row.addStretch()
 
         # ── Notes / Cheatsheet (dual) ────────────────────────────────────
@@ -3547,6 +3836,66 @@ class WhisperEditor(QWidget):
     def _fmt_strike(self):    self._wrap_selection("~~")
     def _fmt_code(self):      self._wrap_selection("`")
     def _fmt_kbd(self):       self._wrap_selection("<kbd>", "</kbd>")
+
+    def _autocorrect_terms(self):
+        """Check if the last typed word matches a Term phrase; expand if so.
+        Only fires for exact-match single-word terms (no spaces) to avoid
+        interfering with normal typing of multi-word phrases mid-sentence.
+        Multi-word terms are matched when the user types the final word followed
+        by a space or punctuation.
+        """
+        cfg = self.config if isinstance(self.config, dict) else getattr(self.config, "settings", {})
+        terms = cfg.get("terms", {}) if isinstance(cfg, dict) else {}
+        if not terms:
+            return
+        cur = self.editor.textCursor()
+        # Only trigger when the character just typed is a space, Enter, or punctuation
+        pos = cur.position()
+        text = self.editor.toPlainText()
+        if pos == 0 or not text:
+            return
+        last_char = text[pos - 1] if pos <= len(text) else ""
+        if last_char not in (" ", "\n", "\t", ".", ",", "!", "?", ";", ":"):
+            return
+        # Get word(s) just before the trigger character
+        before = text[:pos - 1].rstrip()
+        for phrase, replacement in terms.items():
+            phrase_l = phrase.strip().lower()
+            if not phrase_l:
+                continue
+            if before.lower().endswith(phrase_l):
+                # Check it's at a word boundary (preceded by space/start or nothing)
+                end_idx = len(before)
+                start_idx = end_idx - len(phrase_l)
+                if start_idx > 0 and before[start_idx - 1] not in (" ", "\n", "\t"):
+                    continue  # not a word boundary
+                # Replace: select the phrase and insert replacement
+                # Block signal to avoid re-triggering
+                self.editor.textChanged.disconnect(self._autocorrect_terms)
+                try:
+                    sel = self.editor.textCursor()
+                    sel.setPosition(start_idx)
+                    sel.setPosition(end_idx, sel.MoveMode.KeepAnchor)
+                    sel.insertText(replacement)
+                    self.editor.setTextCursor(sel)
+                finally:
+                    self.editor.textChanged.connect(self._autocorrect_terms)
+                break
+
+    def _fmt_tagwrap(self, square=False):
+        """Prompt for a tag name, then wrap selection in <tag>…</tag> or [tag]…[/tag]."""
+        from PyQt6.QtWidgets import QInputDialog
+        style = "[]" if square else "<>"
+        tag, ok = QInputDialog.getText(
+            self, "Tag Wrap",
+            f"Enter tag name ({style[0]}tag{style[1]}):")
+        if not ok or not tag.strip():
+            return
+        tag = tag.strip()
+        if square:
+            self._wrap_selection(f"[{tag}]", f"[/{tag}]")
+        else:
+            self._wrap_selection(f"<{tag}>", f"</{tag}>")
     def _fmt_emdash(self):
         cur = self.editor.textCursor(); cur.insertText("—"); self.editor.setTextCursor(cur)
 
@@ -3694,10 +4043,11 @@ class WhisperEditor(QWidget):
             (cfg.get("editor_hk_numlist",   "Ctrl+Shift+N"),    self._fmt_numlist),
             (cfg.get("editor_hk_tasklist",  "Ctrl+Shift+T"),    self._fmt_tasklist),
             (cfg.get("editor_hk_kbd",       "Ctrl+Shift+D"),    self._fmt_kbd),
+            (cfg.get("editor_hk_tagwrap",   "Ctrl+Shift+W"),    self._fmt_tagwrap),
             (cfg.get("editor_hk_link",      "Ctrl+K"),          self._fmt_link),
             ("Ctrl+Shift+K",                                     lambda: self._fmt_link(use_clipboard=True)),
             ("Ctrl+H",                                           self._show_find_replace),
-            ("Ctrl+Shift+H",                                     self._show_history),
+            ("Ctrl+Alt+H",                                       self._show_history),
         ]
         for keys, slot in shortcuts:
             try:
@@ -3908,6 +4258,7 @@ class WhisperEditor(QWidget):
             QMessageBox.warning(self, "Load failed", str(e))
 
     def _save_project(self):
+        self._push_history()   # snapshot before save
         init = str(self._project_path) if self._project_path else ""
         path, _ = QFileDialog.getSaveFileName(
             self, "Save project", init,
@@ -3940,12 +4291,9 @@ class WhisperEditor(QWidget):
         if self._version_history and self._version_history[-1][1] == text:
             return  # unchanged
         from datetime import datetime as _dt
-        keep = int(getattr(self.config if isinstance(self.config, dict)
-                           else getattr(self.config, "settings", {}),
-                           "version_history_keep", 20)
-                   if isinstance(self.config, int) else
-                   (self.config.settings if hasattr(self.config, "settings")
-                    else self.config).get("version_history_keep", 20))
+        _cfg_h = (self.config if isinstance(self.config, dict)
+                  else getattr(self.config, "settings", {}))
+        keep = int(_cfg_h.get("version_history_keep", 20))
         self._version_history.append((_dt.now().strftime("%H:%M:%S"), text))
         if len(self._version_history) > keep:
             self._version_history.pop(0)
@@ -3982,85 +4330,123 @@ class WhisperEditor(QWidget):
     # ── Find & Replace ────────────────────────────────────────────────────────
 
     def _show_find_replace(self):
-        """Open a non-modal Find / Replace bar inside the editor."""
+        """Open/close a non-modal Find / Replace bar inside the editor."""
         if getattr(self, "_fr_bar", None) and self._fr_bar.isVisible():
             self._fr_bar.close()
+            self._fr_bar = None
+            self.editor.setFocus()
             return
-        from PyQt6.QtWidgets import QWidget, QHBoxLayout, QLineEdit
+        from PyQt6.QtWidgets import QWidget, QHBoxLayout, QLineEdit, QLabel
         bar = QWidget(self)
         bar.setStyleSheet(
             "QWidget{background:#252525;border-top:1px solid #444;}"
             "QLineEdit{background:#1e1e1e;border:1px solid #555;color:#ddd;"
-            "padding:3px 6px;border-radius:3px;}")
+            "padding:3px 6px;border-radius:3px;min-width:150px;}")
         h = QHBoxLayout(bar)
         h.setContentsMargins(6, 4, 6, 4)
         h.setSpacing(6)
-        _find  = QLineEdit(); _find.setPlaceholderText("Find…"); _find.setFixedWidth(160)
-        _repl  = QLineEdit(); _repl.setPlaceholderText("Replace…"); _repl.setFixedWidth(160)
+        h.addWidget(QLabel("Find:"))
+        _find  = QLineEdit(); _find.setPlaceholderText("search text…")
+        h.addWidget(_find)
+        h.addWidget(QLabel("Replace:"))
+        _repl  = QLineEdit(); _repl.setPlaceholderText("replacement…")
+        h.addWidget(_repl)
         _ss = ("QPushButton{background:#2a2a2a;border:1px solid #555;color:#ddd;"
                "padding:3px 8px;border-radius:3px;}"
                "QPushButton:hover{background:#353535;border-color:#0078d7;}")
-        _btn_find = QPushButton("Find"); _btn_find.setStyleSheet(_ss)
+        _btn_find = QPushButton("▶ Find"); _btn_find.setStyleSheet(_ss)
         _btn_repl = QPushButton("Replace"); _btn_repl.setStyleSheet(_ss)
         _btn_all  = QPushButton("Replace All"); _btn_all.setStyleSheet(_ss)
-        _btn_re   = QCheckBox(".*"); _btn_re.setToolTip("Use regex"); _btn_re.setStyleSheet("color:#aaa;")
+        _lbl_count = QLabel(""); _lbl_count.setStyleSheet("color:#aaa;font-size:9pt;")
+        _btn_re   = QCheckBox(".*"); _btn_re.setToolTip("Use regular expressions")
+        _btn_re.setStyleSheet("QCheckBox{color:#aaa;}")
         _btn_close = QPushButton("✕"); _btn_close.setFixedSize(22,22); _btn_close.setStyleSheet(_ss)
-        for w in (_find, _repl, _btn_find, _btn_repl, _btn_all, _btn_re, _btn_close):
+        for w in (_btn_find, _btn_repl, _btn_all, _lbl_count, _btn_re, _btn_close):
             h.addWidget(w)
         h.addStretch()
         self._fr_bar = bar
-        self._fr_find_edit = _find
-        # Insert bar into layout (above paste button row)
         self.layout().addWidget(bar)
 
-        def _do_find(direction=1):
-            import re
+        def _do_find():
             needle = _find.text()
-            if not needle: return
-            doc = self.editor.document()
-            cur = self.editor.textCursor()
-            flags = QTextDocument.FindFlag(0)
-            if _btn_re.isChecked():
-                found = doc.find(QRegularExpression(needle), cur, flags)
-            else:
-                found = doc.find(needle, cur, flags)
-            if found.isNull():
-                # Wrap around
-                cur.movePosition(cur.MoveOperation.Start)
-                self.editor.setTextCursor(cur)
-                if _btn_re.isChecked():
-                    found = doc.find(QRegularExpression(needle), cur, flags)
-                else:
-                    found = doc.find(needle, cur, flags)
-            if not found.isNull():
-                self.editor.setTextCursor(found)
-
-        def _do_replace():
+            if not needle:
+                return
+            # Move cursor past current selection to advance, not re-find the same match
             cur = self.editor.textCursor()
             if cur.hasSelection():
-                cur.insertText(_repl.text())
+                # Advance past current selection before searching
+                pos = max(cur.selectionStart(), cur.selectionEnd())
+                cur.setPosition(pos)
+                self.editor.setTextCursor(cur)
+            doc = self.editor.document()
+            cur = self.editor.textCursor()
+            if _btn_re.isChecked():
+                found = doc.find(QRegularExpression(needle), cur)
+            else:
+                found = doc.find(needle, cur)
+            if found.isNull():
+                # Wrap around from start
+                cur2 = self.editor.textCursor()
+                cur2.movePosition(cur2.MoveOperation.Start)
+                self.editor.setTextCursor(cur2)
+                if _btn_re.isChecked():
+                    found = doc.find(QRegularExpression(needle), self.editor.textCursor())
+                else:
+                    found = doc.find(needle, self.editor.textCursor())
+            if not found.isNull():
+                self.editor.setTextCursor(found)
+                self.editor.ensureCursorVisible()
+            else:
+                _lbl_count.setText("not found")
+
+        def _do_replace():
+            needle = _find.text()
+            if not needle:
+                return
+            cur = self.editor.textCursor()
+            if cur.hasSelection():
+                # Replace whatever is selected (result of a Find)
+                cur.insertText(_repl.text())   # undo-able single op
+                self.editor.setTextCursor(cur)
+            # Always advance to next match after replacing
             _do_find()
 
         def _do_replace_all():
-            import re
+            import re as _re_fa
             needle = _find.text()
             repl   = _repl.text()
-            if not needle: return
-            text = self.editor.toPlainText()
-            if _btn_re.isChecked():
-                new_text = re.sub(needle, repl, text)
-            else:
-                new_text = text.replace(needle, repl)
-            count = text.count(needle) if not _btn_re.isChecked() else len(re.findall(needle, text))
-            self._push_history()
-            self.editor.setPlainText(new_text)
-            QMessageBox.information(self, "Replace All", f"Replaced {count} occurrence(s).")
+            if not needle:
+                return
+            # Use cursor-based replacement so Ctrl+Z undoes all at once
+            doc = self.editor.document()
+            cur = self.editor.textCursor()
+            cur.beginEditBlock()
+            cur.movePosition(cur.MoveOperation.Start)
+            self.editor.setTextCursor(cur)
+            count = 0
+            while True:
+                if _btn_re.isChecked():
+                    found = doc.find(QRegularExpression(needle), self.editor.textCursor())
+                else:
+                    found = doc.find(needle, self.editor.textCursor())
+                if found.isNull():
+                    break
+                if _btn_re.isChecked():
+                    import re as _re_s
+                    replaced = _re_s.sub(needle, repl, found.selectedText(), count=1)
+                else:
+                    replaced = repl
+                found.insertText(replaced)
+                self.editor.setTextCursor(found)
+                count += 1
+            cur.endEditBlock()
+            _lbl_count.setText(f"{count} replaced")
 
-        _btn_find.clicked.connect(lambda: _do_find())
-        _find.returnPressed.connect(lambda: _do_find())
+        _btn_find.clicked.connect(_do_find)
+        _find.returnPressed.connect(_do_find)
         _btn_repl.clicked.connect(_do_replace)
         _btn_all.clicked.connect(_do_replace_all)
-        _btn_close.clicked.connect(bar.close)
+        _btn_close.clicked.connect(lambda: (bar.close(), setattr(self, "_fr_bar", None)))
         _find.setFocus()
 
     # ── Auto-backup ───────────────────────────────────────────────────────────
@@ -4536,6 +4922,7 @@ class WhisperRApp(QMainWindow):
             self.transcriber.finished_text.connect(self.on_text)
             self.transcriber.status_changed.connect(self.on_trans_status)
             self.transcriber.log_msg.connect(self._on_transcriber_log)
+            self.transcriber.model_not_found_sig.connect(self._on_model_not_found)
             app_logger.debug("→ Starting TranscriberWorker thread...")
             self.transcriber.start()
             app_logger.debug("✓ TranscriberWorker thread started")
@@ -5227,6 +5614,47 @@ class WhisperRApp(QMainWindow):
         )
         ai_layout.addRow("Min. Confidence (0-1):", self.cfg_conf_spin)
 
+        # ── Model cache folder ──────────────────────────────────────────────
+        import os as _os_hf
+        _default_hf = _os_hf.path.join(
+            _os_hf.path.expanduser("~"), ".cache", "huggingface", "hub")
+        _saved_hf = self.config.settings.get("hf_cache_path", "") or _default_hf
+        self.cfg_hf_path = QLineEdit(_saved_hf)
+        self.cfg_hf_path.setToolTip(
+            "Folder where Whisper model files are stored.\n"
+            "WhisperR looks here for cached models before attempting a download.\n"
+            "Default: %USERPROFILE%\\.cache\\huggingface\\hub")
+        self.cfg_hf_path.setStyleSheet(
+            "QLineEdit{background:#1a1a1a;color:#88ccff;font-family:monospace;font-size:9pt;}")
+        _btn_hf_browse = QPushButton("Browse…")
+        _btn_hf_browse.setToolTip("Choose a different folder containing model files.")
+        _btn_hf_browse.setStyleSheet(
+            "QPushButton{background:#2a2a2a;border:1px solid #444;padding:3px 10px;"
+            "border-radius:4px;}QPushButton:hover{border-color:#0078d7;}")
+        def _browse_hf_dir():
+            chosen = QFileDialog.getExistingDirectory(
+                self, "Select Model Cache Folder", self.cfg_hf_path.text())
+            if chosen:
+                self.cfg_hf_path.setText(chosen)
+        _btn_hf_browse.clicked.connect(_browse_hf_dir)
+        _btn_hf_open = QPushButton("📁 Open")
+        _btn_hf_open.setToolTip("Open the model cache folder in Explorer.")
+        _btn_hf_open.setStyleSheet(
+            "QPushButton{background:#2a2a2a;border:1px solid #444;padding:3px 10px;"
+            "border-radius:4px;}QPushButton:hover{border-color:#0078d7;}")
+        def _open_hf_dir():
+            import subprocess as _sp_hf2
+            try: _sp_hf2.Popen(["explorer", self.cfg_hf_path.text()])
+            except Exception: pass
+        _btn_hf_open.clicked.connect(_open_hf_dir)
+        _hf_row_w = QWidget()
+        _hf_row = QHBoxLayout(_hf_row_w)
+        _hf_row.setContentsMargins(0,0,0,0)
+        _hf_row.addWidget(self.cfg_hf_path, 1)
+        _hf_row.addWidget(_btn_hf_browse)
+        _hf_row.addWidget(_btn_hf_open)
+        ai_layout.addRow("Model cache:", _hf_row_w)
+
         ai_group.setLayout(ai_layout)
         main_layout.addWidget(ai_group)
 
@@ -5545,6 +5973,27 @@ class WhisperRApp(QMainWindow):
             "Maximum number of backup files to keep per project.\n"
             "Oldest backups are deleted when the limit is exceeded.")
         backup_layout.addRow("Keep up to:", self.cfg_backup_keep)
+        _btn_browse_bak = QPushButton("📁 Browse Backup Folder")
+        _btn_browse_bak.setToolTip(
+            "Open the folder containing backups for the currently loaded project.")
+        _btn_browse_bak.setStyleSheet(
+            "QPushButton{background:#2a2a2a;border:1px solid #444;padding:4px 10px;"
+            "border-radius:4px;color:#ddd;}"
+            "QPushButton:hover{background:#353535;border-color:#0078d7;}")
+        def _browse_bak():
+            import subprocess as _sp_bak
+            # Walk up to WhisperRApp to find active editor
+            _app_w = next((w for w in QApplication.topLevelWidgets()
+                           if w.__class__.__name__ == "WhisperRApp"), None)
+            _ed = getattr(_app_w, "_editor", None) if _app_w else None
+            _pp = getattr(_ed, "_project_path", None) if _ed else None
+            folder = str(_pp.parent) if _pp else str(Path.home())
+            try:
+                _sp_bak.Popen(["explorer", folder])
+            except Exception:
+                QMessageBox.information(self, "Backup Folder", folder)
+        _btn_browse_bak.clicked.connect(_browse_bak)
+        backup_layout.addRow(_btn_browse_bak)
         backup_group.setLayout(backup_layout)
         main_layout.addWidget(backup_group)
 
@@ -6121,6 +6570,7 @@ class WhisperRApp(QMainWindow):
         # Update all settings
         self.config.settings.update({
             "model": self.cfg_model.currentText(),
+            "hf_cache_path": self.cfg_hf_path.text(),
             "lang_name": self.cfg_lang.currentText(),
             "lang_code": LANG_MAP[self.cfg_lang.currentText()],
             "audio_folder": self.cfg_folder.text(),
@@ -6682,7 +7132,20 @@ class WhisperRApp(QMainWindow):
             if not _nw_poll:
                 self._editor._notes_win = _NotesWindow(self._editor)
                 _nw_poll = self._editor._notes_win
-            _nw_poll._add_note(text=current)
+            # Source tagging for notes mode
+            _note_text = current
+            if self.config.settings.get("cb_source_tag", False):
+                try:
+                    import ctypes as _ct_stn
+                    _hwnd_stn = _ct_stn.windll.user32.GetForegroundWindow()
+                    _buf_stn  = _ct_stn.create_unicode_buffer(256)
+                    _ct_stn.windll.user32.GetWindowTextW(_hwnd_stn, _buf_stn, 256)
+                    _src_stn = _buf_stn.value.strip()
+                    if _src_stn:
+                        _note_text = f"[{_src_stn}]\n{current}"
+                except Exception:
+                    pass
+            _nw_poll._add_note(text=_note_text)
             # Keep snapshot and app-level flag in sync
             self._editor._saved_notes_snapshot = _nw_poll.get_notes_data()
             self._editor_notes_open = True
@@ -8330,12 +8793,16 @@ class WhisperRApp(QMainWindow):
             if _sp and self._editor_remember:
                 try:
                     import json as _json_tew
+                    _nw_tew = getattr(self._editor, "_notes_win", None)
+                    _notes_tew = _nw_tew.get_notes_data() if _nw_tew else getattr(self, "_editor_saved_notes", [])
                     _sp.write_text(_json_tew.dumps({
                         "remember": True,
                         "content":  self._editor_saved_content,
                         "target_words": self._editor_saved_target,
                         "clipboard_prefill": getattr(self, "_editor_clipboard_prefill", False),
                         "cb_monitor": self._editor_cb_monitor_was_on,
+                        "notes": _notes_tew,
+                        "notes_open": bool(_nw_tew and _nw_tew.isVisible()),
                     }, ensure_ascii=False, indent=2), encoding="utf-8")
                 except Exception:
                     pass
@@ -8422,6 +8889,93 @@ class WhisperRApp(QMainWindow):
         _set_aot(_ed,   cfg.get("aot_editor",      False))
         _set_aot(getattr(_ed, "_notes_win",  None), cfg.get("aot_notes",      False))
         _set_aot(getattr(_ed, "_cheatsheet", None), cfg.get("aot_cheatsheet", False))
+
+
+    def _on_model_not_found(self, model_name: str, dest_path: str, hf_url: str):
+        """Show a helpful dialog when a model can't be loaded or downloaded."""
+        app_logger.warning(f"Model not found: {model_name}, dest={dest_path}")
+        try:
+            self._show_model_not_found_dialog(model_name, dest_path, hf_url)
+        except Exception as _e:
+            app_logger.error(f"model_not_found dialog failed: {_e}", exc_info=True)
+            QMessageBox.critical(self, f"Model Not Found — {model_name}",
+                f"Could not load model '{model_name}'.\n\n"
+                f"Target folder:\n{dest_path}\n\n"
+                f"Download from:\n{hf_url}")
+
+    def _show_model_not_found_dialog(self, model_name: str, dest_path: str, hf_url: str):
+        """Inner implementation — separated so exceptions surface cleanly."""
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel,
+                                     QPushButton, QHBoxLayout, QTextEdit)
+        import webbrowser as _wb
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Model Not Found — {model_name}")
+        dlg.resize(580, 440)
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(10)
+
+        lbl = QLabel(
+            f"<b>WhisperR could not load or download: <code>{model_name}</code></b><br><br>"
+            "This can happen when:<br>"
+            "&nbsp;• The model has never been downloaded on this machine<br>"
+            "&nbsp;• HuggingFace is unreachable (firewall, proxy, or no internet)<br>"
+            "&nbsp;• The cached model folder is incomplete or corrupted<br><br>"
+            "<b>How to fix it:</b><br>"
+            "&nbsp;1. Click <i>Open Download Page</i> and download all model files.<br>"
+            "&nbsp;2. Save them into the <b>Target folder</b> shown below (copy it first).<br>"
+            "&nbsp;3. Restart WhisperR.<br><br>"
+            "<b>If Windows Firewall is blocking the app:</b><br>"
+            "&nbsp;• Open <i>Windows Defender Firewall → Allow an app through firewall</i><br>"
+            "&nbsp;• Add WhisperR.exe to the allowed list for Private <i>and</i> Public networks.<br>"
+            "&nbsp;• Then restart WhisperR — it will download the model automatically.")
+        lbl.setWordWrap(True)
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(lbl)
+
+        path_lbl = QLabel("Target folder (save downloaded files here):")
+        path_lbl.setStyleSheet("font-weight:bold;margin-top:4px;")
+        lay.addWidget(path_lbl)
+        path_box = QTextEdit()
+        path_box.setPlainText(dest_path)
+        path_box.setReadOnly(True)
+        path_box.setFixedHeight(44)
+        path_box.setStyleSheet(
+            "background:#1a1a1a;color:#88ccff;border:1px solid #444;"
+            "font-family:monospace;padding:4px;font-size:9pt;")
+        lay.addWidget(path_box)
+
+        btn_row = QHBoxLayout()
+        _ss = ("QPushButton{background:#2a2a2a;border:1px solid #555;color:#ddd;"
+               "padding:5px 14px;border-radius:4px;font-size:9pt;}"
+               "QPushButton:hover{background:#353535;border-color:#0078d7;}")
+
+        btn_clip = QPushButton("📋  Copy Path")
+        btn_clip.setStyleSheet(_ss)
+        def _copy_path():
+            QApplication.clipboard().setText(dest_path)
+            btn_clip.setText("✓  Copied!")
+        btn_clip.clicked.connect(_copy_path)
+        btn_row.addWidget(btn_clip)
+
+        btn_browser = QPushButton("🌐  Open Download Page")
+        btn_browser.setStyleSheet(_ss)
+        btn_browser.clicked.connect(lambda: _wb.open(hf_url))
+        btn_row.addWidget(btn_browser)
+
+        btn_fw = QPushButton("🔒  Firewall Help")
+        btn_fw.setStyleSheet(_ss)
+        btn_fw.clicked.connect(lambda: _wb.open(
+            "ms-settings:windowsdefender"))
+        btn_row.addWidget(btn_fw)
+
+        btn_close = QPushButton("Close")
+        btn_close.setStyleSheet(_ss)
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_close)
+
+        lay.addLayout(btn_row)
+        dlg.exec()
 
     def normalize_hotkey(self, hotkey_str):
         """Convert our hotkey format to pynput format.
