@@ -2997,6 +2997,7 @@ class _NotesWindow(QWidget):
         self._undo_stack: list[dict] = []
         self._dragging_note = None   # active drag target
         self._color_filter: set = set()  # empty = show all colors
+        self._bulk_delete_snapshot: list = []  # for undoing Delete All
         self._build_ui()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
 
@@ -3018,6 +3019,15 @@ class _NotesWindow(QWidget):
         lbl.setStyleSheet("font-weight:bold;color:#ccc;font-size:10pt;")
         hdr.addWidget(lbl)
         hdr.addStretch()
+        self._btn_undo_all = QPushButton("↩ Restore All")
+        self._btn_undo_all.setToolTip("Restore all notes deleted by Delete All")
+        self._btn_undo_all.setStyleSheet(
+            "QPushButton{background:#3a2a00;border:1px solid #cc8800;"
+            "color:#ffcc44;border-radius:4px;padding:3px 8px;font-weight:bold;}"
+            "QPushButton:hover{background:#5a3a00;}")
+        self._btn_undo_all.clicked.connect(self._undo_delete_all)
+        self._btn_undo_all.setVisible(False)
+        hdr.addWidget(self._btn_undo_all)
         self._btn_undo = QPushButton("↩ Undo")
         self._btn_undo.setToolTip("Restore last deleted note")
         self._btn_undo.setStyleSheet(
@@ -3062,11 +3072,23 @@ class _NotesWindow(QWidget):
         btn_add.setStyleSheet(_ss + "QPushButton{padding:4px 10px;}")
         btn_add.clicked.connect(lambda: self._add_note_after_focused())
         foot.addWidget(btn_add)
+        # Delete All — sits right next to Add Note so users can't miss the pair
+        self._btn_del_all = QPushButton("🗑 Delete All")
+        self._btn_del_all.setToolTip(
+            "Delete ALL notes\n"
+            "Hold Shift to skip confirmation.\n"
+            "Undoable with the Restore All button that appears.")
+        self._btn_del_all.setStyleSheet(
+            "QPushButton{background:#2a2a2a;border:1px solid #444;"
+            "border-radius:4px;color:#cc4444;padding:4px 8px;}"
+            "QPushButton:hover{background:#3a1a1a;border-color:#e53935;color:#ff6b6b;}")
+        self._btn_del_all.clicked.connect(self._delete_all_notes)
+        foot.addWidget(self._btn_del_all)
         # Ctrl+Enter shortcut — add note after the currently focused one
         _sc_add = QShortcut(QKeySequence("Ctrl+Return"), self)
         _sc_add.setContext(Qt.ShortcutContext.WindowShortcut)
         _sc_add.activated.connect(self._add_note_after_focused)
-        # Color filter button + hidden-notes indicator
+        # Right side: filter indicator + filter button
         self._filter_btn = QPushButton("🎨")
         self._filter_btn.setFixedSize(28, 28)
         self._filter_btn.setToolTip(
@@ -3147,6 +3169,67 @@ class _NotesWindow(QWidget):
         self._add_note(data["text"], data["color_idx"])
         self._btn_undo.setVisible(bool(self._undo_stack))
 
+    def _delete_all_notes(self):
+        """Delete visible (filtered) notes, or all notes if no filter active.
+        Stores a full snapshot for undo regardless.
+        """
+        shift_held = bool(QApplication.keyboardModifiers() &
+                          Qt.KeyboardModifier.ShiftModifier)
+        # Determine which notes will be deleted
+        if self._color_filter:
+            # Only delete notes whose color is in the active filter (visible)
+            to_delete = [n for n in self._notes
+                         if n.get_color_idx() in self._color_filter]
+            label = f"Delete {len(to_delete)} Filtered Note(s)"
+            question = (
+                f"Delete {len(to_delete)} visible (filtered) note(s)?\n"
+                f"The {len(self._notes) - len(to_delete)} hidden note(s) "
+                f"will NOT be deleted.\n\n"
+                "You can restore deleted notes with the \u21a9 Restore All button.")
+        else:
+            to_delete = list(self._notes)
+            label = f"Delete All {len(to_delete)} Note(s)"
+            question = (
+                f"Delete all {len(to_delete)} note(s)?\n\n"
+                "You can restore them with the \u21a9 Restore All button.")
+        if not to_delete:
+            return
+        if not shift_held:
+            reply = QMessageBox.question(
+                self, label, question,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        # Snapshot ALL notes (including hidden) so Restore All is complete
+        self._bulk_delete_snapshot = self.get_notes_data()
+        self._undo_stack.clear()
+        self._btn_undo.setVisible(False)
+        for n in to_delete:
+            self._notes.remove(n)
+            n.setParent(None)
+            n.deleteLater()
+        # Ensure at least one blank note remains if everything was deleted
+        if not self._notes:
+            self._add_note()
+        self._btn_undo_all.setVisible(True)
+        self._apply_color_filter()
+
+    def _undo_delete_all(self):
+        """Restore notes snapshot saved by _delete_all_notes."""
+        if not self._bulk_delete_snapshot:
+            return
+        for n in list(self._notes):
+            n.setParent(None)
+            n.deleteLater()
+        self._notes.clear()
+        for item in self._bulk_delete_snapshot:
+            self._add_note(item.get("text", ""), item.get("color_idx", 0))
+        self._bulk_delete_snapshot = []
+        self._btn_undo_all.setVisible(False)
+        if self._color_filter:
+            self._apply_color_filter()
+
     def _collapse_all(self):
         for n in self._notes: n.collapse()
 
@@ -3215,6 +3298,21 @@ class _NotesWindow(QWidget):
             self._filter_indicator.show()
         else:
             self._filter_indicator.hide()
+        # Update Delete button label based on filter state
+        visible_count = len(self._notes) - hidden
+        if self._color_filter:
+            self._btn_del_all.setText(f"🗑 Delete Filtered ({visible_count})")
+            self._btn_del_all.setToolTip(
+                f"Delete only the {visible_count} visible (filtered) note(s)\n"
+                "Hidden notes are left untouched.\n"
+                "Hold Shift to skip confirmation.\n"
+                "Undoable with the Restore All button that appears.")
+        else:
+            self._btn_del_all.setText("🗑 Delete All")
+            self._btn_del_all.setToolTip(
+                "Delete ALL notes\n"
+                "Hold Shift to skip confirmation.\n"
+                "Undoable with the Restore All button that appears.")
 
     def get_notes_data(self):
         return [{"text": n.get_text(), "color_idx": n.get_color_idx()}
@@ -5218,6 +5316,7 @@ class WhisperRApp(QMainWindow):
             self._editor_cheatsheet_open: bool = False
             self._editor_notes_open: bool = False
             self._editor_saved_notes: list = []
+            self._editor_saved_filter: list = []   # notes color filter
             self._cb_monitor_mode: str = "text"
             # Load persisted editor content from disk (if "remember" was on last session)
             _ed_persist_path = Path(self.config.path).parent / "whisperr_editor.txt"
@@ -5237,6 +5336,7 @@ class WhisperRApp(QMainWindow):
                         self._editor_saved_target       = _st.get("target_words", 0)
                         self._editor_saved_notes        = _st.get("notes", [])
                         self._editor_notes_open         = _st.get("notes_open", False)
+                        self._editor_saved_filter       = _st.get("notes_filter", [])
                         app_logger.info(
                             f"Restored editor state: {len(self._editor_saved_content)}ch, "
                             f"target={self._editor_saved_target}")
@@ -7582,6 +7682,9 @@ class WhisperRApp(QMainWindow):
                 _saved_n = getattr(self, "_editor_saved_notes", [])
                 if _saved_n:
                     _nw_op.set_notes_data(_saved_n)
+                _saved_filt2 = getattr(self, "_editor_saved_filter", [])
+                if _saved_filt2:
+                    _nw_op.set_filter_state(_saved_filt2)
             _nw_op.show()
             _nw_op.raise_()
             _btn_n2 = getattr(self._editor, "btn_notes", None)
@@ -7642,6 +7745,7 @@ class WhisperRApp(QMainWindow):
         _nw = getattr(self._editor, "_notes_win", None)
         self._editor_saved_notes = _nw.get_notes_data() if _nw else []
         self._editor_notes_open = bool(_nw and _nw.isVisible())
+        self._editor_saved_filter = (_nw.get_filter_state() if _nw else [])
         _cs_oc = getattr(self._editor, "_cheatsheet", None)
         self._editor_cheatsheet_open = bool(_cs_oc and _cs_oc.isVisible())
         # Persist text/target only when remember is on
@@ -7669,6 +7773,7 @@ class WhisperRApp(QMainWindow):
                         "cb_monitor":      self._editor_cb_monitor_was_on,
                         "notes":           getattr(self, "_editor_saved_notes", []),
                         "notes_open":      getattr(self, "_editor_notes_open", False),
+                        "notes_filter":    getattr(self, "_editor_saved_filter", []),
                     }
                     _state_path.write_text(
                         _json_sv.dumps(_state, ensure_ascii=False, indent=2),
@@ -8909,6 +9014,7 @@ class WhisperRApp(QMainWindow):
                                 "cb_monitor": getattr(self, "_editor_cb_monitor_was_on", False),
                                 "notes": _notes_q,
                                 "notes_open": getattr(self, "_editor_notes_open", False),
+                                "notes_filter": getattr(self, "_editor_saved_filter", []),
                             }, ensure_ascii=False, indent=2), encoding="utf-8")
                         elif _sp.exists():
                             _sp.unlink(missing_ok=True)
@@ -9003,6 +9109,7 @@ class WhisperRApp(QMainWindow):
                         "cb_monitor": self._editor_cb_monitor_was_on,
                         "notes": _notes_tew,
                         "notes_open": bool(_nw_tew and _nw_tew.isVisible()),
+                        "notes_filter": (_nw_tew.get_filter_state() if _nw_tew else []),
                     }, ensure_ascii=False, indent=2), encoding="utf-8")
                 except Exception:
                     pass
@@ -9014,6 +9121,7 @@ class WhisperRApp(QMainWindow):
             self._editor_notes_open = bool(_nw and _nw.isVisible())
             # Snapshot notes content before hiding
             self._editor_saved_notes = _nw.get_notes_data() if _nw else []
+            self._editor_saved_filter = (_nw.get_filter_state() if _nw else [])
             self._editor.hide()
             # Hide panels together with editor
             if _cs and _cs.isVisible():
