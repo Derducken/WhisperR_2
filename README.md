@@ -1,6 +1,6 @@
 # WhisperR
 
-**Free, local, offline-capable AI speech-to-text — plus a full-featured writing and research workbench. No subscription. No cloud. No one listening.**
+**Free, local, offline-capable AI speech-to-text — plus a full-featured writing and research workbench. No subscription. No cloud. No one eavesdropping.**
 
 ![WhisperR v2.1.0](https://img.shields.io/badge/version-2.1.0-blue) ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green) ![Python](https://img.shields.io/badge/python-3.12-yellow)
 
