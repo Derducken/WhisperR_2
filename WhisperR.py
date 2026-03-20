@@ -14,89 +14,172 @@ import multiprocessing
 
 
 # ── Direct model downloader (bypasses huggingface_hub SSL issues) ──────────
-# Required files — download fails if any of these 404
-_HF_MODEL_REQUIRED = ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"]
-# Optional files — silently skipped if 404 (not all model sizes have them)
-_HF_MODEL_OPTIONAL = ["tokenizer_config.json", "preprocessor_config.json",
-                       "special_tokens_map.json"]
+#
+# Per-model fallback file lists (used only when HF API is unreachable).
+# large-v2/v3 do NOT have vocabulary.txt; smaller models DO.
+_HF_FALLBACK_FILES = {
+    "tiny":     (["config.json","model.bin","tokenizer.json","vocabulary.txt"],
+                 ["tokenizer_config.json","special_tokens_map.json","preprocessor_config.json"]),
+    "base":     (["config.json","model.bin","tokenizer.json","vocabulary.txt"],
+                 ["tokenizer_config.json","special_tokens_map.json","preprocessor_config.json"]),
+    "small":    (["config.json","model.bin","tokenizer.json","vocabulary.txt"],
+                 ["tokenizer_config.json","special_tokens_map.json","preprocessor_config.json"]),
+    "medium":   (["config.json","model.bin","tokenizer.json","vocabulary.txt"],
+                 ["tokenizer_config.json","special_tokens_map.json","preprocessor_config.json"]),
+    "large-v2": (["config.json","model.bin","tokenizer.json"],
+                 ["vocabulary.txt","tokenizer_config.json","special_tokens_map.json","preprocessor_config.json"]),
+    "large-v3": (["config.json","model.bin","tokenizer.json"],
+                 ["vocabulary.txt","tokenizer_config.json","special_tokens_map.json","preprocessor_config.json"]),
+}
+_HF_CORE_REQUIRED = {"config.json", "model.bin", "tokenizer.json"}
+
+
+def _get_hf_file_list(model_name, ssl_ctx, log_fn):
+    """Fetch the exact file list from the HF API. Returns list of filenames
+    or None if unreachable."""
+    import urllib.request as _ur, json as _j
+    url = f"https://huggingface.co/api/models/Systran/faster-whisper-{model_name}"
+    try:
+        req = _ur.Request(url, headers={"User-Agent": "WhisperR/2.0"})
+        with _ur.urlopen(req, timeout=8, context=ssl_ctx) as r:
+            data = _j.loads(r.read())
+            files = [s["rfilename"] for s in data.get("siblings", [])
+                     if not s["rfilename"].startswith(".")]
+            log_fn(f"  HF API: {len(files)} file(s) listed for {model_name}")
+            return files   # everything listed is needed
+    except Exception as e:
+        log_fn(f"  HF API unreachable ({e}) — using built-in file list")
+        return None
+
 
 def _download_model_direct(model_name, hf_home, log_fn):
-    """Download a faster-whisper model directly via urllib, bypassing
-    huggingface_hub (which requires SSL certs that aren't bundled in
-    frozen apps).  Returns the local snapshot path on success, None on fail."""
-    import os, urllib.request, ssl, json, hashlib
+    """Download a faster-whisper model directly via urllib.
 
-    repo_id   = f"Systran/faster-whisper-{model_name}"
-    repo_dir  = os.path.join(hf_home, f"models--Systran--faster-whisper-{model_name}")
-    snap_dir  = os.path.join(repo_dir, "snapshots", "main")
+    - Queries HF API for the exact file list (no hardcoded guesses)
+    - Falls back to a known-good per-model list if API is unreachable
+    - Skips files that already exist and are non-zero (resume-friendly)
+    - Retries each file once on transient failure
+    - Uses atomic rename (file.part -> file) to avoid partial reads
+    - Returns the local snapshot path on success, None on failure
+    """
+    import os, urllib.request as _ur, ssl
+
+    repo_id  = f"Systran/faster-whisper-{model_name}"
+    repo_dir = os.path.join(hf_home, f"models--Systran--faster-whisper-{model_name}")
+    snap_dir = os.path.join(repo_dir, "snapshots", "main")
     os.makedirs(snap_dir, exist_ok=True)
 
-    # Build an SSL context — try certifi bundle, fall back to unverified.
-    # Unverified is acceptable here: we're downloading read-only public model
-    # weights from a known URL, not transmitting secrets.
+    # Build SSL context
     ssl_ctx = ssl.create_default_context()
-    _cert_tried = []
-    for _cert_candidate in [
-        os.path.join(os.path.dirname(os.path.abspath(
-            getattr(__import__("sys"), "executable", ""))),
-            "_internal", "certifi", "cacert.pem"),
-        os.path.join(os.path.dirname(os.path.abspath(
-            getattr(__import__("sys"), "executable", ""))),
-            "certifi", "cacert.pem"),
+    _exe_dir = os.path.dirname(os.path.abspath(
+        getattr(__import__("sys"), "executable", __file__)))
+    _found_cert = False
+    for _cert in [
+        os.path.join(_exe_dir, "_internal", "certifi", "cacert.pem"),
+        os.path.join(_exe_dir, "certifi", "cacert.pem"),
+        os.path.join(_exe_dir, "_internal", "cacert.pem"),
     ]:
-        if os.path.isfile(_cert_candidate):
+        if os.path.isfile(_cert):
             try:
-                ssl_ctx.load_verify_locations(_cert_candidate)
-                _cert_tried.append(f"OK:{_cert_candidate}")
+                ssl_ctx.load_verify_locations(_cert)
+                _found_cert = True
+                log_fn(f"  SSL: cert bundle found")
                 break
-            except Exception as _ce:
-                _cert_tried.append(f"FAIL:{_cert_candidate}:{_ce}")
-    else:
-        # No cert bundle found — disable verification
+            except Exception:
+                pass
+    if not _found_cert:
         ssl_ctx = ssl._create_unverified_context()
-        log_fn("  SSL cert bundle not found — using unverified context")
+        log_fn("  SSL: no cert bundle — using unverified context")
 
-    base_url  = f"https://huggingface.co/{repo_id}/resolve/main"
-    all_files    = [(f, True)  for f in _HF_MODEL_REQUIRED] +                    [(f, False) for f in _HF_MODEL_OPTIONAL]
+    # Test the SSL context with a cheap HEAD request.
+    # If cert verification fails (e.g. VM clock skew), downgrade to
+    # unverified rather than blocking all downloads.
+    try:
+        import urllib.request as _ur_test
+        _tr = _ur_test.Request("https://huggingface.co",
+                               headers={"User-Agent": "WhisperR/2.0"},
+                               method="HEAD")
+        _ur_test.urlopen(_tr, timeout=6, context=ssl_ctx)
+    except Exception as _ssl_e:
+        _ssl_es = str(_ssl_e)
+        if "CERTIFICATE_VERIFY_FAILED" in _ssl_es or \
+           "not yet valid" in _ssl_es or \
+           "has expired" in _ssl_es:
+            log_fn(f"  SSL cert check failed: {_ssl_e}")
+            log_fn("  ⚠ This is usually caused by a wrong system clock.")
+            log_fn("  Falling back to unverified SSL (safe for public model downloads).")
+            ssl_ctx = ssl._create_unverified_context()
+        # Other errors (e.g. network down) are handled per-file below
 
-    for fname, required in all_files:
+    # Get file list
+    api_files = _get_hf_file_list(model_name, ssl_ctx, log_fn)
+    if api_files is not None:
+        # Everything the API lists is required; nothing is optional
+        required_files = api_files
+        optional_files = []
+    else:
+        required_files, optional_files = _HF_FALLBACK_FILES.get(
+            model_name,
+            (["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"], []))
+
+    base_url = f"https://huggingface.co/{repo_id}/resolve/main"
+
+    def _dl_file(fname, required):
         dest = os.path.join(snap_dir, fname)
         if os.path.isfile(dest) and os.path.getsize(dest) > 0:
             log_fn(f"  Skip (exists): {fname}")
-            continue
-        url = f"{base_url}/{fname}"
-        log_fn(f"  Downloading: {fname} ...")
-        try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "WhisperR/2.0"})
-            with urllib.request.urlopen(req, timeout=300,
-                                        context=ssl_ctx) as resp, \
-                 open(dest, "wb") as fout:
-                total = int(resp.headers.get("Content-Length", 0))
-                done  = 0
-                while True:
-                    chunk = resp.read(1 << 20)  # 1 MB
-                    if not chunk:
-                        break
-                    fout.write(chunk)
-                    done += len(chunk)
-                    if total:
-                        pct = done * 100 // total
-                        if pct % 10 == 0:
-                            log_fn(f"    {fname}: {pct}%  ({done//(1<<20)}MB / {total//(1<<20)}MB)")
-            log_fn(f"  ✓ {fname}  ({done//(1<<20) if done>1<<20 else done//1024}{'MB' if done>1<<20 else 'KB'})")
-        except Exception as e:
-            if required:
-                log_fn(f"  ✗ {fname} FAILED (required): {e}")
-                # Clean up incomplete file
-                try: os.remove(dest)
+            return True
+        url  = f"{base_url}/{fname}"
+        part = dest + ".part"
+        for attempt in range(2):
+            try:
+                req = _ur.Request(url, headers={"User-Agent": "WhisperR/2.0"})
+                with _ur.urlopen(req, timeout=300, context=ssl_ctx) as resp,                      open(part, "wb") as fout:
+                    total    = int(resp.headers.get("Content-Length", 0))
+                    done     = 0
+                    last_pct = -10
+                    while True:
+                        chunk = resp.read(1 << 20)
+                        if not chunk:
+                            break
+                        fout.write(chunk)
+                        done += len(chunk)
+                        if total:
+                            pct = done * 100 // total
+                            if pct - last_pct >= 10:
+                                last_pct = pct
+                                log_fn(f"    {fname}: {pct}%"
+                                       f"  ({done//(1<<20)}MB / {total//(1<<20)}MB)")
+                os.replace(part, dest)
+                sz = os.path.getsize(dest)
+                log_fn(f"  ✓ {fname}"
+                       f"  ({sz//(1<<20) if sz>=(1<<20) else sz//1024}"
+                       f"{'MB' if sz>=(1<<20) else 'KB'})")
+                return True
+            except Exception as e:
+                try: os.remove(part)
                 except Exception: pass
-                return None
-            else:
-                log_fn(f"  ✗ {fname} skipped (optional, 404 is OK): {e}")
+                if attempt == 0:
+                    log_fn(f"  ✗ {fname} attempt 1 failed: {e} — retrying...")
+                else:
+                    if required:
+                        log_fn(f"  ✗ {fname} FAILED after 2 attempts: {e}")
+                        return False
+                    else:
+                        log_fn(f"  ✗ {fname} skipped (optional): {e}")
+                        return True   # optional failure is non-fatal
+        return True
 
-    log_fn(f"  All files downloaded to {snap_dir}")
+    all_files = [(f, True)  for f in required_files] +                 [(f, False) for f in optional_files]
+
+    for fname, required in all_files:
+        if not _dl_file(fname, required):
+            log_fn(f"  Download aborted — {fname} is required but could not be downloaded")
+            return None
+
+    log_fn(f"  ✓ All files downloaded to {snap_dir}")
     return snap_dir
+
 
 def _ai_worker_process(task_q, result_q, log_q):
     """AI worker — runs in a child process, owns faster-whisper + ctranslate2."""
@@ -597,33 +680,27 @@ def _ai_worker_process(task_q, result_q, log_q):
                               if os.path.isdir(os.path.join(_snaps_dir, s))]
                     if _snaps:
                         _snap_path = os.path.join(_snaps_dir, sorted(_snaps)[-1])
-                        _snap_files = os.listdir(_snap_path)
+                        _snap_files  = os.listdir(_snap_path)
                         _has_weights = any(f.endswith(('.bin', '.ct2'))
                                            for f in _snap_files)
-                        _has_vocab   = "vocabulary.txt" in _snap_files
-                        if _has_weights and _has_vocab:
+                        _has_config  = "config.json" in _snap_files
+                        if _has_weights and _has_config:
+                            # Model is cached — vocabulary.txt presence is
+                            # model-dependent (large-v3 doesn't have it)
                             _model_path = _snap_path
-                            _log(f"  Resolved: {_model_path}")
-                        elif _has_weights and not _has_vocab:
-                            _log(f"  vocabulary.txt missing from snapshot "
-                                 f"— clearing for re-download")
-                            try:
-                                import shutil as _shu_v
-                                _shu_v.rmtree(_repo_dir)
-                                _log(f"  Cleared: {_repo_dir}")
-                            except Exception as _ve:
-                                _log(f"  Could not clear: {_ve}")
+                            _log(f"  Resolved: {_model_path} "
+                                 f"({len(_snap_files)} files)")
                         else:
-                            # Snapshot dir exists but has no weights — partial/corrupt
-                            # download. Remove it so WhisperModel can re-download cleanly.
-                            _log(f"  Snapshot empty (partial download) — clearing cache")
+                            # No weights yet — partial or corrupt download
+                            _log(f"  Snapshot incomplete ({_snap_files}) "
+                                 f"— clearing for re-download")
                             try:
                                 import shutil as _shu
                                 _shu.rmtree(_repo_dir)
                                 _log(f"  Cleared: {_repo_dir}")
                             except Exception as _rme:
                                 _log(f"  Could not clear cache: {_rme}")
-                            _model_path = model_name  # fall back to name for download
+                            _model_path = model_name
                     else:
                         _log(f"  No snapshots — clearing empty repo dir")
                         try:
@@ -1505,17 +1582,20 @@ class TranscriberWorker(QThread):
 
     # ── public API ────────────────────────────────────────────────
 
-    def preload_model(self):
-        """Ask the worker to pre-warm the model (runs before first recording)."""
+    def preload_model(self, model_name: str = ""):
+        """Ask the worker to pre-warm the model (runs before first recording).
+        Pass model_name to override the saved config (e.g. on dropdown change).
+        """
         cfg = self.config.settings
+        name    = model_name or cfg['model']
         compute = 'cpu' if self._cuda_failed else cfg.get('compute_pref', 'auto')
         task = (
-            cfg['model'], cfg['lang_code'], compute,
+            name, cfg['lang_code'], compute,
             None, None,           # audio_data=None, src=None → preload sentinel
             False, False, '',     # translate, use_vad, prompt
             0.0,                  # min_confidence (unused on preload)
         )
-        app_logger.info(f"TranscriberWorker.preload_model: queuing preload for model={cfg['model']} compute={compute}")
+        app_logger.info(f"TranscriberWorker.preload_model: queuing preload for model={name} compute={compute}")
         self._pending.put(task)
 
     def reload_model(self):
@@ -8024,14 +8104,30 @@ class WhisperRApp(QMainWindow):
 
     def _on_model_changed(self, model_name: str):
         """Called when the model dropdown selection changes.
-        Saves new selection and pre-warms the model immediately."""
+        Updates config immediately and triggers preload/download right away.
+        The user sees progress in the scratchpad without having to save first.
+        """
         if not hasattr(self, 'transcriber'):
             return
-        app_logger.info(f"Model changed to: {model_name} — preloading")
+        # Update config immediately so the worker gets the right model name
+        self.config.settings['model'] = model_name
+        try:
+            self.config.save()
+        except Exception:
+            pass
+        app_logger.info(f"Model changed to: {model_name} — preloading immediately")
         self._model_loading = True
         self._update_app_state()
-        self.scratchpad.append(f"[System] Model changed to {model_name} — loading in background...")
-        self.transcriber.preload_model()
+        self.scratchpad.append(
+            f"[System] Model changed to {model_name}\n"
+            f"[System] Downloading / loading in background — "
+            f"progress shown below...")
+        # Drain any pending preloads for previous model selections
+        while not self.transcriber._pending.empty():
+            try: self.transcriber._pending.get_nowait()
+            except Exception: break
+        # Queue the new model immediately, passing name directly
+        self.transcriber.preload_model(model_name=model_name)
 
     def _make_tray_icon(self, state: str) -> QIcon:
         """Draw a coloured circle QIcon for the system tray.
