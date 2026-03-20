@@ -189,15 +189,17 @@ def _ai_worker_process(task_q, result_q, log_q):
 
     _log(f"AI worker process started (pid={os.getpid()})")
 
-    # Enable faulthandler so crashes write a traceback to stderr
-    # (visible in the log if stderr is captured, otherwise helps with debugging)
+    # Enable faulthandler only when WHISPERR_DEBUG env var is set.
+    # Without the guard every run creates a file in TEMP — bad for SSDs.
     try:
-        import faulthandler
-        import tempfile
-        _fh_path = os.path.join(tempfile.gettempdir(), f'whisperr_crash_{os.getpid()}.txt')
-        _fh_file = open(_fh_path, 'w')
-        faulthandler.enable(file=_fh_file)
-        _log(f"  Crash log: {_fh_path}")
+        if os.environ.get("WHISPERR_DEBUG"):
+            import faulthandler
+            import tempfile
+            _fh_path = os.path.join(tempfile.gettempdir(),
+                                    f'whisperr_crash_{os.getpid()}.txt')
+            _fh_file = open(_fh_path, 'w')
+            faulthandler.enable(file=_fh_file)
+            _log(f"  Crash log: {_fh_path}")
     except Exception as _fe:
         _log(f"  faulthandler setup failed: {_fe}")
 
@@ -936,9 +938,14 @@ class AppConfig:
             "editor_hotkey": "ctrl+shift+alt+a",
             "editor_edit_hotkey": "ctrl+shift+x",
             "rollback_hotkey": "ctrl+shift+z",
-            "always_on_top": False,
-            "aot_main": False, "aot_editor": False,
-            "aot_notes": False, "aot_cheatsheet": False,
+            "always_on_top": True,
+            "aot_main": True, "aot_editor": True,
+            "aot_notes": True, "aot_cheatsheet": True,
+            "auto_backup_enabled": False,
+            "auto_backup_interval": 10,
+            "auto_backup_keep": 5,
+            "cb_source_tag": False,
+            "version_history_keep": 20,
             "live_mode": "Auto-Pause",
             "dict_mode": "Auto-Pause", "auto_pause_sec": 2.0,
             "noise_floor": 50, "speech_vol": 500,
@@ -2456,44 +2463,28 @@ class _HotkeyFilteredTextEdit(QTextEdit):
 class _NoteDragButton(QPushButton):
     """Compact drag-handle button in each note's top-bar.
 
-    Uses grabMouse() so move events arrive even when cursor leaves the button.
-    Cursor is managed on QApplication level so it stays correct after grab.
+    Does NOT use grabMouse() — that gives wrong coordinates on Windows inside
+    a QScrollArea.  Instead, on press we install a QApplication-level event
+    filter on _NotesWindow so it receives every subsequent mouse move/release
+    regardless of which widget the cursor is over.
     """
     def __init__(self, text, note: "QWidget", parent=None):
         super().__init__(text, parent)
         self._note = note
-        self._dragging = False
         self.setCursor(Qt.CursorShape.OpenHandCursor)
-        self.setMouseTracking(True)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._dragging = True
-            # Override app cursor (grabMouse resets widget cursor)
-            QApplication.setOverrideCursor(Qt.CursorShape.ClosedHandCursor)
-            self.grabMouse()
-            # Make dragged note semi-transparent
-            from PyQt6.QtWidgets import QGraphicsOpacityEffect
-            _eff = QGraphicsOpacityEffect(self._note)
-            _eff.setOpacity(0.45)
-            self._note.setGraphicsEffect(_eff)
+            nw = self._note._find_notes_win()
+            if nw:
+                nw._start_drag(self._note)
+        event.accept()
 
     def mouseMoveEvent(self, event):
-        if self._dragging:
-            nw = self._note._find_notes_win()
-            if nw:
-                nw._drag_move(self._note, event.globalPosition().toPoint())
+        event.accept()   # handled by the NotesWindow event filter
 
     def mouseReleaseEvent(self, event):
-        if self._dragging:
-            self._dragging = False
-            self.releaseMouse()
-            QApplication.restoreOverrideCursor()
-            self._note.setGraphicsEffect(None)
-            self._note._apply_color()
-            nw = self._note._find_notes_win()
-            if nw:
-                nw._drag_drop(self._note, event.globalPosition().toPoint())
+        event.accept()   # handled by the NotesWindow event filter
 
 
 
@@ -2648,6 +2639,7 @@ class _NotesWindow(QWidget):
         self._editor = editor
         self._notes: list[_NoteWidget] = []
         self._undo_stack: list[dict] = []
+        self._dragging_note = None   # active drag target
         self._build_ui()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
 
@@ -2693,6 +2685,13 @@ class _NotesWindow(QWidget):
         self._notes_layout.addStretch()
         scroll.setWidget(self._inner)
         root.addWidget(scroll, 1)
+        # Drop-indicator line (shown while dragging, hidden otherwise)
+        self._drop_line = QFrame(self._inner)
+        self._drop_line.setFrameShape(QFrame.Shape.HLine)
+        self._drop_line.setFixedHeight(5)
+        self._drop_line.setStyleSheet(
+            "QFrame{background:#0078d7;border:none;border-radius:2px;}")
+        self._drop_line.hide()
 
         # ── footer ──────────────────────────────────────────────────────────
         _ss = ("QPushButton{background:#2a2a2a;border:1px solid #444;"
@@ -2791,6 +2790,50 @@ class _NotesWindow(QWidget):
         if not self._notes:
             self._add_note()
 
+    # ── Drag infrastructure (app-level event filter approach) ─────────────
+
+    def _start_drag(self, note: _NoteWidget):
+        """Begin a drag session: set state, install event filter, update UI."""
+        self._dragging_note = note
+        QApplication.setOverrideCursor(Qt.CursorShape.ClosedHandCursor)
+        from PyQt6.QtWidgets import QGraphicsOpacityEffect
+        _eff = QGraphicsOpacityEffect(note)
+        _eff.setOpacity(0.45)
+        note.setGraphicsEffect(_eff)
+        QApplication.instance().installEventFilter(self)
+
+    def _end_drag(self, global_pos=None):
+        """Finish or cancel the current drag session."""
+        note = getattr(self, "_dragging_note", None)
+        self._dragging_note = None
+        QApplication.instance().removeEventFilter(self)
+        QApplication.restoreOverrideCursor()
+        self._drop_line.hide()
+        if note:
+            note.setGraphicsEffect(None)
+            note._apply_color()
+        if note and global_pos is not None:
+            self._drag_drop(note, global_pos)
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        note = getattr(self, "_dragging_note", None)
+        if note is None:
+            return False
+        t = event.type()
+        if t == QEvent.Type.MouseMove:
+            gp = event.globalPosition().toPoint()
+            self._drag_move(note, gp)
+            return True
+        if t == QEvent.Type.MouseButtonRelease:
+            gp = event.globalPosition().toPoint()
+            self._end_drag(gp)
+            return True
+        # Block press events so other drag buttons can't start a new drag
+        if t == QEvent.Type.MouseButtonPress:
+            return True
+        return False
+
     def refresh(self):
         pass
 
@@ -2831,6 +2874,8 @@ class _NotesWindow(QWidget):
         local_y = self._inner.mapFromGlobal(_gp).y()
         new_idx = self._drop_index(local_y, dragged)
         old_idx = self._notes.index(dragged)
+        # Clamp to valid range
+        new_idx = min(new_idx, len(self._notes) - 1)
         if new_idx == old_idx:
             return
         # Reorder in _notes list
@@ -2849,15 +2894,18 @@ class _NotesWindow(QWidget):
             note.show()
 
     def _drop_index(self, local_y: int, dragged: _NoteWidget) -> int:
-        """Return the index in self._notes where dragged should land."""
-        for i, n in enumerate(self._notes):
-            if n is dragged:
-                continue
+        """Return the insertion index (in self._notes) where dragged should land.
+        Computes against the visual midpoint of each non-dragged note.
+        """
+        others = [n for n in self._notes if n is not dragged]
+        for i, n in enumerate(others):
             n_top = n.mapTo(self._inner, n.rect().topLeft()).y()
             n_mid = n_top + n.height() // 2
             if local_y < n_mid:
-                return i
-        return len(self._notes) - 1
+                # Insert before this note — find its actual index in self._notes
+                return self._notes.index(n)
+        # After all others — insert at end
+        return len(self._notes)
 
 
 class _CheatsheetWindow(QWidget):
@@ -3126,22 +3174,51 @@ class WhisperEditor(QWidget):
         # Track which mode is active: None / "text" / "notes"
         self._cb_mode: str = "text"   # updated by toggle handlers
 
-        def _excl(sender, others):
-            if sender.isChecked():
-                for o in others:
-                    o.setChecked(False)
+        def _ensure_remember_on():
+            """Turn on remember without firing any mutual-exclusion logic."""
+            if not self.remember_toggle.isChecked():
+                self.remember_toggle.blockSignals(True)
+                self.remember_toggle.setChecked(True)
+                self.remember_toggle.blockSignals(False)
 
-        self.remember_toggle.toggled.connect(
-            lambda: _excl(self.remember_toggle,
-                [self.clipboard_prefill_toggle, self.clipboard_monitor_toggle]))
-        self.clipboard_prefill_toggle.toggled.connect(
-            lambda: _excl(self.clipboard_prefill_toggle,
-                [self.remember_toggle, self.clipboard_monitor_toggle]))
-        self.clipboard_monitor_toggle.toggled.connect(
-            lambda chk: (
-                self._start_clipboard_monitor() if chk else self._stop_clipboard_monitor(),
-                _excl(self.clipboard_monitor_toggle,
-                    [self.remember_toggle, self.clipboard_prefill_toggle])))
+        # remember_toggle: purely manual — never touched by other toggles
+        # (no auto-off when another is enabled)
+
+        # clipboard_prefill: mutually exclusive with monitor only
+        def _on_prefill_toggled(checked):
+            if checked:
+                self.clipboard_monitor_toggle.blockSignals(True)
+                self.clipboard_monitor_toggle.setChecked(False)
+                self.clipboard_monitor_toggle.blockSignals(False)
+                self.clipboard_monitor_toggle.setStyleSheet("QPushButton{}")
+                self.clipboard_monitor_toggle._cb_notes_mode = False
+                self._stop_clipboard_monitor()
+        self.clipboard_prefill_toggle.toggled.connect(_on_prefill_toggled)
+
+        # clipboard_monitor (left-click): text-append mode
+        def _on_monitor_toggled(checked):
+            if checked:
+                # If currently in notes mode, switching to text mode
+                _was_notes = getattr(
+                    self.clipboard_monitor_toggle, "_cb_notes_mode", False)
+                self.clipboard_monitor_toggle._cb_notes_mode = False
+                # Turn off prefill
+                self.clipboard_prefill_toggle.blockSignals(True)
+                self.clipboard_prefill_toggle.setChecked(False)
+                self.clipboard_prefill_toggle.blockSignals(False)
+                # Apply green style for text mode
+                self.clipboard_monitor_toggle.setStyleSheet(
+                    "QPushButton{background:#003a1a;border:2px solid #00cc55;"
+                    "color:#00ff77;border-radius:4px;padding:3px 8px;font-weight:bold;}")
+                self._start_clipboard_monitor()
+                _ensure_remember_on()
+            else:
+                # Only stop if not switching to notes mode
+                if not getattr(
+                        self.clipboard_monitor_toggle, "_cb_notes_mode", False):
+                    self._stop_clipboard_monitor()
+                    self.clipboard_monitor_toggle.setStyleSheet("QPushButton{}")
+        self.clipboard_monitor_toggle.toggled.connect(_on_monitor_toggled)
 
         for tog in (self.remember_toggle,
                     self.clipboard_prefill_toggle,
@@ -3251,6 +3328,12 @@ class WhisperEditor(QWidget):
             "QTextEdit{background:#111;color:#e0e0e0;border:1px solid #333;"
             "border-radius:4px;padding:6px;font-family:Consolas,monospace;}")
         self.editor.textChanged.connect(self._update_stats)
+        # Debounced history snapshot
+        self._history_timer = QTimer(self)
+        self._history_timer.setSingleShot(True)
+        self._history_timer.setInterval(5000)
+        self._history_timer.timeout.connect(self._push_history)
+        self.editor.textChanged.connect(lambda: self._history_timer.start())
         # Drop support
         self.editor.dragEnterEvent = self._drag_enter
         self.editor.dropEvent = self._drop_event
@@ -3534,22 +3617,47 @@ class WhisperEditor(QWidget):
     # ── Clipboard monitor (delegated to WhisperRApp for persistence) ────────
 
     def _toggle_cb_notes_mode(self):
-        """Right-click on clipboard monitor → switch to Notes mode."""
+        """Right-click on clipboard monitor → toggle Notes mode.
+        Right-click ON  → notes mode (blue), turn off text mode if active.
+        Right-click OFF → stop monitor, leave remember unchanged.
+        """
         host = self._get_host()
         if not host:
             return
-        # If notes mode already active → turn off
-        if getattr(host, "_cb_monitor_mode", "text") == "notes":
+        _btn = self.clipboard_monitor_toggle
+        in_notes_mode = getattr(_btn, "_cb_notes_mode", False)
+        if in_notes_mode:
+            # Turn off notes mode — stop monitor, clear style, leave remember
+            _btn._cb_notes_mode = False
             host.stop_clipboard_monitor()
-            self.clipboard_monitor_toggle.setChecked(False)
-            self.clipboard_monitor_toggle.setStyleSheet("")
+            _btn.blockSignals(True)
+            _btn.setChecked(False)
+            _btn.blockSignals(False)
+            _btn.setStyleSheet("QPushButton{}")
             return
-        # Switch to notes mode
-        self.clipboard_monitor_toggle.setChecked(True)
-        self.clipboard_monitor_toggle.setStyleSheet(
-            "QPushButton{background:#001a33;border:1px solid #0078d7;"
-            "color:#4ab3f4;border-radius:4px;padding:3px 8px;font-weight:bold;}")
+        # Activate notes mode
+        _btn._cb_notes_mode = True
+        # Stop text-mode monitor if running (mode will change to notes)
+        if host._cb_monitor_timer and host._cb_monitor_timer.isActive():
+            host.stop_clipboard_monitor()
+        # Turn off prefill
+        self.clipboard_prefill_toggle.blockSignals(True)
+        self.clipboard_prefill_toggle.setChecked(False)
+        self.clipboard_prefill_toggle.blockSignals(False)
+        # Set checked and apply blue style — block signals so _on_monitor_toggled
+        # does not fire (we handle start manually here)
+        _btn.blockSignals(True)
+        _btn.setChecked(True)
+        _btn.blockSignals(False)
+        _btn.setStyleSheet(
+            "QPushButton{background:#001a40;border:2px solid #0088ff;"
+            "color:#44bbff;border-radius:4px;padding:3px 8px;font-weight:bold;}")
         host.start_clipboard_monitor(mode="notes")
+        # Ensure remember is on (never turn it off)
+        if hasattr(self, "remember_toggle") and not self.remember_toggle.isChecked():
+            self.remember_toggle.blockSignals(True)
+            self.remember_toggle.setChecked(True)
+            self.remember_toggle.blockSignals(False)
 
     def _get_host(self):
         app = QApplication.instance()
@@ -3561,14 +3669,12 @@ class WhisperEditor(QWidget):
         host = self._get_host()
         if host:
             host.start_clipboard_monitor(mode="text")
-            self.clipboard_monitor_toggle.setStyleSheet("")
 
     def _stop_clipboard_monitor(self):
         """Delegate stop to the host app."""
         host = self._get_host()
         if host:
             host.stop_clipboard_monitor()
-        self.clipboard_monitor_toggle.setStyleSheet("")
 
     def _apply_formatting_hotkeys(self):
         """Register QShortcut hotkeys active only while this window is open."""
@@ -3590,6 +3696,8 @@ class WhisperEditor(QWidget):
             (cfg.get("editor_hk_kbd",       "Ctrl+Shift+D"),    self._fmt_kbd),
             (cfg.get("editor_hk_link",      "Ctrl+K"),          self._fmt_link),
             ("Ctrl+Shift+K",                                     lambda: self._fmt_link(use_clipboard=True)),
+            ("Ctrl+H",                                           self._show_find_replace),
+            ("Ctrl+Shift+H",                                     self._show_history),
         ]
         for keys, slot in shortcuts:
             try:
@@ -3760,6 +3868,7 @@ class WhisperEditor(QWidget):
         rt = getattr(self, "remember_toggle", None)
         if rt:
             rt.setChecked(True)
+        self._start_auto_backup()
 
     def _update_title(self):
         if self._project_path:
@@ -3814,8 +3923,213 @@ class WhisperEditor(QWidget):
                 encoding="utf-8")
             self._project_path = Path(path)
             self._update_title()
+            self._start_auto_backup()
         except Exception as e:
             QMessageBox.warning(self, "Save failed", str(e))
+
+
+    # ── Version history ───────────────────────────────────────────────────────
+
+    _MAX_HISTORY = 20   # overridden by config at runtime
+
+    def _push_history(self):
+        """Snapshot current text into version history."""
+        text = self.editor.toPlainText()
+        if not hasattr(self, "_version_history"):
+            self._version_history: list[tuple] = []  # [(timestamp, text), ...]
+        if self._version_history and self._version_history[-1][1] == text:
+            return  # unchanged
+        from datetime import datetime as _dt
+        keep = int(getattr(self.config if isinstance(self.config, dict)
+                           else getattr(self.config, "settings", {}),
+                           "version_history_keep", 20)
+                   if isinstance(self.config, int) else
+                   (self.config.settings if hasattr(self.config, "settings")
+                    else self.config).get("version_history_keep", 20))
+        self._version_history.append((_dt.now().strftime("%H:%M:%S"), text))
+        if len(self._version_history) > keep:
+            self._version_history.pop(0)
+
+    def _show_history(self):
+        """Show version history picker dialog."""
+        if not getattr(self, "_version_history", None):
+            QMessageBox.information(self, "Version History",
+                                    "No history yet for this session.")
+            return
+        from PyQt6.QtWidgets import QDialog, QListWidget, QDialogButtonBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Version History")
+        dlg.resize(480, 320)
+        lay = QVBoxLayout(dlg)
+        lbl = QLabel("Select a version to restore:")
+        lay.addWidget(lbl)
+        lst = QListWidget()
+        for ts, txt in reversed(self._version_history):
+            preview = txt[:80].replace("\n", " ")
+            lst.addItem(f"{ts}  —  {preview}{'…' if len(txt)>80 else ''}")
+        lay.addWidget(lst)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+        if dlg.exec() == QDialog.DialogCode.Accepted and lst.currentRow() >= 0:
+            idx = len(self._version_history) - 1 - lst.currentRow()
+            self._push_history()   # save current before restoring
+            self.editor.setPlainText(self._version_history[idx][1])
+
+    # ── Find & Replace ────────────────────────────────────────────────────────
+
+    def _show_find_replace(self):
+        """Open a non-modal Find / Replace bar inside the editor."""
+        if getattr(self, "_fr_bar", None) and self._fr_bar.isVisible():
+            self._fr_bar.close()
+            return
+        from PyQt6.QtWidgets import QWidget, QHBoxLayout, QLineEdit
+        bar = QWidget(self)
+        bar.setStyleSheet(
+            "QWidget{background:#252525;border-top:1px solid #444;}"
+            "QLineEdit{background:#1e1e1e;border:1px solid #555;color:#ddd;"
+            "padding:3px 6px;border-radius:3px;}")
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(6, 4, 6, 4)
+        h.setSpacing(6)
+        _find  = QLineEdit(); _find.setPlaceholderText("Find…"); _find.setFixedWidth(160)
+        _repl  = QLineEdit(); _repl.setPlaceholderText("Replace…"); _repl.setFixedWidth(160)
+        _ss = ("QPushButton{background:#2a2a2a;border:1px solid #555;color:#ddd;"
+               "padding:3px 8px;border-radius:3px;}"
+               "QPushButton:hover{background:#353535;border-color:#0078d7;}")
+        _btn_find = QPushButton("Find"); _btn_find.setStyleSheet(_ss)
+        _btn_repl = QPushButton("Replace"); _btn_repl.setStyleSheet(_ss)
+        _btn_all  = QPushButton("Replace All"); _btn_all.setStyleSheet(_ss)
+        _btn_re   = QCheckBox(".*"); _btn_re.setToolTip("Use regex"); _btn_re.setStyleSheet("color:#aaa;")
+        _btn_close = QPushButton("✕"); _btn_close.setFixedSize(22,22); _btn_close.setStyleSheet(_ss)
+        for w in (_find, _repl, _btn_find, _btn_repl, _btn_all, _btn_re, _btn_close):
+            h.addWidget(w)
+        h.addStretch()
+        self._fr_bar = bar
+        self._fr_find_edit = _find
+        # Insert bar into layout (above paste button row)
+        self.layout().addWidget(bar)
+
+        def _do_find(direction=1):
+            import re
+            needle = _find.text()
+            if not needle: return
+            doc = self.editor.document()
+            cur = self.editor.textCursor()
+            flags = QTextDocument.FindFlag(0)
+            if _btn_re.isChecked():
+                found = doc.find(QRegularExpression(needle), cur, flags)
+            else:
+                found = doc.find(needle, cur, flags)
+            if found.isNull():
+                # Wrap around
+                cur.movePosition(cur.MoveOperation.Start)
+                self.editor.setTextCursor(cur)
+                if _btn_re.isChecked():
+                    found = doc.find(QRegularExpression(needle), cur, flags)
+                else:
+                    found = doc.find(needle, cur, flags)
+            if not found.isNull():
+                self.editor.setTextCursor(found)
+
+        def _do_replace():
+            cur = self.editor.textCursor()
+            if cur.hasSelection():
+                cur.insertText(_repl.text())
+            _do_find()
+
+        def _do_replace_all():
+            import re
+            needle = _find.text()
+            repl   = _repl.text()
+            if not needle: return
+            text = self.editor.toPlainText()
+            if _btn_re.isChecked():
+                new_text = re.sub(needle, repl, text)
+            else:
+                new_text = text.replace(needle, repl)
+            count = text.count(needle) if not _btn_re.isChecked() else len(re.findall(needle, text))
+            self._push_history()
+            self.editor.setPlainText(new_text)
+            QMessageBox.information(self, "Replace All", f"Replaced {count} occurrence(s).")
+
+        _btn_find.clicked.connect(lambda: _do_find())
+        _find.returnPressed.connect(lambda: _do_find())
+        _btn_repl.clicked.connect(_do_replace)
+        _btn_all.clicked.connect(_do_replace_all)
+        _btn_close.clicked.connect(bar.close)
+        _find.setFocus()
+
+    # ── Auto-backup ───────────────────────────────────────────────────────────
+
+    def _start_auto_backup(self):
+        """Start (or restart) the auto-backup timer using current config."""
+        cfg = self.config.settings if hasattr(self.config, "settings") else self.config
+        if not cfg.get("auto_backup_enabled", False):
+            self._stop_auto_backup()
+            return
+        interval_min = int(cfg.get("auto_backup_interval", 10))
+        if not hasattr(self, "_backup_timer"):
+            self._backup_timer = QTimer(self)
+            self._backup_timer.timeout.connect(self._do_auto_backup)
+        self._backup_timer.start(interval_min * 60 * 1000)
+
+    def _stop_auto_backup(self):
+        if getattr(self, "_backup_timer", None):
+            self._backup_timer.stop()
+
+    def _do_auto_backup(self):
+        """Write a timestamped backup of the current project."""
+        cfg = self.config.settings if hasattr(self.config, "settings") else self.config
+        if not cfg.get("auto_backup_enabled", False):
+            return
+        text = self.editor.toPlainText()
+        if not text.strip():
+            return  # nothing to back up
+        # Need a save path
+        if not self._project_path:
+            reply = QMessageBox.question(
+                self, "Auto-backup",
+                "Auto-backup is enabled but the project hasn't been saved yet.\n"
+                "Save now so backups have a home?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if reply == QMessageBox.StandardButton.Yes:
+                self._save_project()
+            if not self._project_path:
+                return  # user cancelled
+        from datetime import datetime as _dt
+        import json as _jb
+        ts = _dt.now().strftime("%Y-%m-%d-%H-%M")
+        stem = self._project_path.stem
+        backup_path = self._project_path.parent / f"{stem}_{ts}.wrp.bak"
+        try:
+            # Build full project snapshot
+            _ts_spin = getattr(self, "target_spin", None)
+            if _ts_spin: _ts_spin.interpretText()
+            data = {
+                "version": 1,
+                "text": text,
+                "target_words": _ts_spin.value() if _ts_spin else 0,
+                "notes": (self._notes_win.get_notes_data() if self._notes_win else []),
+                "backup_timestamp": ts,
+            }
+            backup_path.write_text(
+                _jb.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            # Prune old backups
+            keep = int(cfg.get("auto_backup_keep", 5))
+            import glob as _gl
+            pattern = str(self._project_path.parent / f"{stem}_????-??-??-??-??.wrp.bak")
+            backups = sorted(_gl.glob(pattern))
+            for old in backups[:-keep]:
+                try: Path(old).unlink()
+                except Exception: pass
+            app_logger.info(f"Auto-backup saved: {backup_path.name}")
+        except Exception as e:
+            app_logger.warning(f"Auto-backup failed: {e}")
 
     # ── Import / Export (text only) ───────────────────────────────────────────
 
@@ -4323,9 +4637,17 @@ class WhisperRApp(QMainWindow):
             self._cursor_ops_pending: bool = False  # next transcription should be lowercased (select/move used)
             self._pending_edit = None  # (op, target) set by whisperreplace/insert triggers
             self._pre_clip_capture = None  # set by hotkey handler before Qt signal
-            self._editor: WhisperEditor | None = None  # built-in text editor window
-            self._editor_remember: bool = False      # persist editor content across open/close
-            self._editor_saved_content: str = ""     # content preserved when remember is on
+            self._editor: WhisperEditor | None = None
+            # Persisted editor state — defaults overwritten by JSON load below
+            self._editor_remember: bool = False
+            self._editor_saved_content: str = ""
+            self._editor_clipboard_prefill: bool = False
+            self._editor_saved_target: int = 0
+            self._editor_cb_monitor_was_on: bool = False
+            self._editor_cheatsheet_open: bool = False
+            self._editor_notes_open: bool = False
+            self._editor_saved_notes: list = []
+            self._cb_monitor_mode: str = "text"
             # Load persisted editor content from disk (if "remember" was on last session)
             _ed_persist_path = Path(self.config.path).parent / "whisperr_editor.txt"
             _ed_state_path   = Path(self.config.path).parent / "whisperr_editor_state.json"
@@ -4358,16 +4680,15 @@ class WhisperRApp(QMainWindow):
                         app_logger.info(f"Restored editor content ({len(_saved)} chars) from legacy txt")
                 except Exception as _e:
                     app_logger.warning(f"Could not restore editor content: {_e}")
-            self._editor_clipboard_prefill: bool = False  # prefill with clipboard on open
-            self._editor_saved_target: int = 0            # persisted target word count
-            self._editor_return_hwnd = None           # window to restore focus to after paste
-            self._cb_monitor_timer: QTimer | None = None  # app-level clipboard monitor
-            self._cb_monitor_mode: str = "text"            # "text" or "notes"
-            self._cb_monitor_last: str = ""               # last seen clipboard content
-            self._editor_cb_monitor_was_on: bool = False  # persists monitor toggle state
-            self._editor_cheatsheet_open: bool = False  # persists cheatsheet visibility
-            self._editor_notes_open: bool = False       # persists notes visibility
-            self._editor_saved_notes: list = []         # persists notes content
+            # Restart clipboard monitor after state is loaded
+            if self._editor_cb_monitor_was_on:
+                _mode_restart = self._cb_monitor_mode
+                self.start_clipboard_monitor(mode=_mode_restart)
+                app_logger.info(f"Clipboard monitor auto-restarted (mode={_mode_restart})")
+            # Non-persisted runtime state
+            self._editor_return_hwnd = None
+            self._cb_monitor_timer: QTimer | None = None
+            self._cb_monitor_last: str = ""
             # ── Wizard state ──────────────────────────────────────────
             # When a multi-step voice command is active, _wizard holds:
             #   op       : str   — "select"|"move"|"movebefore"|"moveafter"|
@@ -5198,6 +5519,57 @@ class WhisperRApp(QMainWindow):
         storage_group.setLayout(storage_layout)
         main_layout.addWidget(storage_group)
 
+        # --- Auto-Backup ---
+        backup_group = QGroupBox("Auto-Backup (Text Editor)")
+        backup_layout = QFormLayout()
+        self.cfg_backup_enabled = QCheckBox("Enable auto-backup while editing")
+        self.cfg_backup_enabled.setChecked(
+            self.config.settings.get("auto_backup_enabled", False))
+        self.cfg_backup_enabled.setToolTip(
+            "Periodically saves a timestamped .wrp.bak snapshot of the active project.\n"
+            "Backups are stored next to the project file.")
+        backup_layout.addRow(self.cfg_backup_enabled)
+        from PyQt6.QtWidgets import QSpinBox as _SB2
+        self.cfg_backup_interval = _SB2()
+        self.cfg_backup_interval.setRange(1, 120)
+        self.cfg_backup_interval.setSuffix(" min")
+        self.cfg_backup_interval.setValue(
+            int(self.config.settings.get("auto_backup_interval", 10)))
+        self.cfg_backup_interval.setToolTip("How often to take a backup snapshot.")
+        backup_layout.addRow("Backup every:", self.cfg_backup_interval)
+        self.cfg_backup_keep = _SB2()
+        self.cfg_backup_keep.setRange(1, 100)
+        self.cfg_backup_keep.setValue(
+            int(self.config.settings.get("auto_backup_keep", 5)))
+        self.cfg_backup_keep.setToolTip(
+            "Maximum number of backup files to keep per project.\n"
+            "Oldest backups are deleted when the limit is exceeded.")
+        backup_layout.addRow("Keep up to:", self.cfg_backup_keep)
+        backup_group.setLayout(backup_layout)
+        main_layout.addWidget(backup_group)
+
+        # --- Clipboard Monitor Options ---
+        cbmon_group = QGroupBox("Clipboard Monitor Options")
+        cbmon_layout = QFormLayout()
+        self.cfg_cb_source_tag = QCheckBox(
+            "Tag clipboard entries with their source window title")
+        self.cfg_cb_source_tag.setChecked(
+            self.config.settings.get("cb_source_tag", False))
+        self.cfg_cb_source_tag.setToolTip(
+            "Prepends [Window Title] to each clipboard entry\n"
+            "so you can track where each clip came from.")
+        cbmon_layout.addRow(self.cfg_cb_source_tag)
+        self.cfg_version_history = _SB2()
+        self.cfg_version_history.setRange(0, 200)
+        self.cfg_version_history.setValue(
+            int(self.config.settings.get("version_history_keep", 20)))
+        self.cfg_version_history.setToolTip(
+            "How many editor snapshots to keep in version history (0 = off).\n"
+            "Access history with Ctrl+Shift+H in the editor.")
+        cbmon_layout.addRow("Version history depth:", self.cfg_version_history)
+        cbmon_group.setLayout(cbmon_layout)
+        main_layout.addWidget(cbmon_group)
+
         # --- Advanced ---
         advanced_group = QGroupBox("Advanced")
         advanced_layout = QFormLayout()
@@ -5786,6 +6158,11 @@ class WhisperRApp(QMainWindow):
             "aot_editor": self.cfg_aot_editor.isChecked(),
             "aot_notes": self.cfg_aot_notes.isChecked(),
             "aot_cheatsheet": self.cfg_aot_cheatsheet.isChecked(),
+            "auto_backup_enabled":  self.cfg_backup_enabled.isChecked(),
+            "auto_backup_interval": self.cfg_backup_interval.value(),
+            "auto_backup_keep":     self.cfg_backup_keep.value(),
+            "cb_source_tag":        self.cfg_cb_source_tag.isChecked(),
+            "version_history_keep": self.cfg_version_history.value(),
             "min_to_tray": self.cfg_tray.isChecked(),
             "auto_space": self.cfg_space.isChecked(),
             "ind_show": self.cfg_ind_show.isChecked(),
@@ -6300,22 +6677,39 @@ class WhisperRApp(QMainWindow):
 
         mode = getattr(self, "_cb_monitor_mode", "text")
         if mode == "notes":
-            # Add as a new note (create notes window if needed)
-            if not self._editor._notes_win:
+            # Create notes window silently if needed
+            _nw_poll = getattr(self._editor, "_notes_win", None)
+            if not _nw_poll:
                 self._editor._notes_win = _NotesWindow(self._editor)
-            self._editor._notes_win._add_note(text=current)
-            # Keep snapshot in sync
-            self._editor._saved_notes_snapshot = (
-                self._editor._notes_win.get_notes_data())
+                _nw_poll = self._editor._notes_win
+            _nw_poll._add_note(text=current)
+            # Keep snapshot and app-level flag in sync
+            self._editor._saved_notes_snapshot = _nw_poll.get_notes_data()
+            self._editor_notes_open = True
         else:
             cur = self._editor.editor.textCursor()
             cur.movePosition(cur.MoveOperation.End)
             existing = self._editor.editor.toPlainText()
             sep = "\n\n" if existing.strip() else ""
-            cur.insertText(sep + current)
+            # Source tagging: prepend window title if enabled
+            _tagged = current
+            if self.config.settings.get("cb_source_tag", False):
+                try:
+                    import ctypes as _ct_st
+                    _hwnd_st = _ct_st.windll.user32.GetForegroundWindow()
+                    _buf_st  = _ct_st.create_unicode_buffer(256)
+                    _ct_st.windll.user32.GetWindowTextW(_hwnd_st, _buf_st, 256)
+                    _src_title = _buf_st.value.strip()
+                    if _src_title:
+                        _tagged = f"[{_src_title}]\n{current}"
+                except Exception:
+                    pass
+            cur.insertText(sep + _tagged)
             self._editor.editor.setTextCursor(cur)
             if self._editor.isVisible():
                 self._editor.editor.ensureCursorVisible()
+            # Keep saved content in sync so re-open shows accumulated text
+            self._editor_saved_content = self._editor.editor.toPlainText()
 
     def _open_editor(self, prefill: str = "", from_clipboard: bool = False):
         """Open the WhisperEditor window.
@@ -6472,13 +6866,19 @@ class WhisperRApp(QMainWindow):
         elif self._editor_remember and self._editor_saved_content and not prefill:
             prefill = self._editor_saved_content
 
-        # Re-use existing visible editor
-        if self._editor and self._editor.isVisible():
-            if from_clipboard and prefill:
-                self._editor.editor.setPlainText(prefill)
-            self._editor.raise_()
-            self._editor.activateWindow()
-            return
+        # Re-use existing editor (visible or kept alive by clipboard monitor)
+        if self._editor:
+            if self._editor.isVisible():
+                if from_clipboard and prefill:
+                    self._editor.editor.setPlainText(prefill)
+                self._editor.raise_()
+                self._editor.activateWindow()
+                return
+            # Editor exists but is hidden (monitor kept it) — just show it
+            # Don't replace it; it already has all the accumulated content.
+            _skip_create = True
+        else:
+            _skip_create = False
 
         # Clipboard prefill: always load CURRENT clipboard on open (not saved).
         # The toggle state persists; the content is always fresh each open.
@@ -6489,18 +6889,32 @@ class WhisperRApp(QMainWindow):
             except Exception:
                 pass
 
-        self._editor = WhisperEditor(
-            initial_text=prefill,
-            config=self.config,
-            parent=None)
-        # Restore toggle states
-        if self._editor_remember:
-            self._editor.remember_toggle.setChecked(True)
-        elif getattr(self, "_editor_clipboard_prefill", False):
-            self._editor.clipboard_prefill_toggle.setChecked(True)
-        # Restore monitor toggle if it was on (monitor itself already running on app)
+        if not _skip_create:
+            self._editor = WhisperEditor(
+                initial_text=prefill,
+                config=self.config,
+                parent=None)
+        # Restore toggle states — block signals to prevent _excl from
+        # unchecking the others while we restore each one independently.
+        for _tog in (self._editor.remember_toggle,
+                     self._editor.clipboard_prefill_toggle,
+                     self._editor.clipboard_monitor_toggle):
+            _tog.blockSignals(True)
+        self._editor.remember_toggle.setChecked(
+            bool(getattr(self, "_editor_remember", False)))
+        self._editor.clipboard_prefill_toggle.setChecked(
+            bool(getattr(self, "_editor_clipboard_prefill", False)))
+        self._editor.clipboard_monitor_toggle.setChecked(
+            bool(getattr(self, "_editor_cb_monitor_was_on", False)))
+        for _tog in (self._editor.remember_toggle,
+                     self._editor.clipboard_prefill_toggle,
+                     self._editor.clipboard_monitor_toggle):
+            _tog.blockSignals(False)
+        # If monitor was on, ensure it's still running
         if getattr(self, "_editor_cb_monitor_was_on", False):
-            self._editor.clipboard_monitor_toggle.setChecked(True)
+            if not (self._cb_monitor_timer and self._cb_monitor_timer.isActive()):
+                self.start_clipboard_monitor(
+                    mode=getattr(self, "_cb_monitor_mode", "text"))
         # Restore target word count
         if getattr(self, "_editor_saved_target", 0):
             self._editor.target_spin.setValue(self._editor_saved_target)
@@ -6513,9 +6927,14 @@ class WhisperRApp(QMainWindow):
             if _nw_op is None:
                 self._editor._notes_win = _NotesWindow(self._editor)
                 _nw_op = self._editor._notes_win
-            _saved_n = getattr(self, "_editor_saved_notes", [])
-            if _saved_n:
-                _nw_op.set_notes_data(_saved_n)
+            # Only restore from snapshot for a freshly-created editor.
+            # If the editor was kept alive (monitor running), its _notes_win
+            # already has the live up-to-date notes — overwriting would
+            # discard any notes added by the clipboard poll while hidden.
+            if not _skip_create:
+                _saved_n = getattr(self, "_editor_saved_notes", [])
+                if _saved_n:
+                    _nw_op.set_notes_data(_saved_n)
             _nw_op.show()
             _nw_op.raise_()
             _btn_n2 = getattr(self._editor, "btn_notes", None)
@@ -6532,22 +6951,31 @@ class WhisperRApp(QMainWindow):
                 self._editor._reposition_panels()
             if _btn3 is not None:
                 _btn3.setChecked(True)
-        self._editor.paste_requested.connect(self._editor_paste_to_app)
-        # Save content when editor is closed/hidden
-        self._editor.finished.connect(self._on_editor_closed)
+        if not _skip_create:
+            self._editor.paste_requested.connect(self._editor_paste_to_app)
+            # Save content when editor is closed/hidden
+            self._editor.finished.connect(self._on_editor_closed)
         # Re-sync clipboard monitor toggle with running state
         if self._cb_monitor_timer and self._cb_monitor_timer.isActive():
             if hasattr(self._editor, "clipboard_monitor_toggle"):
                 _mode = getattr(self, "_cb_monitor_mode", "text")
                 self._editor.clipboard_monitor_toggle.setChecked(True)
                 if _mode == "notes":
+                    self._editor.clipboard_monitor_toggle._cb_notes_mode = True
                     self._editor.clipboard_monitor_toggle.setStyleSheet(
-                        "QPushButton{background:#001a33;border:1px solid #0078d7;"
-                        "color:#4ab3f4;border-radius:4px;padding:3px 8px;font-weight:bold;}")
+                        "QPushButton{background:#001a40;border:2px solid #0088ff;"
+                        "color:#44bbff;border-radius:4px;padding:3px 8px;font-weight:bold;}")
+                else:
+                    self._editor.clipboard_monitor_toggle._cb_notes_mode = False
+                    self._editor.clipboard_monitor_toggle.setStyleSheet(
+                        "QPushButton{background:#003a1a;border:2px solid #00cc55;"
+                        "color:#00ff77;border-radius:4px;padding:3px 8px;font-weight:bold;}")
         self._editor.show()
         self._editor.raise_()
         self._editor.activateWindow()
         self._apply_always_on_top()
+        # Reposition panels after Qt processes the show event so geometry is fresh
+        QTimer.singleShot(0, self._editor._reposition_panels)
         self.scratchpad.append("[Editor] Opened — dictation now goes into the editor.")
 
     def _on_editor_closed(self):
@@ -7805,12 +8233,19 @@ class WhisperRApp(QMainWindow):
                             _target = self._editor_saved_target
                         _rem = self._editor_remember
                         if _rem:
+                            _nw_q = None
+                            if self._editor:
+                                _nw_q = getattr(self._editor, "_notes_win", None)
+                            _notes_q = (_nw_q.get_notes_data() if _nw_q
+                                        else getattr(self, "_editor_saved_notes", []))
                             _sp.write_text(_json_quit.dumps({
                                 "remember": True,
                                 "content":  _content_to_save,
                                 "target_words": _target,
                                 "clipboard_prefill": getattr(self, "_editor_clipboard_prefill", False),
                                 "cb_monitor": getattr(self, "_editor_cb_monitor_was_on", False),
+                                "notes": _notes_q,
+                                "notes_open": getattr(self, "_editor_notes_open", False),
                             }, ensure_ascii=False, indent=2), encoding="utf-8")
                         elif _sp.exists():
                             _sp.unlink(missing_ok=True)
@@ -7930,20 +8365,28 @@ class WhisperRApp(QMainWindow):
                 self._editor.set_voice_state(
                     getattr(self, "_is_listening", False))
             # Re-show notes if they were open
-            if self._editor and getattr(self, "_editor_notes_open", False):
+            _editor_notes_open = getattr(self, "_editor_notes_open", False)
+            _monitor_live = bool(
+                self._cb_monitor_timer and self._cb_monitor_timer.isActive())
+            if self._editor and (_editor_notes_open or _monitor_live):
                 _nw2 = getattr(self._editor, "_notes_win", None)
+                _nw2_was_none = _nw2 is None
                 if _nw2 is None:
                     self._editor._notes_win = _NotesWindow(self._editor)
                     _nw2 = self._editor._notes_win
-                # Restore saved notes data
-                _saved_notes = getattr(self, "_editor_saved_notes", [])
-                if _saved_notes:
-                    _nw2.set_notes_data(_saved_notes)
-                _nw2.show()
-                _nw2.raise_()
-                _btn_n = getattr(self._editor, "btn_notes", None)
-                if _btn_n: _btn_n.setChecked(True)
-                self._editor._reposition_panels()
+                # Only restore from snapshot when notes window was freshly created.
+                # If it already existed (editor kept alive by monitor), its notes
+                # are live and must not be overwritten with the stale snapshot.
+                if _nw2_was_none:
+                    _saved_notes = getattr(self, "_editor_saved_notes", [])
+                    if _saved_notes:
+                        _nw2.set_notes_data(_saved_notes)
+                if _editor_notes_open:
+                    _nw2.show()
+                    _nw2.raise_()
+                    _btn_n = getattr(self._editor, "btn_notes", None)
+                    if _btn_n: _btn_n.setChecked(True)
+                    self._editor._reposition_panels()
             # Re-show cheatsheet if it was open
             if self._editor and getattr(self, "_editor_cheatsheet_open", False):
                 _cs2 = getattr(self._editor, "_cheatsheet", None)
