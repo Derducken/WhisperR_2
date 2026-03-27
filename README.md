@@ -12,6 +12,14 @@ WhisperR is a Windows desktop application that turns your voice into text — ac
 
 It also happens to ship with a surprisingly capable writing and research editor that professionals, students, and content creators have found genuinely useful for day-to-day work. That part is also free. All of it is free. We are not sorry about this.
 
+## Vibe-coding alert!
+
+WhisperR is **vibe-coded**, initially with Google Gemini and, later, using Claude.
+
+A lot of work has gone in its design and the way all its features work and coexist to enable a voice-empowered writing/content-crafting workflow. It's the result of over thirty years of experience producing articles, tutorials, guides, and ebooks, for print and the web.
+
+However, "I get it" if you don't like that - honestly, for remember, my very line of work is writing, and that's one of the fields hurt the most by modern LLMs. Still, if you're one of the fine folks who brand everything created with AI-assistance as "AI slop", and would prefer I'd actually copy-pasted snippets of code one-by-one from other GitHub projects and Stack Overflow, changed three lines and four variables, and called it a day, instead of having an LLM "translate" dozens of pages of detailed instructions of "how this should look and work" into python code, well, you'd better skip this :-)
+
 ---
 
 ## Why WhisperR instead of [insert paid service here]?
@@ -43,8 +51,10 @@ Point a microphone at your mouth, press a hotkey, talk, let go. Your words appea
 - **Push-to-talk mode** for when you're in a noisy environment or don't trust the silence detection.
 - **Language support** for dozens of languages, with automatic detection if you're feeling spontaneous.
 - **Translation** — transcribe non-English speech directly into English text.
+- **Transcription Steering** — guide Whisper toward domain-specific vocabulary with a steering prompt (context-based) and a hotwords list (acoustically matched). Both are in the dedicated Transcription Steering settings tab.
 - **Terms / Text Expansion** — teach WhisperR that when you say "hexagon software" you mean "Hexagon Software™", or that "contact info" should expand to your full email signature. Works for both voice input and typed text.
 - **Voice Commands** — trigger custom actions, run scripts, or launch applications by saying predefined phrases.
+- **Batch file transcription** — queue multiple audio files for transcription with a progress bar and cancel button; drop them in or use the Add Files browser
 - **Folder monitoring** — drop audio files into a watched folder and have them transcribed automatically.
 - **Confidence filtering** — discard low-confidence transcriptions that are more likely hallucinations than words you actually said.
 
@@ -166,9 +176,11 @@ WhisperR is built on:
 
 ### Step 1: Run the app
 
-Double-click `WhisperR.exe`. A window appears. The app immediately begins downloading the `tiny` Whisper model in the background — you'll see a progress message in the text area at the bottom. Wait for it to finish. It's about 150 MB and takes a minute or two on a normal connection.
+Double-click `WhisperR.exe`. A window appears. The app immediately begins downloading the `tiny` Whisper model in the background — you'll see progress messages in the scratchpad area at the bottom. Wait for it to finish. It's about 150 MB and takes a minute or two on a normal connection.
 
-When you see `✓ tiny loaded on GPU (float16)` or `✓ tiny loaded on CPU (float32)` in the scratchpad, the app is ready.
+When you see `✓ tiny loaded` in the scratchpad, the app is ready.
+
+> **Tip:** You only need an internet connection once, for the initial model download. After that, WhisperR works completely offline.
 
 ### Step 2: Select your microphone
 
@@ -293,7 +305,19 @@ The three available modes are:
 
 **Push-to-Talk** is not a mode — it's a separate hotkey (Ctrl+Shift+Space by default) that records only while held, regardless of which mode is selected.
 
+> **VAD vs Auto-Pause:** When VAD is enabled in Settings → Advanced, it replaces Auto-Pause's volume-based silence detection with a neural network that actually recognises speech. VAD is generally more accurate in noisy environments. The three VAD tuning parameters (Threshold, Min Silence, Min Speech) are described in the VAD Fine-Tuning section below.
+
 **Configuring Noise Floor and Speech Volume for Auto-Pause:** These two settings in Audio Input Settings determine when Auto-Pause considers you to be speaking vs silent. The Noise Floor is the threshold below which audio is treated as background noise. The Speech Volume is the threshold above which audio is treated as active speech. The gap between them prevents rapid toggling. If Auto-Pause is cutting off your words, lower the Speech Volume. If it's triggering on ambient noise, raise the Noise Floor. Start the app speaking normally at your typical dictation volume and adjust from there.
+
+### VAD Fine-Tuning (Settings → Advanced)
+
+When VAD (Voice Activity Detection) is enabled, three additional parameters in Settings → Advanced control its behaviour:
+
+**VAD Threshold** — Silero VAD sensitivity from 0.01 to 0.99. Higher values mean only confident speech activates recording; lower values are more sensitive and may trigger on background noise. Default: 0.50.
+
+**VAD Min Silence** — Milliseconds of silence required before a speech segment is sent for transcription. Lower values give faster response but more sentence fragments; higher values produce fuller sentences with more latency. Default: 2000 ms.
+
+**VAD Min Speech** — Minimum speech duration for a segment to be considered valid. Sounds shorter than this (brief noise bursts, throat-clearing) are ignored. Default: 250 ms.
 
 ### Where Text Goes
 
@@ -380,11 +404,25 @@ Useful if you're dictating while using other applications and want the WhisperR 
 
 Backups are stored alongside the project file (same folder) with the naming convention `ProjectName_YYYY-MM-DD-HH-MM.wrp.bak`. They can be loaded directly via the editor's Load button if you need to recover an earlier version.
 
+### Optional Tools
+
+Found at the bottom of Settings → **Settings** tab. Shows which optional tools are installed and provides installation guidance.
+
+**How optional tools work in the compiled app:** WhisperR is a self-contained `.exe`. Python packages like `harper-py` or `python-docx` cannot be installed into it after the fact — they must be bundled at build time. The Optional Tools panel shows their status and explains what to do:
+
+- **Pandoc** — a standalone installer (`.msi`) that adds `pandoc.exe` to your system PATH. Works with the compiled app because WhisperR finds it via PATH, not as a Python package. Download from [pandoc.org/installing.html](https://pandoc.org/installing.html), install it, restart WhisperR.
+- **Harper** — must be bundled at build time. End users of the compiled app cannot install it separately. Check the WhisperR GitHub releases page for builds that include Harper.
+- **python-docx** — must be bundled at build time. If Pandoc is installed, DOCX export uses Pandoc instead and python-docx is not needed.
+
 ### Clipboard Monitor Options
 
 **Tag clipboard entries with their source window title** — When the clipboard monitor captures a clip, prepend `[Window Title]` to the text. Lets you see at a glance whether a passage came from a browser tab, a PDF viewer, or another source.
 
-**Version history depth** — How many editor snapshots to retain in the session's version history (access via Ctrl+Alt+H). 0 disables it.
+### History & Auto-Backup (Text Editor)
+
+**Version history depth** — How many in-session editor snapshots to keep (0 = disabled). Snapshots are taken automatically as you type and on every save. Access them with Ctrl+Alt+H in the editor. This setting lives alongside auto-backup because both are about preserving your work — version history for the current session, auto-backup for named projects on disk.
+
+The remaining auto-backup settings (interval, keep count, browse folder) are described in the Auto-backup section above — they now share this group in Settings.
 
 ### Advanced
 
@@ -446,9 +484,19 @@ Running along the bottom of the editor is a row of buttons:
 
 **📂 Load / Import** — Left-click to load a `.wrp` project file. Right-click to import a plain `.txt` or `.md` file into the current text area.
 
-**💾 Save / Export** — Left-click to save as a `.wrp` project (preserves everything: text, notes, word target). Right-click to export as a plain text file.
+**💾 Save / Export** — Left-click to save as a `.wrp` project (preserves text, notes, word target, and all editor state). Right-click to export in your chosen format — available options depend on what's installed on your system:
+
+- **Markdown (.md) and Plain Text (.txt)** — always available
+- **HTML (.html)** — always available; produces a self-contained file with light CSS styling
+- **Word Document (.docx)** — available if [Pandoc](https://pandoc.org) or `python-docx` is installed; Pandoc produces better results
+- **PDF (.pdf)** — available if Pandoc is installed
+
+Pandoc is detected automatically at export time — no configuration needed.
+
 
 **📋 Copy** — Copies all text in the editor to the clipboard.
+
+**📋 Preset dropdown** — Select a document template to instantly populate the editor with a structured starting point. Available: Interview, Meeting Notes, Lecture/Talk, Research Notes, Draft/Freewrite. Prompts for confirmation if the editor has content.
 
 **🔍 Find** — Opens the Find & Replace bar (or close it if already open). Also Ctrl+H.
 
@@ -487,6 +535,12 @@ The formatting buttons use Markdown syntax. The editor is a plain-text Markdown 
 | • | `- text` | Ctrl+Shift+B |
 | 1. | `1. text` | Ctrl+Shift+N |
 | ☐ | `- [ ] text` | Ctrl+Shift+T |
+
+### Spell and Grammar Checking
+
+If `harper-py` is installed (`pip install harper-py`), WhisperR checks spelling and grammar as you type. Errors appear as red wavy underlines. Right-click any underlined word to see the error description and up to five suggested corrections — clicking one applies it immediately. The check runs in a background thread 2 seconds after you stop typing.
+
+Harper is fully offline with no network calls. It catches common English errors: subject-verb agreement, punctuation misuse, commonly confused words. Install it once and it activates automatically.
 
 ### Find & Replace (Ctrl+H)
 
@@ -635,17 +689,23 @@ Any transcription that exactly matches or starts with a phrase in the hallucinat
 
 You can add model-specific hallucinations you encounter. If you find that a particular phrase keeps appearing in your transcriptions during silence, add it here.
 
-### AI Prompt
+### Transcription Steering
 
-The AI Prompt field lets you provide a "hint" to the Whisper model about what kind of content to expect. This can guide the model toward correct spelling of unusual terms, specific writing styles, or technical vocabulary.
+Found in Settings → **Transcription Steering** tab. Two complementary tools for guiding Whisper toward domain-specific vocabulary.
 
-For example, if you're dictating a medical document, you might enter:
-> *Medical transcription. Patient notes. Clinical terminology.*
+**Steering Prompt** — Freeform context sent to Whisper before every transcription. Describe what you'll be talking about: content type, domain terms, proper nouns, abbreviations. This biases the model's language predictions.
 
-Or for a technical interview:
-> *Software engineering. Python, Kubernetes, microservices architecture.*
+Example for medical dictation:
+> *Medical transcription. Patient notes. Drug names: metformin, lisinopril.*
 
-This is optional and has modest impact, but it's there if you want fine-grained control.
+Example for a software interview:
+> *Software engineering. Python, Kubernetes, REST API, CI/CD pipeline.*
+
+**Vocabulary Boost (Hotwords)** — One word or phrase per line that Whisper should prioritise acoustically — matched against what it actually hears, not just used as context. Best for specific terms that the prompt alone doesn't fix. Keep the list short; too many entries can hurt overall accuracy.
+
+**When to use which:** The prompt is better for setting general context. Hotwords are better for specific terms that keep being transcribed incorrectly despite being in the prompt.
+
+Both the prompt and hotwords have Import/Export buttons for `.txt` files, and both are saved to the app config and restored on next launch.
 
 ---
 

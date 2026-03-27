@@ -605,7 +605,7 @@ def _ai_worker_process(task_q, result_q, log_q):
             _log("AI worker: received stop signal, exiting")
             break
 
-        model_name, lang_code, compute_pref, audio_data, src, translate, use_vad, prompt, min_confidence = msg
+        model_name, lang_code, compute_pref, audio_data, src, translate, use_vad, prompt, min_confidence, hotwords, vad_params = msg
 
         # If VAD failed in a previous task this session, honour that for all future tasks.
         if _vad_broken and use_vad:
@@ -1001,7 +1001,9 @@ def _ai_worker_process(task_q, result_q, log_q):
                 language=lang_code if lang_code != 'auto' else None,
                 task='translate' if translate else 'transcribe',
                 vad_filter=use_vad,
+                vad_parameters=vad_params if (use_vad and vad_params) else None,
                 initial_prompt=prompt or None,
+                hotwords=hotwords if hotwords else None,
             )
             seg_list = list(segments)
             # Emit each segment with its logprob so the main process can filter.
@@ -1132,9 +1134,9 @@ from pynput import keyboard
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, 
     QPushButton, QComboBox, QLabel, QFileDialog, QTabWidget, QCheckBox, 
-    QDoubleSpinBox, QProgressBar, QFormLayout, QLineEdit, QGroupBox, QSpinBox, 
+    QDoubleSpinBox, QProgressBar, QFormLayout, QLineEdit, QGroupBox, QSpinBox, QPlainTextEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QDialog, QMessageBox,
-    QSystemTrayIcon, QMenu, QSlider, QListWidget, QListWidgetItem, QAbstractItemView, QSplitter,
+    QSystemTrayIcon, QMenu, QSlider, QListWidget, QListWidgetItem, QRadioButton, QAbstractItemView, QSplitter,
     QFrame, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QPoint, QObject, QEvent
@@ -1143,6 +1145,14 @@ from PyQt6.QtGui import (QPainter, QColor, QFont, QIcon, QAction, QKeyEvent, QPi
 
 # --- 3. CONSTANTS ---
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
+
+EDITOR_PRESETS = {
+    "Interview":       "# Interview\n\n**Date:** \n**Interviewer:** \n**Subject:** \n\n---\n\n**Q:** \n\n**A:** \n\n",
+    "Meeting Notes":   "# Meeting Notes\n\n**Date:** \n**Attendees:** \n**Agenda:** \n\n---\n\n## Discussion\n\n\n\n## Action Items\n\n- [ ] \n\n## Next Meeting\n\n",
+    "Lecture / Talk":  "# Lecture: \n\n**Speaker:** \n**Date:** \n**Source:** \n\n---\n\n## Key Points\n\n\n\n## Notes\n\n\n\n## References\n\n",
+    "Research Notes":  "# Research: \n\n**Topic:** \n**Date:** \n\n---\n\n## Summary\n\n\n\n## Sources\n\n\n\n## Questions\n\n",
+    "Draft / Freewrite": "",
+}
 LANG_MAP = {"Auto": None, "English": "en", "Greek": "el", "German": "de", "French": "fr", "Spanish": "es"}
 # Known Whisper hallucination patterns — matched as SUBSTRINGS (case-insensitive).
 # A transcription is dropped if its entire text (stripped) is one of these,
@@ -1257,6 +1267,7 @@ class AppConfig:
             "hf_cache_path": "",   # empty = use default HF cache location
             "translate": False, "timestamps": False,
             "initial_prompt": "General professional writing. The speaker may use technical terminology across a variety of fields. Software names: Microsoft Word, Excel, PowerPoint, Google Docs, Sheets, Slides, VS Code, GitHub, ChatGPT, WhisperR. Technology terms: API, JSON, XML, HTML, CSS, JavaScript, Python, SQL, GPU, CPU, RAM, SSD, HDD, USB, Wi-Fi, Bluetooth, HTTPS. Business terms: KPI, ROI, B2B, B2C, SaaS, MVP, NDA, CRM. Measurements and abbreviations: GB, TB, MHz, GHz, ms, fps, dpi, OK, AI, ML, AR, VR, UI, UX. When the speaker says 'okay' in a sentence, transcribe it as 'OK'.",
+            "hotwords": [],
             "audio_folder": str(Path.home() / "WhisperR_Recordings"),
             "mon_folder": str(Path.home() / "WhisperR_Watch"),
             "clear_exit": True, "save_to_disk": False, "auto_space": True,
@@ -1278,6 +1289,12 @@ class AppConfig:
             "auto_backup_keep": 5,
             "cb_source_tag": True,
             "version_history_keep": 20,
+            "version_history_infinite": False,
+            # App-state snapshots
+            "snapshots_enabled": False,
+            "snapshots_mode": "count",  # "count" or "duration"
+            "snapshots_keep_count": 60,   # snapshots to keep
+            "snapshots_keep_hours": 24,   # hours of history to keep
             "live_mode": "Auto-Pause",
             "dict_mode": "Auto-Pause", "auto_pause_sec": 2.0,
             "noise_floor": 50, "speech_vol": 500,
@@ -1296,6 +1313,9 @@ class AppConfig:
             "bar_thickness": 3, "ind_opacity": 220, "bar_opacity": 220,
             "ind_hide_idle": True,
             "log_level": "NONE", "use_vad": True,
+            "vad_threshold": 0.5,
+            "vad_min_silence_ms": 2000,
+            "vad_min_speech_ms": 250,
             "ft_output_folder": str(Path.home() / "WhisperR_Output"),
             "ft_mon_folder": str(Path.home() / "WhisperR_Watch"),
             "ft_mon_enabled": False,
@@ -1593,6 +1613,8 @@ class TranscriberWorker(QThread):
             None, None,           # audio_data=None, src=None → preload sentinel
             False, False, '',     # translate, use_vad, prompt
             0.0,                  # min_confidence (unused on preload)
+            [],                   # hotwords
+            {},                   # vad_params
         )
         app_logger.info(f"TranscriberWorker.preload_model: queuing preload for model={name} compute={compute}")
         self._pending.put(task)
@@ -1614,6 +1636,12 @@ class TranscriberWorker(QThread):
             cfg.get('use_vad', False),
             cfg.get('initial_prompt', ''),
             cfg.get('min_confidence', 0.0) if cfg.get('use_confidence', False) else 0.0,
+            cfg.get('hotwords', []),
+            {
+                "threshold": float(cfg.get("vad_threshold", 0.5)),
+                "min_silence_duration_ms": int(cfg.get("vad_min_silence_ms", 2000)),
+                "min_speech_duration_ms":  int(cfg.get("vad_min_speech_ms", 250)),
+            },
         )
         self._pending.put(task)
 
@@ -2696,6 +2724,44 @@ def _smart_case_punct(original: str, new_text: str) -> str:
 # pyautogui + focus-restoration fragility.
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class _HarperLint:
+    """Lazy wrapper around harper-py. Fails silently if not installed."""
+    _checker = None
+    _available = None
+
+    @classmethod
+    def available(cls):
+        if cls._available is None:
+            try:
+                import harper  # noqa
+                cls._available = True
+            except ImportError:
+                cls._available = False
+        return cls._available
+
+    @classmethod
+    def lint(cls, text):
+        """Return list of (start, end, message, [suggestions]) tuples."""
+        if not cls.available():
+            return []
+        try:
+            import harper
+            doc    = harper.DocText(text)
+            lints  = doc.lint()
+            result = []
+            for l in lints:
+                span = l.span()
+                result.append((
+                    span[0], span[1],
+                    l.message(),
+                    list(l.suggestions()) if hasattr(l, 'suggestions') else [],
+                ))
+            return result
+        except Exception:
+            return []
+
+
+
 class _MdHighlighter(QSyntaxHighlighter):
     """Live Markdown syntax highlighter for WhisperEditor.
 
@@ -2743,6 +2809,31 @@ class _MdHighlighter(QSyntaxHighlighter):
         for pattern, fmt in self._rules:
             for m in pattern.finditer(text):
                 self.setFormat(m.start(), m.end() - m.start(), fmt)
+        # Lint underlines — applied AFTER Markdown so they show on top
+        block_start = self.currentBlock().position()
+        self._apply_lint(block_start, text)
+
+    def set_lint_errors(self, lint_list):
+        """Update error spans and re-highlight. lint_list: [(start,end,msg,[sugg])]"""
+        self._lint_errors = lint_list
+        self.rehighlight()
+
+    def _apply_lint(self, block_start, text):
+        """Apply wavy-underline format to lint spans overlapping this block."""
+        if not hasattr(self, '_lint_errors') or not self._lint_errors:
+            return
+        block_end = block_start + len(text)
+        err_fmt = QTextCharFormat()
+        err_fmt.setUnderlineColor(QColor("#ff4444"))
+        err_fmt.setUnderlineStyle(
+            QTextCharFormat.UnderlineStyle.SpellCheckUnderline)
+        for (start, end, _msg, _sugg) in self._lint_errors:
+            # Clamp to this block
+            s = max(start - block_start, 0)
+            e = min(end   - block_start, len(text))
+            if s < e:
+                self.setFormat(s, e - s, err_fmt)
+
 
 
 class _HotkeyFilteredTextEdit(QTextEdit):
@@ -3122,6 +3213,31 @@ class _NotesWindow(QWidget):
         foot.addWidget(btn_col)
         foot.addWidget(btn_exp)
         root.addLayout(foot)
+        # ── import/export row ───────────────────────────────────────────
+        _ss2 = ("QPushButton{background:#2a2a2a;border:1px solid #444;"
+                "border-radius:4px;color:#aaa;font-size:9pt;padding:3px 8px;}"
+                "QPushButton:hover{background:#353535;border-color:#0078d7;color:#ddd;}")
+        io_row = QHBoxLayout()
+        btn_imp = QPushButton("↑ Import Notes")
+        btn_imp.setToolTip(
+            "Import notes from a file.\n"
+            "TXT/MD: each note separated by ---------- (10 dashes).\n"
+            "WRP: only the notes are read; all other project data is ignored.\n"
+            "Imported notes are appended to existing notes.")
+        btn_imp.setStyleSheet(_ss2)
+        btn_imp.clicked.connect(self._import_notes_file)
+        btn_exp = QPushButton("↓ Export Notes")
+        btn_exp.setToolTip(
+            "Export notes to a file.\n"
+            "TXT/MD: notes separated by ---------- (10 dashes).\n"
+            "WRP (new): creates a notes-only project file.\n"
+            "WRP (existing): appends notes to the file's existing notes.")
+        btn_exp.setStyleSheet(_ss2)
+        btn_exp.clicked.connect(self._export_notes_file)
+        io_row.addWidget(btn_imp)
+        io_row.addWidget(btn_exp)
+        io_row.addStretch()
+        root.addLayout(io_row)
 
         self._add_note()
 
@@ -3360,6 +3476,119 @@ class _NotesWindow(QWidget):
                 "Delete ALL notes\n"
                 "Hold Shift to skip confirmation.\n"
                 "Undoable with the Restore All button that appears.")
+
+    _NOTES_SEPARATOR = "----------"  # ten dashes — delimiter in TXT/MD exports
+
+    def _import_notes_file(self):
+        """Import notes from TXT, MD, or WRP — appending to existing notes."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Notes",
+            "",
+            "All supported (*.txt *.md *.wrp);;"
+            "Text / Markdown (*.txt *.md);;"
+            "WhisperR Project (*.wrp);;"
+            "All files (*)")
+        if not path:
+            return
+        try:
+            ext = Path(path).suffix.lower()
+            if ext == ".wrp":
+                import json as _j
+                data = _j.loads(Path(path).read_text(encoding="utf-8"))
+                new_notes = data.get("notes", [])
+                if not new_notes:
+                    QMessageBox.information(
+                        self, "Import Notes",
+                        "No notes found in that project file.")
+                    return
+                for n in new_notes:
+                    self._add_note(n.get("text", ""), n.get("color_idx", 0))
+                self._scroll_to_note(self._notes[-1])
+                QMessageBox.information(
+                    self, "Import Notes",
+                    f"Imported {len(new_notes)} note(s) from project file.")
+            else:
+                # TXT / MD — split on ten-dash separator
+                raw = Path(path).read_text(encoding="utf-8")
+                parts = [p.strip() for p in raw.split(self._NOTES_SEPARATOR)]
+                parts = [p for p in parts if p]  # drop empty
+                if not parts:
+                    QMessageBox.information(
+                        self, "Import Notes",
+                        "No notes found in that file.\n\n"
+                        "Notes should be separated by a line of ten dashes: ----------")
+                    return
+                for text in parts:
+                    self._add_note(text, 0)
+                self._scroll_to_note(self._notes[-1])
+                QMessageBox.information(
+                    self, "Import Notes",
+                    f"Imported {len(parts)} note(s).")
+        except Exception as e:
+            QMessageBox.warning(self, "Import failed", str(e))
+
+    def _export_notes_file(self):
+        """Export notes to TXT, MD, or WRP."""
+        notes = self.get_notes_data()
+        if not notes:
+            QMessageBox.information(
+                self, "Export Notes", "No notes to export.")
+            return
+        path, selected = QFileDialog.getSaveFileName(
+            self, "Export Notes",
+            "",
+            "Text file (*.txt);;"
+            "Markdown (*.md);;"
+            "WhisperR Project (*.wrp);;"
+            "All files (*)")
+        if not path:
+            return
+        try:
+            ext = Path(path).suffix.lower()
+            if ext == ".wrp":
+                import json as _j
+                if Path(path).exists():
+                    # Existing WRP — merge notes, preserve everything else
+                    existing = _j.loads(
+                        Path(path).read_text(encoding="utf-8"))
+                    old_notes = existing.get("notes", [])
+                    existing["notes"] = old_notes + notes
+                    Path(path).write_text(
+                        _j.dumps(existing, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+                    added = len(notes)
+                    total = len(existing["notes"])
+                    QMessageBox.information(
+                        self, "Export Notes",
+                        f"Added {added} note(s) to existing file.\n"
+                        f"File now contains {total} note(s) total.")
+                else:
+                    # New WRP — notes-only project skeleton
+                    skeleton = {
+                        "version":      1,
+                        "text":         "",
+                        "target_words": 0,
+                        "notes":        notes,
+                        "notes_filter": [],
+                    }
+                    Path(path).write_text(
+                        _j.dumps(skeleton, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+                    QMessageBox.information(
+                        self, "Export Notes",
+                        f"Exported {len(notes)} note(s) to new project file.")
+            else:
+                # TXT / MD
+                sep = f"\n{self._NOTES_SEPARATOR}\n"
+                body = sep.join(n["text"] for n in notes)
+                Path(path).write_text(body, encoding="utf-8")
+                QMessageBox.information(
+                    self, "Export Notes",
+                    f"Exported {len(notes)} note(s).\n"
+                    f"Notes are separated by: {self._NOTES_SEPARATOR}")
+        except Exception as e:
+            QMessageBox.warning(self, "Export failed", str(e))
+
 
     def get_notes_data(self):
         return [{"text": n.get_text(), "color_idx": n.get_color_idx()}
@@ -3933,12 +4162,52 @@ class WhisperEditor(QWidget):
             "border-radius:4px;padding:6px;font-family:Consolas,monospace;}")
         self.editor.textChanged.connect(self._update_stats)
         self.editor.textChanged.connect(self._autocorrect_terms)
+        # Right-click context menu with lint corrections
+        _editor_ref = self
+        _orig_ctx = self.editor.contextMenuEvent
+        def _ctx_menu(ev, _orig=_orig_ctx):
+            from PyQt6.QtWidgets import QMenu as _QMctx
+            from PyQt6.QtGui import QAction as _QActCtx
+            cursor = self.editor.cursorForPosition(ev.pos())
+            char_pos = cursor.position()
+            lint_hit = _editor_ref._lint_at_cursor(char_pos)
+            menu = self.editor.createStandardContextMenu()
+            if lint_hit:
+                msg, suggestions = lint_hit
+                menu.insertSeparator(menu.actions()[0])
+                _info = _QActCtx(f"⚠️ {msg}", menu)
+                _info.setEnabled(False)
+                menu.insertAction(menu.actions()[0], _info)
+                for sugg in suggestions[:5]:
+                    def _make_fix(s=sugg, pos=char_pos):
+                        # Find the error span and replace it
+                        for (st, en, _m, _sg) in _editor_ref._lint_errors:
+                            if st <= pos < en:
+                                cur = self.editor.textCursor()
+                                cur.setPosition(st)
+                                cur.setPosition(en,
+                                    cur.MoveMode.KeepAnchor)
+                                cur.insertText(s)
+                                break
+                    act = _QActCtx(f"✓ {sugg}", menu)
+                    act.triggered.connect(_make_fix)
+                    menu.insertAction(menu.actions()[2], act)
+            menu.exec(ev.globalPos())
+        self.editor.contextMenuEvent = _ctx_menu
         # Debounced history snapshot
         self._history_timer = QTimer(self)
         self._history_timer.setSingleShot(True)
         self._history_timer.setInterval(5000)
         self._history_timer.timeout.connect(self._push_history)
+        self._history_timer.timeout.connect(self._snap_on_editor_change)
         self.editor.textChanged.connect(lambda: self._history_timer.start())
+        # Harper spell/grammar check — debounced 2 s
+        self._lint_timer = QTimer(self)
+        self._lint_timer.setSingleShot(True)
+        self._lint_timer.setInterval(2000)
+        self._lint_timer.timeout.connect(self._run_lint)
+        self.editor.textChanged.connect(lambda: self._lint_timer.start())
+        self._lint_errors: list = []  # [(start,end,msg,[sugg])]
         # Drop support
         self.editor.dragEnterEvent = self._drag_enter
         self.editor.dropEvent = self._drop_event
@@ -3959,6 +4228,53 @@ class WhisperEditor(QWidget):
                 "border-radius:4px;color:#ddd;}"
                 "QPushButton:hover{background:#353535;border-color:#0078d7;}")
             return b
+
+        # ── Menu bar ──────────────────────────────────────────────────────
+        from PyQt6.QtWidgets import QMenuBar as _QMB
+        _menubar = _QMB(self)
+        _menubar.setStyleSheet(
+            "QMenuBar{background:#1e1e1e;color:#ddd;border-bottom:1px solid #333;}"
+            "QMenuBar::item{padding:4px 10px;background:transparent;}"
+            "QMenuBar::item:selected{background:#2a2a2a;}"
+            "QMenu{background:#1e1e1e;color:#ddd;border:1px solid #444;}"
+            "QMenu::item{padding:4px 20px;}"
+            "QMenu::item:selected{background:#1a3a5c;}"
+            "QMenu::separator{height:1px;background:#333;margin:2px 0;}")
+
+        # Helper: create a QAction with optional shortcut and add to menu
+        from PyQt6.QtGui import QAction as _QAct, QKeySequence as _QKS
+        def _ma(menu, label, slot, shortcut=None):
+            act = _QAct(label, self)
+            act.triggered.connect(slot)
+            if shortcut:
+                act.setShortcut(_QKS(shortcut))
+            menu.addAction(act)
+            return act
+
+        # File menu
+        _m_file = _menubar.addMenu("File")
+        _ma(_m_file, "New Project",         self._new_project,      "Ctrl+N")
+        _m_file.addSeparator()
+        _ma(_m_file, "Load Project…",     self._load_project,     "Ctrl+O")
+        _ma(_m_file, "Import Text File…",  self._import_file)
+        _m_file.addSeparator()
+        _ma(_m_file, "Save Project",         self._save_project,     "Ctrl+S")
+        _ma(_m_file, "Export Text File…",  self._export_file)
+
+        # Edit menu
+        _m_edit = _menubar.addMenu("Edit")
+        _ma(_m_edit, "Copy All",             self._copy_all,         "Ctrl+Shift+C")
+        _ma(_m_edit, "Find && Replace",      self._show_find_replace, "Ctrl+H")
+
+        # History menu (project version history — populated dynamically)
+        self._m_history = _menubar.addMenu("History")
+        self._m_history.aboutToShow.connect(self._populate_history_menu)
+
+        # Snapshots menu (app-state snapshots — populated dynamically)
+        self._m_snapshots = _menubar.addMenu("Snapshots")
+        self._m_snapshots.aboutToShow.connect(self._populate_snapshots_menu)
+
+        root.setMenuBar(_menubar)
 
         _btn_ss = ("QPushButton{background:#2a2a2a;border:1px solid #444;padding:5px 10px;"
                    "border-radius:4px;color:#ddd;}"
@@ -3983,6 +4299,22 @@ class WhisperEditor(QWidget):
         # ── New Project ────────────────────────────────────────────
         btn_row.addWidget(_btn("✨ New", "New project — clears text and notes",
                                self._new_project))
+
+        # ── Format Preset ─────────────────────────────────────────────────
+        from PyQt6.QtWidgets import QComboBox as _QCBe
+        self._preset_combo = _QCBe()
+        self._preset_combo.addItem("📋 Preset…")
+        for _pname in EDITOR_PRESETS:
+            self._preset_combo.addItem(_pname)
+        self._preset_combo.setToolTip(
+            "Insert a template into the current editor.\n"
+            "Replaces content only if editor is empty (or on New project).")
+        self._preset_combo.setStyleSheet(
+            "QComboBox{background:#2a2a2a;border:1px solid #444;"
+            "padding:4px 8px;color:#ddd;border-radius:4px;}"
+            "QComboBox:hover{border-color:#0078d7;}")
+        self._preset_combo.currentTextChanged.connect(self._apply_preset)
+        btn_row.addWidget(self._preset_combo)
 
         # ── Load / Import (dual) ────────────────────────────────────────────
         btn_row.addWidget(_dual_btn(
@@ -4542,6 +4874,12 @@ class WhisperEditor(QWidget):
         if _filt and self._notes_win:
             self._notes_win.set_filter_state(_filt)
         self._project_path = Path(project_path) if project_path else None
+        # Reset and reload history from .wrp.history file
+        self._version_history = []
+        self._history_dirty_count = 0
+        from datetime import datetime as _dt_lh
+        self._history_last_flush = _dt_lh.now()
+        self._load_history_from_project()
         self._update_title()
         # Turn on remember so closing doesn't lose the project
         rt = getattr(self, "remember_toggle", None)
@@ -4554,6 +4892,34 @@ class WhisperEditor(QWidget):
             self.setWindowTitle(f"WhisperR Editor — {self._project_path.stem}")
         else:
             self.setWindowTitle("WhisperR Editor")
+
+    def _apply_preset(self, name: str):
+        """Apply a format preset template to the editor."""
+        if name == "📋 Preset…" or name not in EDITOR_PRESETS:
+            return
+        tpl = EDITOR_PRESETS[name]
+        current = self.editor.toPlainText().strip()
+        if current:
+            reply = QMessageBox.question(
+                self, "Apply Preset",
+                f"Apply the \"{name}\" template?\n\n"
+                "Current text will be replaced.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                # Reset combo without triggering again
+                self._preset_combo.blockSignals(True)
+                self._preset_combo.setCurrentIndex(0)
+                self._preset_combo.blockSignals(False)
+                return
+        self.editor.setPlainText(tpl)
+        self._preset_combo.blockSignals(True)
+        self._preset_combo.setCurrentIndex(0)
+        self._preset_combo.blockSignals(False)
+        # Move cursor to end of first line for immediate editing
+        cur = self.editor.textCursor()
+        cur.movePosition(cur.MoveOperation.End)
+        self.editor.setTextCursor(cur)
 
     def _new_project(self):
         """Reset editor to blank slate — clear text, notes, project path."""
@@ -4587,7 +4953,8 @@ class WhisperEditor(QWidget):
             QMessageBox.warning(self, "Load failed", str(e))
 
     def _save_project(self):
-        self._push_history()   # snapshot before save
+        self._push_history()          # snapshot before save
+        self._flush_history_to_project()  # flush dirty entries to .wrp.history
         init = str(self._project_path) if self._project_path else ""
         path, _ = QFileDialog.getSaveFileName(
             self, "Save project", init,
@@ -4612,49 +4979,463 @@ class WhisperEditor(QWidget):
 
     _MAX_HISTORY = 20   # overridden by config at runtime
 
+    def _populate_history_menu(self):
+        """Populate the History menu with version history entries."""
+        from PyQt6.QtCore import Qt as _Qt3
+        from datetime import datetime as _dt
+        from collections import defaultdict as _dd
+        m = self._m_history
+        m.clear()
+        m.addAction("Open History Picker… (Ctrl+Alt+H)", self._show_history)
+        history = getattr(self, "_version_history", [])
+        if not history:
+            m.addSeparator()
+            m.addAction("No snapshots yet").setEnabled(False)
+            return
+        m.addSeparator()
+        by_day = _dd(list)
+        for i, e in enumerate(history):
+            try: dt = _dt.fromisoformat(e["ts"])
+            except Exception: dt = _dt.now()
+            by_day[dt.strftime("%Y-%m-%d")].append((i, dt, e))
+        all_days = sorted(by_day.keys())
+        span_days = ((_dt.fromisoformat(all_days[-1]) -
+                      _dt.fromisoformat(all_days[0])).days + 1
+                     if len(all_days) > 1 else 1)
+        def _add_entry(parent, i, dt, e):
+            w = e.get("words", len(e["text"].split()))
+            label = f"{dt.strftime("%H:%M:%S")}  —  {w}w  —  {e["text"][:40].replace(chr(10)," ")}..."
+            from PyQt6.QtGui import QAction as _QActH
+            act = _QActH(label, parent)
+            act.triggered.connect(lambda _c=False, _i=i: (
+                self._push_history(),
+                self.editor.setPlainText(history[_i]["text"])))
+            parent.addAction(act)
+        if span_days <= 1:
+            for i, dt, e in reversed(history[-20:] if len(history) > 20
+                                      else history):
+                _add_entry(m, i, dt, e)
+        elif span_days <= 7:
+            for day in reversed(all_days):
+                sub = m.addMenu(_dt.fromisoformat(day).strftime("%A, %b %d"))
+                for i, dt, e in reversed(by_day[day]):
+                    _add_entry(sub, i, dt, e)
+        else:
+            from collections import defaultdict as _dd4
+            by_month = _dd4(lambda: _dd(list))
+            for day in all_days:
+                mo = _dt.fromisoformat(day).strftime("%Y-%m")
+                by_month[mo][day].extend(by_day[day])
+            for mo in reversed(sorted(by_month.keys())):
+                mo_dt = _dt.strptime(mo + "-01", "%Y-%m-%d")
+                mo_sub = m.addMenu(mo_dt.strftime("%B %Y"))
+                for day in reversed(sorted(by_month[mo].keys())):
+                    day_sub = mo_sub.addMenu(
+                        _dt.fromisoformat(day).strftime("%a %b %d"))
+                    for i, dt, e in reversed(by_month[mo][day]):
+                        _add_entry(day_sub, i, dt, e)
+
+    def _populate_snapshots_menu(self):
+        """Populate the Snapshots menu. Delegates to WhisperRApp."""
+        m = self._m_snapshots
+        m.clear()
+        # Find parent WhisperRApp
+        _app_w = next((w for w in QApplication.topLevelWidgets()
+                       if w.__class__.__name__ == "WhisperRApp"), None)
+        m.addAction("Open Snapshots Picker…",
+            lambda: _app_w._show_app_snapshots() if _app_w else None)
+        if not _app_w:
+            return
+        import json as _j
+        from datetime import datetime as _dt
+        from collections import defaultdict as _dd
+        snaps = []
+        sp = Path(BASE_DIR) / "whisperr_snapshots.jsonl"
+        if sp.exists():
+            for line in sp.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    try: snaps.append(_j.loads(line))
+                    except Exception: pass
+        ram = getattr(_app_w, "_app_snapshots_ram", [])
+        on_disk = {s["ts"] for s in snaps}
+        snaps += [s for s in ram if s["ts"] not in on_disk]
+        snaps.sort(key=lambda s: s["ts"])
+        if not snaps:
+            m.addSeparator()
+            m.addAction("No snapshots yet").setEnabled(False)
+            return
+        m.addSeparator()
+        by_day = _dd(list)
+        for i, s in enumerate(snaps):
+            try: dt = _dt.fromisoformat(s["ts"])
+            except Exception: dt = _dt.now()
+            by_day[dt.strftime("%Y-%m-%d")].append((i, dt, s))
+        all_days  = sorted(by_day.keys())
+        span_days = ((_dt.fromisoformat(all_days[-1]) -
+                      _dt.fromisoformat(all_days[0])).days + 1
+                     if len(all_days) > 1 else 1)
+        def _add_snap(parent, i, dt, s):
+            txt = s.get("editor_text", "")
+            label = (f"{dt.strftime("%H:%M:%S")}  —  {len(txt.split())}w  —  "
+                     f"{txt[:35].replace(chr(10)," ")}...")
+            from PyQt6.QtGui import QAction as _QActSn
+            act = _QActSn(label, parent)
+            act.triggered.connect(
+                lambda _c=False, _s=s: _app_w._restore_app_snapshot(_s))
+            parent.addAction(act)
+        if span_days <= 1:
+            for i, dt, s in reversed(snaps[-20:]):
+                _add_snap(m, i, dt, s)
+        elif span_days <= 7:
+            for day in reversed(all_days):
+                sub = m.addMenu(_dt.fromisoformat(day).strftime("%A, %b %d"))
+                for i, dt, s in reversed(by_day[day]):
+                    _add_snap(sub, i, dt, s)
+        else:
+            from collections import defaultdict as _dd5
+            by_month = _dd5(lambda: _dd(list))
+            for day in all_days:
+                mo = _dt.fromisoformat(day).strftime("%Y-%m")
+                by_month[mo][day].extend(by_day[day])
+            for mo in reversed(sorted(by_month.keys())):
+                mo_dt = _dt.strptime(mo + "-01", "%Y-%m-%d")
+                mo_sub = m.addMenu(mo_dt.strftime("%B %Y"))
+                for day in reversed(sorted(by_month[mo].keys())):
+                    day_sub = mo_sub.addMenu(
+                        _dt.fromisoformat(day).strftime("%a %b %d"))
+                    for i, dt, s in reversed(by_month[mo][day]):
+                        _add_snap(day_sub, i, dt, s)
+
+    def _run_lint(self):
+        """Run Harper lint in a background thread; update highlighter on finish."""
+        if not _HarperLint.available():
+            return
+        text = self.editor.toPlainText()
+        import threading as _thr_lint
+        def _lint_worker():
+            errs = _HarperLint.lint(text)
+            # Back on main thread via QTimer.singleShot
+            from PyQt6.QtCore import QTimer as _QTlint
+            _QTlint.singleShot(0, lambda: self._apply_lint_results(errs))
+        _thr_lint.Thread(target=_lint_worker, daemon=True).start()
+
+    def _apply_lint_results(self, errors):
+        self._lint_errors = errors
+        if hasattr(self, "_highlighter"):
+            self._highlighter.set_lint_errors(errors)
+
+    def _lint_at_cursor(self, pos):
+        """Return (msg, suggestions) for the lint error at char position, or None."""
+        for (start, end, msg, sugg) in self._lint_errors:
+            if start <= pos < end:
+                return msg, sugg
+        return None
+
+    def _snap_on_editor_change(self):
+        _app_w = next((w for w in QApplication.topLevelWidgets()
+                       if w.__class__.__name__ == "WhisperRApp"), None)
+        if not _app_w:
+            return
+        txt = self.editor.toPlainText()
+        wc  = len(txt.split())
+        # Calculate how many words were added/removed since last snapshot
+        last_snap = (getattr(_app_w, "_app_snapshots_ram", [None])[-1]
+                     if getattr(_app_w, "_app_snapshots_ram", []) else None)
+        last_wc = len(last_snap["editor_text"].split()) if last_snap else 0
+        delta = wc - last_wc
+        if delta == 0:
+            return   # no change since last snapshot
+        snippet = " ".join(txt.split()[-7:])[:55]
+        if delta > 0:
+            reason = f"Editor: +{delta} word(s) (total {wc})  …  \"{snippet}\""
+        else:
+            reason = f"Editor: {delta} word(s) deleted (total {wc})"
+        _app_w.take_app_snapshot(reason)
+
+    # ── Version History ─────────────────────────────────────────────────────
+    #
+    # Each entry: {"ts": ISO-string, "text": str, "words": int, "chars": int}
+    #
+    # RAM buffer (_version_history) holds all in-session snapshots.
+    # _history_dirty_count tracks how many new entries haven't been flushed
+    # to the project file yet.  Flush occurs when:
+    #   • count >= 10  (configurable later)
+    #   • 10 minutes since last flush
+    #   • user saves the project
+    #   • editor is hidden / app quits
+
+    def _cfg_history(self):
+        """Return (keep_n, infinite) from live config."""
+        cfg = (self.config if isinstance(self.config, dict)
+               else getattr(self.config, "settings", {}))
+        infinite = bool(cfg.get("version_history_infinite", False))
+        keep     = int(cfg.get("version_history_keep", 20))
+        return keep, infinite
+
     def _push_history(self):
-        """Snapshot current text into version history."""
+        """Snapshot current text into version history (RAM buffer)."""
+        from datetime import datetime as _dt
         text = self.editor.toPlainText()
         if not hasattr(self, "_version_history"):
-            self._version_history: list[tuple] = []  # [(timestamp, text), ...]
-        if self._version_history and self._version_history[-1][1] == text:
-            return  # unchanged
+            self._version_history: list[dict] = []
+            self._history_dirty_count: int = 0
+            self._history_last_flush = _dt.now()
+        # Skip if identical to last entry
+        if self._version_history and self._version_history[-1]["text"] == text:
+            return
+        entry = {
+            "ts":    _dt.now().isoformat(timespec="seconds"),
+            "text":  text,
+            "words": len(text.split()),
+            "chars": len(text),
+        }
+        self._version_history.append(entry)
+        self._history_dirty_count += 1
+        keep, infinite = self._cfg_history()
+        if not infinite:
+            while len(self._version_history) > max(keep, 1):
+                self._version_history.pop(0)
+        # Auto-flush to disk?
+        now = _dt.now()
+        minutes_since = (now - self._history_last_flush).total_seconds() / 60
+        if (self._history_dirty_count >= 10 or minutes_since >= 10):
+            self._flush_history_to_project()
+
+    def _flush_history_to_project(self):
+        """Append pending history entries to the project file if one is saved."""
         from datetime import datetime as _dt
-        _cfg_h = (self.config if isinstance(self.config, dict)
-                  else getattr(self.config, "settings", {}))
-        keep = int(_cfg_h.get("version_history_keep", 20))
-        self._version_history.append((_dt.now().strftime("%H:%M:%S"), text))
-        if len(self._version_history) > keep:
-            self._version_history.pop(0)
+        if not self._project_path or not getattr(self, "_version_history", None):
+            return
+        dirty = getattr(self, "_history_dirty_count", 0)
+        if dirty == 0:
+            return
+        try:
+            import json as _j
+            hist_path = self._project_path.with_suffix(".wrp.history")
+            existing: list[dict] = []
+            if hist_path.exists():
+                try:
+                    existing = _j.loads(hist_path.read_text(encoding="utf-8"))
+                except Exception:
+                    existing = []
+            # Append only the new (dirty) entries
+            new_entries = self._version_history[-dirty:]
+            merged = existing + new_entries
+            # Trim by keep policy
+            keep, infinite = self._cfg_history()
+            if not infinite:
+                while len(merged) > max(keep, 1):
+                    merged.pop(0)
+            hist_path.write_text(
+                _j.dumps(merged, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+            self._history_dirty_count = 0
+            self._history_last_flush = _dt.now()
+        except Exception as _e:
+            import logging; logging.getLogger("whisperr").warning(
+                f"History flush failed: {_e}")
+
+    def _load_history_from_project(self):
+        """Load persisted history entries from .wrp.history file into RAM."""
+        from datetime import datetime as _dt
+        if not hasattr(self, "_version_history"):
+            self._version_history = []
+            self._history_dirty_count = 0
+            self._history_last_flush = _dt.now()
+        if not self._project_path:
+            return
+        hist_path = self._project_path.with_suffix(".wrp.history")
+        if not hist_path.exists():
+            return
+        try:
+            import json as _j
+            loaded = _j.loads(hist_path.read_text(encoding="utf-8"))
+            # Merge: loaded entries go first; in-RAM entries appended
+            ram_texts = {e["text"] for e in self._version_history}
+            new_from_disk = [e for e in loaded if e["text"] not in ram_texts]
+            self._version_history = new_from_disk + self._version_history
+            keep, infinite = self._cfg_history()
+            if not infinite:
+                while len(self._version_history) > max(keep, 1):
+                    self._version_history.pop(0)
+        except Exception:
+            pass
 
     def _show_history(self):
-        """Show version history picker dialog."""
-        if not getattr(self, "_version_history", None):
+        """Show version history picker dialog with date/time/words/chars."""
+        from PyQt6.QtWidgets import (QDialog, QTreeWidget, QTreeWidgetItem,
+                                     QDialogButtonBox, QLabel, QHBoxLayout)
+        from PyQt6.QtCore import Qt as _Qt
+        from datetime import datetime as _dt
+
+        history = getattr(self, "_version_history", [])
+        if not history:
             QMessageBox.information(self, "Version History",
-                                    "No history yet for this session.")
+                "No history entries yet.\n\n"
+                "Snapshots are taken automatically 5 seconds after you "
+                "stop typing, and on every Save.")
             return
-        from PyQt6.QtWidgets import QDialog, QListWidget, QDialogButtonBox
+
         dlg = QDialog(self)
         dlg.setWindowTitle("Version History")
-        dlg.resize(480, 320)
+        dlg.resize(640, 420)
         lay = QVBoxLayout(dlg)
-        lbl = QLabel("Select a version to restore:")
+
+        lbl = QLabel(f"{len(history)} snapshot(s) — select one to restore:")
+        lbl.setStyleSheet("color:#aaa;font-size:11px;")
         lay.addWidget(lbl)
-        lst = QListWidget()
-        for ts, txt in reversed(self._version_history):
-            preview = txt[:80].replace("\n", " ")
-            lst.addItem(f"{ts}  —  {preview}{'…' if len(txt)>80 else ''}")
-        lay.addWidget(lst)
+
+        tree = QTreeWidget()
+        tree.setColumnCount(4)
+        tree.setHeaderLabels(["Date / Time", "Words", "Chars", "Preview"])
+        tree.setColumnWidth(0, 160)
+        tree.setColumnWidth(1, 60)
+        tree.setColumnWidth(2, 60)
+        tree.setColumnWidth(3, 280)
+        tree.setStyleSheet(
+            "QTreeWidget{background:#1e1e1e;color:#ddd;border:1px solid #444;}"
+            "QTreeWidget::item:selected{background:#1a3a5c;}"
+            "QHeaderView::section{background:#2a2a2a;color:#aaa;"
+            "border:1px solid #333;padding:2px 4px;}")
+        tree.setAlternatingRowColors(True)
+
+        # Group entries by date for readability
+        from collections import defaultdict as _dd
+        by_day: dict = _dd(list)
+        for i, entry in enumerate(history):
+            try:
+                dt = _dt.fromisoformat(entry["ts"])
+            except Exception:
+                dt = _dt.now()
+            day_key = dt.strftime("%Y-%m-%d")
+            by_day[day_key].append((i, dt, entry))
+
+        # Determine grouping depth based on span
+        all_days = sorted(by_day.keys())
+        span_days = ((_dt.fromisoformat(all_days[-1]) -
+                      _dt.fromisoformat(all_days[0])).days + 1
+                     if len(all_days) > 1 else 1)
+
+        def _make_leaf(i, dt, entry):
+            words = entry.get("words", len(entry["text"].split()))
+            chars = entry.get("chars", len(entry["text"]))
+            preview = entry["text"][:100].replace("\n", " ")
+            if len(entry["text"]) > 100:
+                preview += "…"
+            item = QTreeWidgetItem([
+                dt.strftime("%H:%M:%S"),
+                str(words),
+                str(chars),
+                preview,
+            ])
+            item.setData(0, _Qt.ItemDataRole.UserRole, i)
+            return item
+
+        if span_days <= 1:
+            # Flat list, most recent first
+            for i, dt, entry in reversed(list(by_day[all_days[0]])):
+                tree.addTopLevelItem(_make_leaf(i, dt, entry))
+        elif span_days <= 7:
+            # Group by day
+            for day in reversed(all_days):
+                day_item = QTreeWidgetItem([
+                    _dt.fromisoformat(day).strftime("%A, %b %d %Y"), "", "", ""])
+                day_item.setExpanded(True)
+                for i, dt, entry in reversed(by_day[day]):
+                    day_item.addChild(_make_leaf(i, dt, entry))
+                tree.addTopLevelItem(day_item)
+        elif span_days <= 60:
+            # Week → Day → entries
+            from collections import defaultdict as _dd2
+            by_week: dict = _dd2(lambda: _dd(list))
+            for day in all_days:
+                dt_d = _dt.fromisoformat(day)
+                wk = dt_d.strftime("%Y-W%W")
+                by_week[wk][day].extend(by_day[day])
+            for wk in reversed(sorted(by_week.keys())):
+                wk_dt = _dt.strptime(wk + "-1", "%Y-W%W-%w")
+                wk_item = QTreeWidgetItem([
+                    f"Week of {wk_dt.strftime('%b %d, %Y')}", "", "", ""])
+                wk_item.setExpanded(True)
+                for day in reversed(sorted(by_week[wk].keys())):
+                    day_item = QTreeWidgetItem([
+                        _dt.fromisoformat(day).strftime("%A, %b %d"), "", "", ""])
+                    day_item.setExpanded(False)
+                    for i, dt, entry in reversed(by_week[wk][day]):
+                        day_item.addChild(_make_leaf(i, dt, entry))
+                    wk_item.addChild(day_item)
+                tree.addTopLevelItem(wk_item)
+        else:
+            # Month → Week → Day → entries
+            from collections import defaultdict as _dd3
+            by_month: dict = _dd3(lambda: _dd3(lambda: _dd3(list)))
+            for day in all_days:
+                dt_d = _dt.fromisoformat(day)
+                mo  = dt_d.strftime("%Y-%m")
+                wk  = dt_d.strftime("%Y-W%W")
+                by_month[mo][wk][day].extend(by_day[day])
+            for mo in reversed(sorted(by_month.keys())):
+                mo_dt = _dt.strptime(mo + "-01", "%Y-%m-%d")
+                mo_item = QTreeWidgetItem([mo_dt.strftime("%B %Y"), "", "", ""])
+                mo_item.setExpanded(True)
+                for wk in reversed(sorted(by_month[mo].keys())):
+                    wk_dt = _dt.strptime(wk + "-1", "%Y-W%W-%w")
+                    wk_item = QTreeWidgetItem([
+                        f"Week of {wk_dt.strftime('%b %d')}", "", "", ""])
+                    wk_item.setExpanded(False)
+                    for day in reversed(sorted(by_month[mo][wk].keys())):
+                        day_item = QTreeWidgetItem([
+                            _dt.fromisoformat(day).strftime("%a %b %d"), "", "", ""])
+                        day_item.setExpanded(False)
+                        for i, dt, entry in reversed(by_month[mo][wk][day]):
+                            day_item.addChild(_make_leaf(i, dt, entry))
+                        wk_item.addChild(day_item)
+                    mo_item.addChild(wk_item)
+                tree.addTopLevelItem(mo_item)
+
+        lay.addWidget(tree)
+
+        # Stats bar
+        info_row = QHBoxLayout()
+        info_lbl = QLabel("")
+        info_lbl.setStyleSheet("color:#888;font-size:10px;")
+        info_row.addWidget(info_lbl)
+        info_row.addStretch()
+        lay.addLayout(info_row)
+
+        def _on_selection():
+            items = tree.selectedItems()
+            if not items:
+                return
+            idx = items[0].data(0, _Qt.ItemDataRole.UserRole)
+            if idx is None:
+                info_lbl.setText("")
+                return
+            e = history[idx]
+            w = e.get("words", len(e["text"].split()))
+            c = e.get("chars", len(e["text"]))
+            ts = e.get("ts", "")
+            info_lbl.setText(
+                f"Snapshot {idx+1}/{len(history)}  •  {w} words  •  {c} chars  •  {ts}")
+
+        tree.itemSelectionChanged.connect(_on_selection)
+
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
             QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         lay.addWidget(btns)
-        if dlg.exec() == QDialog.DialogCode.Accepted and lst.currentRow() >= 0:
-            idx = len(self._version_history) - 1 - lst.currentRow()
-            self._push_history()   # save current before restoring
-            self.editor.setPlainText(self._version_history[idx][1])
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            items = tree.selectedItems()
+            if items:
+                idx = items[0].data(0, _Qt.ItemDataRole.UserRole)
+                if idx is not None:
+                    self._push_history()   # save current state first
+                    self.editor.setPlainText(history[idx]["text"])
+
 
     # ── Find & Replace ────────────────────────────────────────────────────────
 
@@ -4858,13 +5639,80 @@ class WhisperEditor(QWidget):
                 QMessageBox.warning(self, "Import failed", str(e))
 
     def _export_file(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export file", "", "Markdown (*.md);;Text (*.txt);;All files (*)")
-        if path:
-            try:
-                Path(path).write_text(self.editor.toPlainText(), encoding="utf-8")
-            except Exception as e:
-                QMessageBox.warning(self, "Export failed", str(e))
+        """Export with format detection: md/txt always; docx/html/pdf if tools available."""
+        import subprocess as _sp
+
+        _has_pandoc = False
+        _has_docx   = False
+        try:
+            import docx as _dx  # noqa
+            _has_docx = True
+        except ImportError:
+            pass
+        try:
+            _r = _sp.run(["pandoc", "--version"], capture_output=True, timeout=3)
+            _has_pandoc = _r.returncode == 0
+        except Exception:
+            pass
+
+        filters = "Markdown (*.md);;Plain Text (*.txt);;HTML (*.html)"
+        if _has_pandoc or _has_docx:
+            filters += ";;Word Document (*.docx)"
+        if _has_pandoc:
+            filters += ";;PDF (*.pdf)"
+
+        path, _ = QFileDialog.getSaveFileName(self, "Export", "", filters)
+        if not path:
+            return
+        ext  = Path(path).suffix.lower()
+        text = self.editor.toPlainText()
+        try:
+            if ext in (".md", ".txt", ""):
+                Path(path).write_text(text, encoding="utf-8")
+
+            elif ext == ".html":
+                import html as _hl
+                nl2  = "\n\n"
+                nl1  = "\n"
+                body = _hl.escape(text).replace(nl2, "</p><p>").replace(nl1, "<br>")
+                html_out = (
+                    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                    "<style>body{font-family:Georgia,serif;max-width:800px;"
+                    "margin:2em auto;line-height:1.6;color:#222;}"
+                    "p{margin:0.8em 0;}</style></head>"
+                    "<body><p>" + body + "</p></body></html>"
+                )
+                Path(path).write_text(html_out, encoding="utf-8")
+
+            elif ext == ".docx":
+                if _has_pandoc:
+                    _sp.run(["pandoc", "-f", "markdown", "-o", path],
+                            input=text.encode("utf-8"), check=True, timeout=30)
+                elif _has_docx:
+                    import docx as _dx2
+                    doc = _dx2.Document()
+                    for para in text.split("\n\n"):
+                        if para.strip():
+                            doc.add_paragraph(para)
+                    doc.save(path)
+                else:
+                    raise RuntimeError("Neither Pandoc nor python-docx is installed.")
+
+            elif ext == ".pdf":
+                if _has_pandoc:
+                    _sp.run(["pandoc", "-f", "markdown", "-o", path],
+                            input=text.encode("utf-8"), check=True, timeout=60)
+                else:
+                    raise RuntimeError(
+                        "PDF export requires Pandoc.\n"
+                        "Download from https://pandoc.org/installing.html")
+
+            else:
+                Path(path).write_text(text, encoding="utf-8")
+
+        except Exception as e:
+            QMessageBox.warning(self, "Export failed", str(e))
+
 
     def _copy_all(self):
         try:
@@ -5330,6 +6178,11 @@ class WhisperRApp(QMainWindow):
             self.m_timer.timeout.connect(self.monitor_dirs)
             self.m_timer.start(5000)
             app_logger.debug("✓ Folder monitor timer started")
+            # Periodic flush: write any pending RAM snapshots to disk every 10 min
+            self._snapshot_flush_timer = QTimer(self)
+            self._snapshot_flush_timer.timeout.connect(
+                lambda: self._flush_app_snapshots())
+            self._snapshot_flush_timer.start(600_000)
             # QFileSystemWatcher for real-time folder monitoring
             self._setup_ft_watcher()
             
@@ -5500,6 +6353,7 @@ class WhisperRApp(QMainWindow):
         self.resize(820, 650)
         
         self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(self._on_settings_tab_changed)
         self.setCentralWidget(self.tabs)
         
         # ===== MAIN TAB =====
@@ -5654,28 +6508,63 @@ class WhisperRApp(QMainWindow):
         
         self.tabs.addTab(t1, "Main")
         
-        # ===== PROMPT TAB =====
+        # ===== TRANSCRIPTION STEERING TAB =====
         tp = QWidget()
         lp = QVBoxLayout(tp)
-        
-        lp.addWidget(QLabel("Whisper Steering Prompt (helps guide transcription):"))
+        lp.setSpacing(6)
+        lp.setContentsMargins(8, 8, 8, 8)
+
+        # ── Steering Prompt (~60% of space) ─────────────────────────
+        _sp_lbl = QLabel("Steering Prompt")
+        _sp_lbl.setStyleSheet("font-weight:bold;color:#ddd;")
+        lp.addWidget(_sp_lbl)
+        _sp_help = QLabel(
+            "Describe what Whisper will hear — mention domain terms, proper nouns, "
+            "abbreviations. Sent as context before every transcription.")
+        _sp_help.setWordWrap(True)
+        _sp_help.setStyleSheet("color:#888;font-size:11px;")
+        lp.addWidget(_sp_help)
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setText(self.config.settings["initial_prompt"])
-        self.prompt_edit.setMaximumHeight(250)
-        lp.addWidget(self.prompt_edit)
-        
+        lp.addWidget(self.prompt_edit, 3)   # stretch=3 → ~60%
         hbp = QHBoxLayout()
-        bi = QPushButton("Import .txt")
-        bi.clicked.connect(self.import_p)
-        be = QPushButton("Export .txt")
-        be.clicked.connect(self.export_p)
-        hbp.addWidget(bi)
-        hbp.addWidget(be)
+        bi = QPushButton("Import .txt"); bi.clicked.connect(self.import_p)
+        be = QPushButton("Export .txt"); be.clicked.connect(self.export_p)
+        hbp.addWidget(bi); hbp.addWidget(be); hbp.addStretch()
         lp.addLayout(hbp)
-        lp.addStretch()
-        
-        self.tabs.addTab(tp, "AI Prompt")
-        
+
+        # ── Vocabulary Boost / Hotwords (~40% of space) ──────────────
+        _hw_lbl = QLabel("Vocabulary Boost  (Hotwords)")
+        _hw_lbl.setStyleSheet("font-weight:bold;color:#ddd;margin-top:4px;")
+        lp.addWidget(_hw_lbl)
+        _hw_help = QLabel(
+            "Words/phrases Whisper should prioritise — one per line. "
+            "Matched acoustically (not just as context). Keep list short.")
+        _hw_help.setWordWrap(True)
+        _hw_help.setStyleSheet("color:#888;font-size:11px;")
+        lp.addWidget(_hw_help)
+        self.hotwords_edit = QPlainTextEdit()
+        self.hotwords_edit.setPlaceholderText("e.g.\nWhisperR\nHexagon Software")
+        self.hotwords_edit.setPlainText(
+            "\n".join(self.config.settings.get("hotwords", [])))
+        lp.addWidget(self.hotwords_edit, 2)   # stretch=2 → ~40%
+        hbhw = QHBoxLayout()
+        bi_hw = QPushButton("Import .txt")
+        be_hw = QPushButton("Export .txt")
+        bi_hw.clicked.connect(self._import_hotwords)
+        be_hw.clicked.connect(self._export_hotwords)
+        hbhw.addWidget(bi_hw); hbhw.addWidget(be_hw); hbhw.addStretch()
+        lp.addLayout(hbhw)
+
+        self.tabs.addTab(tp, "Transcription Steering")
+        # Auto-save: prompt changes debounced 5 s
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(5000)
+        self._autosave_timer.timeout.connect(self._autosave_tabs)
+        self.prompt_edit.textChanged.connect(self._autosave_timer.start)
+        self.hotwords_edit.textChanged.connect(self._autosave_timer.start)
+
         # ===== COMMANDS TAB =====
         t2 = QWidget()
         l2 = QVBoxLayout(t2)
@@ -5684,6 +6573,8 @@ class WhisperRApp(QMainWindow):
         
         self.cmd_table = QTableWidget(0, 2)
         self.cmd_table.setHorizontalHeaderLabels(["Phrase to Detect", "Command to Execute"])
+        self.cmd_table.itemChanged.connect(
+            lambda: self._autosave_timer.start() if hasattr(self, "_autosave_timer") else None)
         self.cmd_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         
         for k, v in self.config.settings["commands"].items():
@@ -5726,6 +6617,8 @@ class WhisperRApp(QMainWindow):
         l_terms.addWidget(lbl_terms)
         self.terms_table = QTableWidget(0, 2)
         self.terms_table.setHorizontalHeaderLabels(["Recognised Phrase", "Replacement Text"])
+        self.terms_table.itemChanged.connect(
+            lambda: self._autosave_timer.start() if hasattr(self, "_autosave_timer") else None)
         self.terms_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         for k, v in self.config.settings.get("terms", {}).items():
             r = self.terms_table.rowCount()
@@ -5770,6 +6663,10 @@ class WhisperRApp(QMainWindow):
 
         self.hall_list = QListWidget()
         self.hall_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.hall_list.model().rowsInserted.connect(
+            lambda *_: self._autosave_timer.start() if hasattr(self, "_autosave_timer") else None)
+        self.hall_list.model().rowsRemoved.connect(
+            lambda *_: self._autosave_timer.start() if hasattr(self, "_autosave_timer") else None)
         self.hall_list.setAlternatingRowColors(True)
         for phrase in self.config.settings.get("hallucinations", []):
             self.hall_list.addItem(QListWidgetItem(phrase))
@@ -5869,6 +6766,26 @@ class WhisperRApp(QMainWindow):
         self.ft_status_lbl = QLabel("")
         self.ft_status_lbl.setStyleSheet("color: #aaaaaa; font-size: 11px;")
         l_ft.addWidget(self.ft_status_lbl)
+
+        self.ft_progress = QProgressBar()
+        self.ft_progress.setRange(0, 100)
+        self.ft_progress.setValue(0)
+        self.ft_progress.setVisible(False)
+        self.ft_progress.setStyleSheet(
+            "QProgressBar{border:1px solid #444;border-radius:4px;"
+            "background:#1e1e1e;color:#ddd;text-align:center;}"
+            "QProgressBar::chunk{background:#0078d7;border-radius:3px;}")
+        l_ft.addWidget(self.ft_progress)
+
+        self.ft_cancel_btn = QPushButton("Cancel")
+        self.ft_cancel_btn.setVisible(False)
+        self.ft_cancel_btn.setStyleSheet(
+            "QPushButton{background:#5a1a1a;border:1px solid #aa3333;"
+            "color:#ff8888;padding:4px 12px;border-radius:4px;}"
+            "QPushButton:hover{background:#7a2222;}")
+        self.ft_cancel_btn.clicked.connect(self._ft_cancel)
+        l_ft.addWidget(self.ft_cancel_btn)
+        self._ft_cancelled = False
 
         l_ft.addStretch()
         self.tabs.addTab(t_ft, "File Transcription")
@@ -6061,8 +6978,11 @@ class WhisperRApp(QMainWindow):
                                step=0.1, decimals=1,
                                value=self.config.settings.get("auto_pause_sec", 1.5))
         self.cfg_p_sec.setToolTip(
-            "Auto-Pause: seconds of silence before transcription triggers.\n"
-            "1.0-2.0 s works well for most people."
+            "Seconds of volume-silence before recording stops and transcription begins.\n"
+            "Uses the Noise Floor/Speech Vol settings to detect silence.\n\n"
+            "Note: if VAD (Voice Activity Detection) is enabled in Advanced settings,\n"
+            "the VAD Min Silence setting takes over this role and this value is ignored.\n\n"
+            "1.0–2.0 s works well for most people."
         )
         dict_layout.addRow("Auto-Pause Silence (s):", self.cfg_p_sec)
 
@@ -6279,7 +7199,7 @@ class WhisperRApp(QMainWindow):
         main_layout.addWidget(storage_group)
 
         # --- Auto-Backup ---
-        backup_group = QGroupBox("Auto-Backup (Text Editor)")
+        backup_group = QGroupBox("History & Auto-Backup (Text Editor)")
         backup_layout = QFormLayout()
         self.cfg_backup_enabled = QCheckBox("Enable auto-backup while editing")
         self.cfg_backup_enabled.setChecked(
@@ -6304,6 +7224,34 @@ class WhisperRApp(QMainWindow):
             "Maximum number of backup files to keep per project.\n"
             "Oldest backups are deleted when the limit is exceeded.")
         backup_layout.addRow("Keep up to:", self.cfg_backup_keep)
+        # Version history — infinite toggle + depth spinbox
+        self.cfg_vh_infinite = QCheckBox("Infinite version history")
+        self.cfg_vh_infinite.setChecked(
+            self.config.settings.get("version_history_infinite", False))
+        def _vh_inf_immediate(checked):
+            self.config.settings["version_history_infinite"] = checked
+        self.cfg_vh_infinite.toggled.connect(_vh_inf_immediate)
+        self.cfg_vh_infinite.setToolTip(
+            "Keep ALL snapshots — the depth limit below is ignored.\n"
+            "Snapshots are flushed to a .wrp.history file alongside\n"
+            "the project file when you save or close the editor.")
+        backup_layout.addRow(self.cfg_vh_infinite)
+        self.cfg_version_history = _SB2()
+        self.cfg_version_history.setRange(1, 10000)
+        self.cfg_version_history.setValue(
+            int(self.config.settings.get("version_history_keep", 20)))
+        self.cfg_version_history.setToolTip(
+            "Maximum snapshots to keep in session and in the .wrp.history file.\n"
+            "Oldest entries are dropped when the limit is exceeded.\n"
+            "Disabled (greyed out) when Infinite version history is enabled.\n"
+            "Snapshots are taken 5 s after you stop typing and on every Save.\n"
+            "Access them with Ctrl+Alt+H in the editor.")
+        backup_layout.addRow("Version history depth:", self.cfg_version_history)
+        # Grey out depth when infinite is on
+        def _vh_inf_toggled(checked):
+            self.cfg_version_history.setEnabled(not checked)
+        self.cfg_vh_infinite.toggled.connect(_vh_inf_toggled)
+        _vh_inf_toggled(self.cfg_vh_infinite.isChecked())
         _btn_browse_bak = QPushButton("📁 Browse Backup Folder")
         _btn_browse_bak.setToolTip(
             "Open the folder containing backups for the currently loaded project.")
@@ -6328,6 +7276,78 @@ class WhisperRApp(QMainWindow):
         backup_group.setLayout(backup_layout)
         main_layout.addWidget(backup_group)
 
+        # --- App State Snapshots ---
+        snap_group = QGroupBox("App State Snapshots")
+        snap_layout = QFormLayout()
+        self.cfg_snap_enabled = QCheckBox("Enable app-state snapshots")
+        self.cfg_snap_enabled.setChecked(
+            self.config.settings.get("snapshots_enabled", False))
+        # Apply immediately on toggle — don't wait for Save Settings
+        def _snap_immediate(checked):
+            # Update in-memory only — full disk save happens via Save Settings.
+            # Calling config.save() here would write a partial config because
+            # other settings haven't been collected from the UI yet.
+            self.config.settings["snapshots_enabled"] = checked
+        self.cfg_snap_enabled.toggled.connect(_snap_immediate)
+        self.cfg_snap_enabled.setToolTip(
+            "Periodically snapshots EVERYTHING — settings, editor text, notes,\n"
+            "word target, terms, commands — to a .snapshots file.\n"
+            "Lets you recover work even if you never saved a project.")
+        snap_layout.addRow(self.cfg_snap_enabled)
+        # Mode: count vs duration (mutually exclusive)
+        self.cfg_snap_mode_count = QRadioButton("Keep up to N snapshots")
+        self.cfg_snap_mode_dur   = QRadioButton("Keep snapshots for a time period")
+        _snap_mode = self.config.settings.get("snapshots_mode", "count")
+        self.cfg_snap_mode_count.setChecked(_snap_mode == "count")
+        self.cfg_snap_mode_dur.setChecked(_snap_mode == "duration")
+        snap_layout.addRow(self.cfg_snap_mode_count)
+        snap_layout.addRow(self.cfg_snap_mode_dur)
+        # Count spinner
+        self.cfg_snap_count = _SB2()
+        self.cfg_snap_count.setRange(10, 50000)
+        self.cfg_snap_count.setValue(
+            int(self.config.settings.get("snapshots_keep_count", 60)))
+        self.cfg_snap_count.setToolTip("Maximum number of snapshots to keep.")
+        snap_layout.addRow("Max snapshots:", self.cfg_snap_count)
+        # Duration spinner + unit combo
+        _snap_dur_row = QHBoxLayout()
+        self.cfg_snap_hours = _SB2()
+        self.cfg_snap_hours.setRange(1, 8760)  # up to 1 year
+        self.cfg_snap_hours.setValue(
+            int(self.config.settings.get("snapshots_keep_hours", 24)))
+        self.cfg_snap_hours.setToolTip("Keep snapshots taken within this many hours.")
+        from PyQt6.QtWidgets import QComboBox as _QCB2
+        self.cfg_snap_unit = _QCB2()
+        self.cfg_snap_unit.addItems(["hours", "days", "weeks", "months"])
+        self.cfg_snap_unit.setCurrentText(
+            self.config.settings.get("snapshots_keep_unit", "hours"))
+        _snap_dur_row.addWidget(self.cfg_snap_hours)
+        _snap_dur_row.addWidget(self.cfg_snap_unit)
+        _snap_dur_w = QWidget(); _snap_dur_w.setLayout(_snap_dur_row)
+        snap_layout.addRow("Keep for:", _snap_dur_w)
+        # Grayout logic
+        def _snap_mode_changed():
+            count_mode = self.cfg_snap_mode_count.isChecked()
+            self.cfg_snap_count.setEnabled(count_mode)
+            self.cfg_snap_hours.setEnabled(not count_mode)
+            self.cfg_snap_unit.setEnabled(not count_mode)
+        self.cfg_snap_mode_count.toggled.connect(_snap_mode_changed)
+        self.cfg_snap_mode_dur.toggled.connect(_snap_mode_changed)
+        _snap_mode_changed()
+        # Enable/disable whole group
+        def _snap_enabled_changed(checked):
+            for w in [self.cfg_snap_mode_count, self.cfg_snap_mode_dur,
+                      self.cfg_snap_count, self.cfg_snap_hours,
+                      self.cfg_snap_unit]:
+                w.setEnabled(checked if w not in
+                    ([self.cfg_snap_count] if self.cfg_snap_mode_dur.isChecked()
+                     else [self.cfg_snap_hours, self.cfg_snap_unit])
+                    else False)
+        self.cfg_snap_enabled.toggled.connect(lambda c: _snap_mode_changed() or _snap_enabled_changed(c))
+        _snap_enabled_changed(self.cfg_snap_enabled.isChecked())
+        snap_group.setLayout(snap_layout)
+        main_layout.addWidget(snap_group)
+
         # --- Clipboard Monitor Options ---
         cbmon_group = QGroupBox("Clipboard Monitor Options")
         cbmon_layout = QFormLayout()
@@ -6339,14 +7359,6 @@ class WhisperRApp(QMainWindow):
             "Prepends [Window Title] to each clipboard entry\n"
             "so you can track where each clip came from.")
         cbmon_layout.addRow(self.cfg_cb_source_tag)
-        self.cfg_version_history = _SB2()
-        self.cfg_version_history.setRange(0, 200)
-        self.cfg_version_history.setValue(
-            int(self.config.settings.get("version_history_keep", 20)))
-        self.cfg_version_history.setToolTip(
-            "How many editor snapshots to keep in version history (0 = off).\n"
-            "Access history with Ctrl+Shift+H in the editor.")
-        cbmon_layout.addRow("Version history depth:", self.cfg_version_history)
         cbmon_group.setLayout(cbmon_layout)
         main_layout.addWidget(cbmon_group)
 
@@ -6474,6 +7486,50 @@ class WhisperRApp(QMainWindow):
             "NOTE: may cause a DLL conflict in the frozen app — disable if crashes occur."
         )
         advanced_layout.addRow(self.cfg_use_vad)
+        from PyQt6.QtWidgets import QDoubleSpinBox as _QDSB
+        self.cfg_vad_threshold = _QDSB()
+        self.cfg_vad_threshold.setRange(0.01, 0.99)
+        self.cfg_vad_threshold.setSingleStep(0.05)
+        self.cfg_vad_threshold.setDecimals(2)
+        self.cfg_vad_threshold.setValue(
+            float(self.config.settings.get("vad_threshold", 0.5)))
+        self.cfg_vad_threshold.setToolTip(
+            "How sensitive the microphone activity detector is.\n"
+            "This is NOT the same as Confidence Filtering:\n"
+            "  VAD Threshold controls when recording STARTS\n"
+            "    (is there speech happening right now?).\n"
+            "  Confidence Filtering controls whether the TRANSCRIBED TEXT\n"
+            "    is accurate enough to keep after Whisper processes it.\n\n"
+            "Higher = only starts recording on clearly audible speech.\n"
+            "Lower = more sensitive, may trigger on quiet sounds or noise.\n"
+            "Default: 0.50")
+        advanced_layout.addRow("VAD Threshold:", self.cfg_vad_threshold)
+        self.cfg_vad_min_silence = _SB2()
+        self.cfg_vad_min_silence.setRange(100, 10000)
+        self.cfg_vad_min_silence.setSuffix(" ms")
+        self.cfg_vad_min_silence.setValue(
+            int(self.config.settings.get("vad_min_silence_ms", 2000)))
+        self.cfg_vad_min_silence.setToolTip(
+            "How long a pause in speech (in ms) causes VAD to stop and send\n"
+            "the audio to Whisper for transcription.\n\n"
+            "This is similar to Auto-Pause Silence, but they operate differently:\n"
+            "  Auto-Pause Silence uses the volume level to detect silence.\n"
+            "  VAD Min Silence uses the Silero neural network to detect\n"
+            "    whether speech is actually present (more accurate).\n\n"
+            "If VAD is enabled, VAD Min Silence takes precedence.\n"
+            "If VAD is disabled, Auto-Pause Silence is used instead.\n\n"
+            "Lower = faster response but more sentence fragments.\n"
+            "Higher = more complete sentences but more delay.\n"
+            "Default: 2000 ms")
+        advanced_layout.addRow("VAD Min Silence:", self.cfg_vad_min_silence)
+        self.cfg_vad_min_speech = _SB2()
+        self.cfg_vad_min_speech.setRange(50, 2000)
+        self.cfg_vad_min_speech.setSuffix(" ms")
+        self.cfg_vad_min_speech.setValue(
+            int(self.config.settings.get("vad_min_speech_ms", 250)))
+        self.cfg_vad_min_speech.setToolTip(
+            "Minimum speech duration to count as a valid segment.\nDefault: 250 ms")
+        advanced_layout.addRow("VAD Min Speech:", self.cfg_vad_min_speech)
 
         self.btn_setup = QPushButton("GPU Acceleration Setup Guide")
         self.btn_setup.setStyleSheet("background-color: #27ae60; color: white;")
@@ -6486,9 +7542,126 @@ class WhisperRApp(QMainWindow):
 
         advanced_group.setLayout(advanced_layout)
         main_layout.addWidget(advanced_group)
-        
+
+        # --- Optional Tools ---
+        opt_group = QGroupBox("Optional Tools")
+        opt_layout = QVBoxLayout()
+        opt_lbl = QLabel(
+            "These tools add optional features. WhisperR works fine without them.\n"
+            "Hover over each item for installation instructions.")
+        opt_lbl.setWordWrap(True)
+        opt_lbl.setStyleSheet("color:#888;font-size:11px;")
+        opt_layout.addWidget(opt_lbl)
+
+        def _opt_row(tool_name, check_fn, frozen_msg, dev_msg, url):
+            """Status row. frozen_msg = instructions for compiled app users.
+            dev_msg = instructions for developers building from source."""
+            row = QHBoxLayout()
+            ok = False
+            try: check_fn(); ok = True
+            except Exception: pass
+            if ok:
+                lbl = QLabel(f"✅  {tool_name}  —  installed")
+                lbl.setStyleSheet("color:#4caf50;font-size:11px;")
+                row.addWidget(lbl)
+            else:
+                lbl = QLabel(f"❌  {tool_name}  —  not installed")
+                lbl.setStyleSheet("color:#cc4444;font-size:11px;")
+                row.addWidget(lbl)
+                btn = QPushButton("How to install ↗")
+                btn.setFixedHeight(22)
+                btn.setStyleSheet(
+                    "QPushButton{background:#2a2a2a;border:1px solid #555;"
+                    "color:#aaa;font-size:10px;padding:1px 8px;border-radius:3px;}"
+                    "QPushButton:hover{border-color:#0078d7;color:#fff;}")
+                _frozen = getattr(sys, "frozen", False)
+                _msg = frozen_msg if _frozen else dev_msg
+                _u = url
+                def _open(_c=False, _m=_msg, _u2=_u):
+                    QMessageBox.information(
+                        self, "How to install", _m)
+                    import webbrowser; webbrowser.open(_u2)
+                btn.clicked.connect(_open)
+                row.addWidget(btn)
+            row.addStretch()
+            return row
+
+        def _chk_harper():
+            import harper  # noqa
+        def _chk_pandoc():
+            import subprocess as _sp2
+            if _sp2.run(["pandoc","--version"], capture_output=True,
+                        timeout=3).returncode != 0:
+                raise RuntimeError
+        def _chk_docx():
+            import docx  # noqa
+
+        # Pandoc — standalone installer, works both for frozen and source
+        _pandoc_msg_frozen = (
+            "Pandoc enables exporting to Word (.docx) and PDF.\n\n"
+            "Steps:\n"
+            "  1. Click OK to open the Pandoc download page\n"
+            "  2. Download the Windows installer (.msi)\n"
+            "  3. Run the installer — it adds pandoc.exe to your PATH\n"
+            "  4. Restart WhisperR\n\n"
+            "Size: ~100 MB. Free, no account needed.\n"
+            "Clicking OK will open the download page.")
+
+        # Harper — NOT a pip package on Windows yet; must be bundled at build time
+        # For frozen app users: not installable after the fact
+        # For developers: pip install harper-py before PyInstaller build
+        _harper_msg_frozen = (
+            "Harper spell/grammar checking is not available in this build of WhisperR.\n\n"
+            "Harper cannot be installed separately into the compiled app.\n"
+            "It must be included when the app is built from source.\n\n"
+            "If you need this feature, check the WhisperR GitHub page for\n"
+            "a build that includes Harper, or build from source yourself.\n\n"
+            "Clicking OK will open the Harper project page for reference.")
+        _harper_msg_dev = (
+            "Harper adds spell and grammar checking to the text editor.\n\n"
+            "To bundle it with the app, run this BEFORE building with PyInstaller:\n"
+            "  pip install harper-py\n\n"
+            "Note: harper-py may not yet have Windows wheels on PyPI.\n"
+            "Check the Harper GitHub page for the latest install instructions.\n\n"
+            "Clicking OK will open the Harper GitHub page.")
+
+        # python-docx — pip package; bundled at build time for frozen app
+        _docx_msg_frozen = (
+            "python-docx (basic Word export) is not available in this build.\n\n"
+            "It must be included when the app is built from source.\n"
+            "If you have Pandoc installed, Word export will use that instead\n"
+            "and python-docx is not needed.\n\n"
+            "Clicking OK will open the python-docx documentation page.")
+        _docx_msg_dev = (
+            "python-docx enables basic Word (.docx) export.\n\n"
+            "To bundle it with the app, run this BEFORE building with PyInstaller:\n"
+            "  pip install python-docx\n\n"
+            "PyInstaller will then include it automatically.\n\n"
+            "Note: Pandoc (if installed by the end user) will be used for DOCX export\n"
+            "in preference to python-docx, so both can coexist.\n\n"
+            "Clicking OK will open the python-docx page.")
+
+        opt_layout.addLayout(_opt_row(
+            "Harper  (spell & grammar check)",
+            _chk_harper,
+            _harper_msg_frozen, _harper_msg_dev,
+            "https://github.com/Automattic/harper"))
+        opt_layout.addLayout(_opt_row(
+            "Pandoc  (Word & PDF export)",
+            _chk_pandoc,
+            _pandoc_msg_frozen, _pandoc_msg_frozen,
+            "https://pandoc.org/installing.html"))
+        opt_layout.addLayout(_opt_row(
+            "python-docx  (basic Word export, no Pandoc needed)",
+            _chk_docx,
+            _docx_msg_frozen, _docx_msg_dev,
+            "https://python-docx.readthedocs.io"))
+        opt_group.setLayout(opt_layout)
+        main_layout.addWidget(opt_group)
+
         # Save button
         btn_s = QPushButton("💾 SAVE ALL SETTINGS")
+        btn_s.setObjectName("save_all_settings_btn")
         btn_s.setFixedHeight(40)
         btn_s.setStyleSheet("background-color: #0078d7; color: white; font-weight: bold;")
         btn_s.clicked.connect(self.save_cfg)
@@ -6878,10 +8051,131 @@ class WhisperRApp(QMainWindow):
         pass
 
 
+    def _on_settings_tab_changed(self, idx):
+        """Flush pending auto-save only when leaving a live-edit tab.
+        Tab indices: 0=Main, 1=Transcription Steering, 2=Terms,
+                     3=Commands, 4=Hallucinations (live-edit tabs).
+        Switching TO any tab (including Settings) should not trigger a flush
+        because that could call config.save() with a partial config.
+        """
+        LIVE_EDIT_TABS = {1, 2, 3, 4}   # tabs that have autosave
+        # We only know the NEW index here — check if the timer was running
+        # (i.e. a live-edit tab was being edited) and we are now leaving it.
+        # Only flush if we are NOT switching INTO one of the live-edit tabs.
+        if idx not in LIVE_EDIT_TABS:
+            if hasattr(self, "_autosave_timer") and self._autosave_timer.isActive():
+                self._autosave_timer.stop()
+                self._autosave_tabs()
+
+    def _autosave_tabs(self):
+        """Auto-save AI Prompt, Terms, Commands, Hallucinations.
+        Detects WHAT changed and builds a specific snapshot reason.
+        """
+        try:
+            cfg = self.config.settings
+            changes = []   # human-readable list of what changed
+
+            # AI Prompt
+            new_prompt = self.prompt_edit.toPlainText()
+            if new_prompt != cfg.get("initial_prompt", ""):
+                snippet = new_prompt[:60].replace("\n", " ")
+                changes.append(f"AI Prompt edited: \"{snippet}\"")
+            cfg["initial_prompt"] = new_prompt
+            new_hw = [w.strip() for w in
+                      self.hotwords_edit.toPlainText().splitlines() if w.strip()]
+            if new_hw != cfg.get("hotwords", []):
+                changes.append(f"Hotwords: {len(new_hw)} word(s)")
+            cfg["hotwords"] = new_hw
+
+            # Terms
+            new_terms = {}
+            for r in range(self.terms_table.rowCount()):
+                k_item = self.terms_table.item(r, 0)
+                v_item = self.terms_table.item(r, 1)
+                if k_item and v_item:
+                    k = k_item.text().strip().lower()
+                    v = v_item.text().strip()
+                    if k and v:
+                        new_terms[k] = v
+            old_terms = cfg.get("terms", {})
+            added_t   = [k for k in new_terms if k not in old_terms]
+            removed_t = [k for k in old_terms if k not in new_terms]
+            changed_t = [k for k in new_terms
+                         if k in old_terms and new_terms[k] != old_terms[k]]
+            for k in added_t[:3]:
+                changes.append(f"Term added: \"{k}\" → \"{new_terms[k]}\"")
+            for k in removed_t[:3]:
+                changes.append(f"Term removed: \"{k}\"")
+            for k in changed_t[:3]:
+                changes.append(f"Term changed: \"{k}\" → \"{new_terms[k]}\"")
+            if len(added_t) + len(removed_t) + len(changed_t) > 3:
+                changes.append(f"...and more term changes")
+            cfg["terms"] = new_terms
+
+            # Commands
+            new_cmds = {}
+            for r in range(self.cmd_table.rowCount()):
+                k_item = self.cmd_table.item(r, 0)
+                v_item = self.cmd_table.item(r, 1)
+                if k_item and v_item:
+                    k = k_item.text().strip()
+                    v = v_item.text().strip()
+                    if k and v:
+                        new_cmds[k] = v
+            old_cmds = cfg.get("commands", {})
+            added_c   = [k for k in new_cmds if k not in old_cmds]
+            removed_c = [k for k in old_cmds if k not in new_cmds]
+            changed_c = [k for k in new_cmds
+                         if k in old_cmds and new_cmds[k] != old_cmds[k]]
+            for k in added_c[:2]:
+                changes.append(f"Command added: \"{k}\"")
+            for k in removed_c[:2]:
+                changes.append(f"Command removed: \"{k}\"")
+            for k in changed_c[:2]:
+                changes.append(f"Command changed: \"{k}\"")
+            cfg["commands"] = new_cmds
+
+            # Hallucinations
+            new_hall = []
+            for r in range(self.hall_list.count()):
+                item = self.hall_list.item(r)
+                if item:
+                    t = item.text().strip()
+                    if t:
+                        new_hall.append(t)
+            old_hall = cfg.get("hallucinations", [])
+            old_set  = set(old_hall)
+            new_set  = set(new_hall)
+            added_h   = list(new_set - old_set)
+            removed_h = list(old_set - new_set)
+            for h in added_h[:2]:
+                changes.append(f"Hallucination added: \"{h[:40]}\"")
+            for h in removed_h[:2]:
+                changes.append(f"Hallucination removed: \"{h[:40]}\"")
+            cfg["hallucinations"] = new_hall
+
+            # Persist and snapshot
+            self.config.save()
+            if changes:
+                reason = "; ".join(changes)
+                app_logger.info(f"Auto-saved: {reason}")
+                _app_w = next((w for w in QApplication.topLevelWidgets()
+                               if w.__class__.__name__ == "WhisperRApp"), None)
+                if _app_w:
+                    _app_w.take_app_snapshot(reason)
+            else:
+                app_logger.debug("Auto-save: no changes detected")
+        except Exception as _e:
+            app_logger.warning(f"Auto-save of tabs failed: {_e}")
+
     def save_cfg(self):
         # Get reference to save button before any operations
         save_button = self.sender()
-        
+        if save_button is None:
+            # Called programmatically (not from button click) — find btn
+            save_button = self.findChild(QPushButton, "save_all_settings_btn")
+        if save_button is None:
+            return   # cannot proceed without button reference
         # Visual feedback - change button temporarily
         save_button.setEnabled(False)
         save_button.setText("💾 Saving...")
@@ -6898,6 +8192,26 @@ class WhisperRApp(QMainWindow):
                 if phrase and cmd:
                     cmds[phrase] = cmd
         
+        # Snapshot old values before update so we can diff for snapshot reason
+        _cfg_before = {
+            k: self.config.settings.get(k)
+            for k in ("model", "lang_name", "lang_code", "noise_floor",
+                      "speech_vol", "dict_mode", "live_mode", "auto_pause_sec",
+                      "compute_pref", "min_confidence", "use_confidence",
+                      "timestamps", "translate", "use_vad", "log_level",
+                      "version_history_keep", "version_history_infinite",
+                      "snapshots_enabled", "snapshots_mode",
+                      "snapshots_keep_count", "snapshots_keep_hours",
+                      "snapshots_keep_unit",
+                      "auto_backup_enabled", "auto_backup_interval",
+                      "auto_backup_keep", "cb_source_tag",
+                      "min_to_tray", "auto_space",
+                      "always_on_top", "aot_main", "aot_editor",
+                      "aot_notes", "aot_cheatsheet",
+                      "ind_show", "ind_type", "ind_pos", "ind_size",
+                      "noise_floor", "speech_vol")
+        }
+
         # Update all settings
         self.config.settings.update({
             "model": self.cfg_model.currentText(),
@@ -6934,6 +8248,8 @@ class WhisperRApp(QMainWindow):
                 if self.hall_list.item(i).text().strip()
             ],
             "initial_prompt": self.prompt_edit.toPlainText(),
+            "hotwords": [w.strip() for w in
+                self.hotwords_edit.toPlainText().splitlines() if w.strip()],
             "always_on_top": self.cfg_aot_master.isChecked(),
             "aot_main": self.cfg_aot_main.isChecked(),
             "aot_editor": self.cfg_aot_editor.isChecked(),
@@ -6944,6 +8260,12 @@ class WhisperRApp(QMainWindow):
             "auto_backup_keep":     self.cfg_backup_keep.value(),
             "cb_source_tag":        self.cfg_cb_source_tag.isChecked(),
             "version_history_keep": self.cfg_version_history.value(),
+            "version_history_infinite": self.cfg_vh_infinite.isChecked(),
+            "snapshots_enabled":     self.cfg_snap_enabled.isChecked(),
+            "snapshots_mode":        "count" if self.cfg_snap_mode_count.isChecked() else "duration",
+            "snapshots_keep_count":  self.cfg_snap_count.value(),
+            "snapshots_keep_hours":  self.cfg_snap_hours.value(),
+            "snapshots_keep_unit":   self.cfg_snap_unit.currentText(),
             "min_to_tray": self.cfg_tray.isChecked(),
             "auto_space": self.cfg_space.isChecked(),
             "ind_show": self.cfg_ind_show.isChecked(),
@@ -6965,6 +8287,9 @@ class WhisperRApp(QMainWindow):
             "ft_mon_folder": self.ft_mon_folder.text(),
             "ft_mon_enabled": self.ft_mon_enabled.isChecked(),
             "use_vad": self.cfg_use_vad.isChecked(),
+            "vad_threshold": round(self.cfg_vad_threshold.value(), 2),
+            "vad_min_silence_ms": self.cfg_vad_min_silence.value(),
+            "vad_min_speech_ms": self.cfg_vad_min_speech.value(),
             "editor_type_trigger":  self.cfg_ed_type_trigger.text().strip() or "whisper type, whisper write",
             "editor_edit_trigger":  self.cfg_ed_edit_trigger.text().strip() or "whisper edit, whisper edit this",
             "editor_paste_trigger": self.cfg_ed_paste_trigger.text().strip() or "whisper paste, whisper done, whisper okay",
@@ -6984,6 +8309,55 @@ class WhisperRApp(QMainWindow):
             app_logger.set_level(self.config.settings["log_level"])
             self._apply_always_on_top()
             self.scratchpad.append("✓ Settings saved successfully")
+            # Build snapshot reason from what actually changed
+            _cfg_after = self.config.settings
+            _changed = []
+            _friendly = {
+                "model": "Model",
+                "lang_name": "Language",
+                "dict_mode": "Dictation mode",
+                "live_mode": "Live mode",
+                "auto_pause_sec": "Auto-pause silence",
+                "noise_floor": "Noise floor",
+                "speech_vol": "Speech volume",
+                "min_confidence": "Min confidence",
+                "use_confidence": "Confidence filter",
+                "timestamps": "Timestamps",
+                "translate": "Translate",
+                "use_vad": "VAD",
+                "log_level": "Log level",
+                "version_history_keep": "History depth",
+                "version_history_infinite": "Infinite history",
+                "snapshots_enabled": "Snapshots",
+                "snapshots_mode": "Snapshot mode",
+                "snapshots_keep_count": "Snapshot count",
+                "snapshots_keep_hours": "Snapshot duration",
+                "snapshots_keep_unit": "Snapshot unit",
+                "auto_backup_enabled": "Auto-backup",
+                "auto_backup_interval": "Backup interval",
+                "cb_source_tag": "Source tagging",
+                "min_to_tray": "Min to tray",
+                "always_on_top": "Always on top",
+                "ind_show": "Status indicator",
+                "ind_type": "Indicator type",
+                "ind_pos": "Indicator position",
+            }
+            for k, label in _friendly.items():
+                old_v = _cfg_before.get(k)
+                new_v = _cfg_after.get(k)
+                if old_v != new_v:
+                    # Format booleans nicely
+                    if isinstance(new_v, bool):
+                        _changed.append(f"{label}: {"ON" if new_v else "OFF"}")
+                    else:
+                        _changed.append(f"{label}: {old_v!r} → {new_v!r}")
+            if _changed:
+                _reason = "Settings changed: " + "; ".join(_changed[:6])
+                if len(_changed) > 6:
+                    _reason += f" (+{len(_changed)-6} more)"
+            else:
+                _reason = "Settings saved (no changes detected)"
+            self.take_app_snapshot(_reason)
             
             # Visual feedback - success
             save_button.setText("✓ SAVED!")
@@ -7791,6 +9165,10 @@ class WhisperRApp(QMainWindow):
         # Capture panel states — use isVisible() directly (btn_cheatsheet aliases btn_notes)
         _nw = getattr(self._editor, "_notes_win", None)
         self._editor_saved_notes = _nw.get_notes_data() if _nw else []
+        # Flush pending history entries to disk
+        if self._editor:
+            try: self._editor._flush_history_to_project()
+            except Exception: pass
         self._editor_notes_open = bool(_nw and _nw.isVisible())
         self._editor_saved_filter = (_nw.get_filter_state() if _nw else [])
         _cs_oc = getattr(self._editor, "_cheatsheet", None)
@@ -8371,6 +9749,7 @@ class WhisperRApp(QMainWindow):
             self.config.save()
         except Exception:
             pass
+        self.take_app_snapshot(f"Model changed to: {model_name}")
         app_logger.info(f"Model changed to: {model_name} — preloading immediately")
         self._model_loading = True
         self._update_app_state()
@@ -9019,6 +10398,259 @@ class WhisperRApp(QMainWindow):
         
         app_logger.debug("✓ setup_logic: Complete")
     
+    # ── App-State Snapshot Engine ─────────────────────────────────────────────
+    # Event-driven: take_app_snapshot(reason) is called wherever something changes.
+    # Entries buffered in RAM, flushed to whisperr_snapshots.jsonl on disk when
+    # 5+ new entries accumulate, every 10 minutes, or on quit.
+
+    def take_app_snapshot(self, reason):
+        if not self.config.settings.get("snapshots_enabled", False):
+            app_logger.debug(f"take_app_snapshot skipped (disabled): {reason!r}")
+            return
+        if not hasattr(self, "_app_snapshots_ram"):
+            self._app_snapshots_ram = []
+            self._app_snapshots_dirty = 0
+        snap = self._collect_app_snapshot(reason)
+        last = self._app_snapshots_ram[-1] if self._app_snapshots_ram else None
+        if last:
+            if (last.get("editor_text") == snap["editor_text"]
+                    and last.get("editor_notes") == snap["editor_notes"]
+                    and last.get("terms") == snap["terms"]
+                    and last.get("commands") == snap["commands"]
+                    and last.get("model") == snap["model"]):
+                return
+        self._app_snapshots_ram.append(snap)
+        self._app_snapshots_dirty += 1
+        _nw = len(snap.get("editor_text", "").split())
+        app_logger.info(
+            f"App snapshot #{len(self._app_snapshots_ram)}: {reason!r} "
+            f"({_nw}w, dirty={self._app_snapshots_dirty})")
+        if self._app_snapshots_dirty >= 5:
+            self._flush_app_snapshots()
+            app_logger.info("App snapshots flushed to disk (threshold)")
+
+    def _collect_app_snapshot(self, reason):
+        from datetime import datetime as _dt
+        cfg = self.config.settings
+        editor_text, editor_notes, editor_target = "", [], 0
+        if self._editor:
+            editor_text = self._editor.editor.toPlainText()
+            _nw = getattr(self._editor, "_notes_win", None)
+            editor_notes = _nw.get_notes_data() if _nw else []
+            _ts = getattr(self._editor, "target_spin", None)
+            if _ts:
+                editor_target = _ts.value()
+        return {
+            "ts":            _dt.now().isoformat(timespec="seconds"),
+            "reason":        reason,
+            "editor_text":   editor_text,
+            "editor_notes":  editor_notes,
+            "editor_target": editor_target,
+            "model":         cfg.get("model", "tiny"),
+            "lang_name":     cfg.get("lang_name", "English"),
+            "terms":         dict(cfg.get("terms", {})),
+            "commands":      dict(cfg.get("commands", {})),
+            "hallucinations":list(cfg.get("hallucinations", [])),
+            "initial_prompt":cfg.get("initial_prompt", ""),
+        }
+
+    def _flush_app_snapshots(self, final=False):
+        import json as _j, os as _os
+        dirty = getattr(self, "_app_snapshots_dirty", 0)
+        ram   = getattr(self, "_app_snapshots_ram", [])
+        if not ram or (dirty == 0 and not final):
+            return
+        snap_path = Path(BASE_DIR) / "whisperr_snapshots.jsonl"
+        cfg = self.config.settings
+        try:
+            existing = []
+            if snap_path.exists():
+                for _ln in snap_path.read_text(encoding="utf-8").splitlines():
+                    _ln = _ln.strip()
+                    if _ln:
+                        try: existing.append(_j.loads(_ln))
+                        except Exception: pass
+            merged = existing + (ram[-dirty:] if dirty else [])
+            mode = cfg.get("snapshots_mode", "count")
+            if mode == "count":
+                keep_n = int(cfg.get("snapshots_keep_count", 60))
+                while len(merged) > keep_n:
+                    merged.pop(0)
+            else:
+                from datetime import datetime as _dt2, timedelta as _td
+                unit = cfg.get("snapshots_keep_unit", "hours")
+                val  = int(cfg.get("snapshots_keep_hours", 24))
+                mul  = {"hours": 1, "days": 24, "weeks": 168, "months": 720}
+                cut  = _dt2.now() - _td(hours=val * mul.get(unit, 1))
+                merged = [s for s in merged
+                          if _dt2.fromisoformat(s["ts"]) >= cut]
+            out = _os.linesep.join(_j.dumps(s, ensure_ascii=False) for s in merged)
+            snap_path.write_text(out + _os.linesep, encoding="utf-8")
+            self._app_snapshots_dirty = 0
+            self._app_snapshots_ram   = merged
+        except Exception as _e:
+            app_logger.warning("App snapshot flush failed: %s", _e)
+
+    def _restore_app_snapshot(self, snap):
+        ed = self._editor
+        if ed:
+            ed.editor.setPlainText(snap.get("editor_text", ""))
+            _nw = getattr(ed, "_notes_win", None)
+            if _nw and snap.get("editor_notes"):
+                _nw.set_notes_data(snap["editor_notes"])
+            _ts = getattr(ed, "target_spin", None)
+            if _ts:
+                _ts.setValue(int(snap.get("editor_target", 0)))
+        cfg = self.config.settings
+        for key in ("terms", "commands", "hallucinations",
+                    "initial_prompt", "model", "lang_name"):
+            if key in snap:
+                cfg[key] = snap[key]
+        try: self.config.save()
+        except Exception: pass
+        rsn = snap.get("reason", "")
+        self.scratchpad.append("[System] App state restored from snapshot: " + rsn)
+
+    def _show_app_snapshots(self):
+        from PyQt6.QtWidgets import (QDialog, QTreeWidget, QTreeWidgetItem,
+                                     QDialogButtonBox, QLabel)
+        from PyQt6.QtCore import Qt as _Qt2
+        from datetime import datetime as _dt
+        from collections import defaultdict as _dd2
+        import json as _j
+
+        snaps = []
+        snap_path = Path(BASE_DIR) / "whisperr_snapshots.jsonl"
+        if snap_path.exists():
+            for _ln in snap_path.read_text(encoding="utf-8").splitlines():
+                _ln = _ln.strip()
+                if _ln:
+                    try: snaps.append(_j.loads(_ln))
+                    except Exception: pass
+        ram = getattr(self, "_app_snapshots_ram", [])
+        on_disk = {s["ts"] for s in snaps}
+        snaps += [s for s in ram if s["ts"] not in on_disk]
+        snaps.sort(key=lambda s: s["ts"])
+
+        if not snaps:
+            QMessageBox.information(
+                self, "App State Snapshots",
+                "No snapshots yet.\n\n"
+                "Enable app-state snapshots in Settings.\n"
+                "Snapshots are taken when you save settings, modify terms/commands,\n"
+                "change models, or type in the editor.")
+            return
+
+        parent_w = self._editor if self._editor else self
+        dlg = QDialog(parent_w)
+        dlg.setWindowTitle("App State Snapshots")
+        dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        dlg.resize(760, 520)
+        lay = QVBoxLayout(dlg)
+        lbl = QLabel(str(len(snaps)) + " snapshot(s)  —  select one to restore:")
+        lbl.setStyleSheet("color:#aaa;font-size:11px;")
+        lay.addWidget(lbl)
+
+        tree = QTreeWidget()
+        tree.setColumnCount(4)
+        tree.setHeaderLabels(["Date / Time", "Words", "Trigger", "Preview"])
+        tree.setColumnWidth(0, 155)
+        tree.setColumnWidth(1, 55)
+        tree.setColumnWidth(2, 205)
+        tree.setColumnWidth(3, 235)
+        tree.setStyleSheet(
+            "QTreeWidget{background:#1e1e1e;color:#ddd;border:1px solid #444;}"
+            "QTreeWidget::item:selected{background:#1a3a5c;}"
+            "QHeaderView::section{background:#2a2a2a;color:#aaa;"
+            "border:1px solid #333;padding:2px 4px;}")
+
+        by_day = _dd2(list)
+        for i, s in enumerate(snaps):
+            try: dt = _dt.fromisoformat(s["ts"])
+            except Exception: dt = _dt.now()
+            by_day[dt.strftime("%Y-%m-%d")].append((i, dt, s))
+
+        all_days  = sorted(by_day.keys())
+        span_days = ((_dt.fromisoformat(all_days[-1]) -
+                      _dt.fromisoformat(all_days[0])).days + 1
+                     if len(all_days) > 1 else 1)
+
+        def _leaf(i, dt, s):
+            txt  = s.get("editor_text", "")
+            prev = txt[:55].replace("\n", " ")
+            if len(txt) > 55:
+                prev += "..."
+            item = QTreeWidgetItem([
+                dt.strftime("%Y-%m-%d %H:%M:%S"),
+                str(len(txt.split())),
+                s.get("reason", ""),
+                prev,
+            ])
+            item.setData(0, _Qt2.ItemDataRole.UserRole, i)
+            return item
+
+        if span_days <= 1:
+            for i, dt, s in reversed(by_day[all_days[0]]):
+                tree.addTopLevelItem(_leaf(i, dt, s))
+        elif span_days <= 7:
+            for day in reversed(all_days):
+                di = QTreeWidgetItem(
+                    [_dt.fromisoformat(day).strftime("%A, %b %d %Y"), "", "", ""])
+                di.setExpanded(True)
+                for i, dt, s in reversed(by_day[day]):
+                    di.addChild(_leaf(i, dt, s))
+                tree.addTopLevelItem(di)
+        else:
+            from collections import defaultdict as _dd3
+            by_month = _dd3(lambda: _dd3(lambda: _dd3(list)))
+            for day in all_days:
+                dt_d = _dt.fromisoformat(day)
+                mo = dt_d.strftime("%Y-%m")
+                wk = dt_d.strftime("%Y-W%W")
+                by_month[mo][wk][day].extend(by_day[day])
+            for mo in reversed(sorted(by_month.keys())):
+                mo_dt = _dt.strptime(mo + "-01", "%Y-%m-%d")
+                mi = QTreeWidgetItem([mo_dt.strftime("%B %Y"), "", "", ""])
+                mi.setExpanded(True)
+                for wk in reversed(sorted(by_month[mo].keys())):
+                    wk_dt = _dt.strptime(wk + "-1", "%Y-W%W-%w")
+                    wi = QTreeWidgetItem(
+                        ["Week of " + wk_dt.strftime("%b %d"), "", "", ""])
+                    wi.setExpanded(False)
+                    for day in reversed(sorted(by_month[mo][wk].keys())):
+                        di = QTreeWidgetItem(
+                            [_dt.fromisoformat(day).strftime("%a %b %d"), "", "", ""])
+                        di.setExpanded(False)
+                        for i, dt, s in reversed(by_month[mo][wk][day]):
+                            di.addChild(_leaf(i, dt, s))
+                        wi.addChild(di)
+                    mi.addChild(wi)
+                tree.addTopLevelItem(mi)
+
+        lay.addWidget(tree)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            items = tree.selectedItems()
+            if items:
+                idx = items[0].data(0, _Qt2.ItemDataRole.UserRole)
+                if idx is not None:
+                    rsn = snaps[idx].get("reason", "")
+                    reply = QMessageBox.question(
+                        parent_w, "Restore Snapshot",
+                        "Restore snapshot:\n\"" + rsn + "\"\n\n"
+                        "This replaces current editor text, notes, and settings.\n"
+                        "This cannot be undone.",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No)
+                    if reply == QMessageBox.StandardButton.Yes:
+                        self._restore_app_snapshot(snaps[idx])
+
     def _quit_app(self):
         """Save persistent state then exit."""
         # Save editor content to disk if "remember" toggle is on
@@ -9069,6 +10701,9 @@ class WhisperRApp(QMainWindow):
                         pass
         except Exception as _e:
             app_logger.warning(f"Could not save editor content: {_e}")
+        # Flush any pending app-state snapshots to disk before exit
+        try: self._flush_app_snapshots(final=True)
+        except Exception: pass
         QApplication.instance().quit()
 
     def on_toggle_hotkey(self):
@@ -9450,6 +11085,10 @@ After placing DLL files, check the logs when transcribing:
         for item in self.ft_list.selectedItems():
             self.ft_list.takeItem(self.ft_list.row(item))
 
+    def _ft_cancel(self):
+        self._ft_cancelled = True
+        self.ft_status_lbl.setText("Cancelling...")
+
     def _ft_start_transcription(self):
         """Submit all queued files to the transcriber."""
         n = self.ft_list.count()
@@ -9459,18 +11098,42 @@ After placing DLL files, check the logs when transcribing:
             self.ft_status_lbl.setText("Queue is empty — use Add Files... to add audio files.")
             self.scratchpad.append("[File] Transcribe button pressed but queue is empty.")
             return
-        self._ft_pending = list(paths)
-        self._ft_total   = len(paths)
-        self.ft_status_lbl.setText(f"Transcribing {self._ft_total} file(s)...")
-        self.scratchpad.append(f"[File] Starting transcription of {self._ft_total} file(s).")
-        # Submit all, then clear the list
-        for p in paths:
+        self._ft_pending   = list(paths)
+        self._ft_total     = len(paths)
+        self._ft_cancelled = False
+        self.ft_progress.setValue(0)
+        self.ft_progress.setVisible(True)
+        self.ft_cancel_btn.setVisible(True)
+        self.ft_start_btn.setEnabled(False)
+        self.ft_status_lbl.setText(
+            f"Queuing {self._ft_total} file(s) for transcription...")
+        self.scratchpad.append(
+            f"[File] Starting transcription of {self._ft_total} file(s).")
+        submitted = 0
+        for i, p in enumerate(paths):
+            if self._ft_cancelled:
+                self.ft_status_lbl.setText(
+                    f"Cancelled. {submitted}/{self._ft_total} file(s) queued.")
+                break
             if not os.path.isfile(p):
                 self.scratchpad.append(f"[File] Skipped (not found): {p}")
-                app_logger.warning(f"_ft_start_transcription: file not found: {p}")
+                app_logger.warning(
+                    f"_ft_start_transcription: file not found: {p}")
                 continue
-            self.transcriber.submit(p, p)  # src=path so on_text knows filename
+            pct = int((i + 1) * 100 / self._ft_total)
+            self.ft_progress.setValue(pct)
+            self.ft_status_lbl.setText(
+                f"[{i+1}/{self._ft_total}] Queuing: {Path(p).name}")
+            QApplication.processEvents()
+            self.transcriber.submit(p, p)
             app_logger.info(f"_ft_start_transcription: submitted {p}")
+            submitted += 1
+        if not self._ft_cancelled:
+            self.ft_status_lbl.setText(
+                f"All {submitted} file(s) queued. Transcribing in background...")
+        self.ft_progress.setVisible(False)
+        self.ft_cancel_btn.setVisible(False)
+        self.ft_start_btn.setEnabled(True)
         self.ft_list.clear()
 
     def _ft_mon_toggled(self, enabled):
@@ -9568,6 +11231,27 @@ After placing DLL files, check the logs when transcribing:
         dialog = HotkeyCaptureDialog(self)
         dialog.key_captured.connect(button.setText)
         dialog.exec()
+
+    def _import_hotwords(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Hotwords", "", "Text Files (*.txt);;All Files (*)")
+        if path:
+            try:
+                text = Path(path).read_text(encoding="utf-8")
+                self.hotwords_edit.setPlainText(text.strip())
+            except Exception as e:
+                QMessageBox.warning(self, "Import failed", str(e))
+
+    def _export_hotwords(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Hotwords", "hotwords.txt",
+            "Text Files (*.txt);;All Files (*)")
+        if path:
+            try:
+                Path(path).write_text(
+                    self.hotwords_edit.toPlainText(), encoding="utf-8")
+            except Exception as e:
+                QMessageBox.warning(self, "Export failed", str(e))
 
     def import_p(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import Prompt", "", "Text Files (*.txt)")
