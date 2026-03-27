@@ -18,7 +18,7 @@ WhisperR is **vibe-coded**, initially with Google Gemini and, later, using Claud
 
 A lot of work has gone in its design and the way all its features work and coexist to enable a voice-empowered writing/content-crafting workflow. It's the result of over thirty years of experience producing articles, tutorials, guides, and ebooks, for print and the web.
 
-However, "I get it" if you don't like that - honestly, for remember, my very line of work is writing, and that's one of the fields hurt the most by modern LLMs. Still, if you're one of the fine folks who brand everything created with AI-assistance as "AI slop", and would prefer I'd actually copy-pasted snippets of code one-by-one from other GitHub projects and Stack Overflow, changed three lines and four variables, and called it a day, instead of having an LLM "translate" dozens of pages of detailed instructions of "how this should look and work" into python code, well, you'd better skip this :-)
+However, "I get it" if you don't like that - honestly, for remember, my very line of work is writing, and that's one of the fields hurt the most by modern LLMs. Still, if you're one of the fine folks who brand everything created with AI-assistance as "AI slop", and would prefer I'd actually copy-pasted snippets of code one-by-one from other GitHub projects and Stack Overflow, changed three lines and four variables, and called it a day, instead of having an LLM "translate" dozens of pages of detailed instructions of "how this should look and work" into Python code, well, you'd better skip this :-)
 
 ---
 
