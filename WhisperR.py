@@ -1314,6 +1314,7 @@ class AppConfig:
             "ind_hide_idle": True,
             "log_level": "NONE", "use_vad": True,
             "vad_threshold": 0.5,
+            "harper": {"installed": False, "version": None},
             "vad_min_silence_ms": 2000,
             "vad_min_speech_ms": 250,
             "ft_output_folder": str(Path.home() / "WhisperR_Output"),
@@ -2724,41 +2725,592 @@ def _smart_case_punct(original: str, new_text: str) -> str:
 # pyautogui + focus-restoration fragility.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class _HarperLint:
-    """Lazy wrapper around harper-py. Fails silently if not installed."""
-    _checker = None
-    _available = None
+# ── Harper LSP Integration ────────────────────────────────────────────────────
+#
+# harper-ls is a standalone binary Language Server that provides real-time
+# spell and grammar checking via the Language Server Protocol (LSP) over stdio.
+#
+# Architecture:
+#   • HarperLSPClient — manages one harper-ls subprocess per editor document.
+#     Speaks JSON-RPC over stdin/stdout. Sends initialize → didOpen → didChange
+#     on every (debounced) text change. Receives publishDiagnostics and converts
+#     them to (line, col, end_line, end_col, message, suggestions) tuples.
+#   • _MdHighlighter is extended to apply SpellCheckUnderline on those ranges.
+#   • Right-click context menu offers quick fixes.
+#   • Status indicator in editor toolbar reflects harper state.
 
-    @classmethod
-    def available(cls):
-        if cls._available is None:
-            try:
-                import harper  # noqa
-                cls._available = True
-            except ImportError:
-                cls._available = False
-        return cls._available
+import os, sys, json, threading, subprocess, platform
 
-    @classmethod
-    def lint(cls, text):
-        """Return list of (start, end, message, [suggestions]) tuples."""
-        if not cls.available():
-            return []
+def _harper_binary_path():
+    """Return the path to harper-ls executable, or None if not found."""
+    exe = "harper-ls.exe" if sys.platform == "win32" else "harper-ls"
+    # 1. Same folder as the app/exe
+    app_dir = (os.path.dirname(sys.executable)
+               if getattr(sys, "frozen", False)
+               else os.path.dirname(os.path.abspath(__file__)))
+    candidate = os.path.join(app_dir, exe)
+    app_logger.debug(
+        f"_harper_binary_path: checking {candidate!r} "
+        f"exists={os.path.isfile(candidate)}")
+    if os.path.isfile(candidate):
+        return candidate
+    # 2. System PATH
+    import shutil
+    found = shutil.which("harper-ls")
+    app_logger.debug(f"_harper_binary_path: PATH lookup → {found!r}")
+    return found  # may be None
+
+
+def _harper_download(progress_cb=None, done_cb=None):
+    """Download the correct harper-ls binary from GitHub in a background thread.
+
+    progress_cb(msg: str) — called with status strings during download.
+    done_cb(success: bool, msg: str) — called when finished.
+    """
+    def _worker():
         try:
-            import harper
-            doc    = harper.DocText(text)
-            lints  = doc.lint()
-            result = []
-            for l in lints:
-                span = l.span()
-                result.append((
-                    span[0], span[1],
-                    l.message(),
-                    list(l.suggestions()) if hasattr(l, 'suggestions') else [],
-                ))
-            return result
+            import urllib.request as _ur, zipfile, tarfile, tempfile, shutil
+
+            # Determine the correct asset name
+            machine = platform.machine().lower()
+            plat    = sys.platform
+            app_logger.info(f"Harper download: platform={plat}, machine={machine}")
+            if plat == "win32":
+                asset_name = "harper-ls-x86_64-pc-windows-msvc.zip"
+            elif plat == "darwin":
+                if "arm" in machine or "aarch64" in machine:
+                    asset_name = "harper-ls-aarch64-apple-darwin.tar.gz"
+                else:
+                    asset_name = "harper-ls-x86_64-apple-darwin.tar.gz"
+            else:  # Linux
+                if "aarch64" in machine or "arm64" in machine:
+                    asset_name = "harper-ls-aarch64-unknown-linux-gnu.tar.gz"
+                else:
+                    asset_name = "harper-ls-x86_64-unknown-linux-gnu.tar.gz"
+
+            if progress_cb:
+                progress_cb("Checking GitHub for the latest Harper release…")
+
+            api_url = "https://api.github.com/repos/Automattic/harper/releases/latest"
+            req = _ur.Request(api_url, headers={"User-Agent": "WhisperR"})
+            with _ur.urlopen(req, timeout=15) as resp:
+                release = json.loads(resp.read())
+
+            version = release.get("tag_name", "unknown")
+            assets  = release.get("assets", [])
+            url     = next(
+                (a["browser_download_url"] for a in assets
+                 if a["name"] == asset_name), None)
+            app_logger.info(f"Harper download: version={version}, asset={asset_name}, url_found={url is not None}")
+
+            if not url:
+                available = [a["name"] for a in assets]
+                if done_cb:
+                    done_cb(False,
+                        f"Could not find the right download for your system.\n\n"
+                        f"Expected: {asset_name}\n"
+                        f"Available:\n" + "\n".join(f"  • {n}" for n in available[:8]) +
+                        "\n\nYou can download manually from:\n"
+                        "https://github.com/Automattic/harper/releases/latest")
+                return
+
+            if progress_cb:
+                progress_cb(f"Downloading {asset_name} ({version})…")
+
+            exe_name = "harper-ls.exe" if plat == "win32" else "harper-ls"
+            app_dir  = (os.path.dirname(sys.executable)
+                        if getattr(sys, "frozen", False)
+                        else os.path.dirname(os.path.abspath(__file__)))
+            dest     = os.path.join(app_dir, exe_name)
+            app_logger.info(f"Harper download: dest={dest}")
+
+            # Use mkdtemp() instead of TemporaryDirectory — on Windows,
+            # TemporaryDirectory registers a weakref finaliser that Python
+            # calls at interpreter shutdown. By that point AV software may
+            # still hold the zip open, causing WinError 32. With mkdtemp we
+            # delete manually with ignore_errors=True and are done.
+            tmp = tempfile.mkdtemp(prefix="whisperr_harper_")
+            src = None
+            try:
+                archive_path = os.path.join(tmp, asset_name)
+                # Stream download with progress so UI stays responsive
+                req2 = _ur.Request(url, headers={"User-Agent": "WhisperR"})
+                with _ur.urlopen(req2, timeout=60) as _resp:
+                    total = int(_resp.headers.get("Content-Length", 0))
+                    downloaded = 0
+                    chunk_size = 65536  # 64 KB
+                    with open(archive_path, "wb") as _fout:
+                        while True:
+                            chunk = _resp.read(chunk_size)
+                            if not chunk:
+                                break
+                            _fout.write(chunk)
+                            downloaded += len(chunk)
+                            if progress_cb and total:
+                                pct = int(downloaded * 100 / total)
+                                mb  = downloaded / 1048576
+                                progress_cb(
+                                    f"Downloading… {mb:.1f} MB ({pct}%)")
+                app_logger.info(
+                    f"Harper download: archive saved ({downloaded} bytes)")
+
+                if progress_cb:
+                    progress_cb("Extracting…")
+
+                if asset_name.endswith(".zip"):
+                    zf = zipfile.ZipFile(archive_path)
+                    try:
+                        members = zf.namelist()
+                        target  = next(
+                            (m for m in members
+                             if m.endswith(exe_name) or m == exe_name), None)
+                        if not target:
+                            if done_cb:
+                                done_cb(False,
+                                    f"Could not find {exe_name} inside the archive.\n"
+                                    f"Archive contents: {members}")
+                            return
+                        src = zf.extract(target, tmp)
+                    finally:
+                        zf.close()  # release handle before any rmtree attempt
+                else:
+                    tf = tarfile.open(archive_path)
+                    try:
+                        members = tf.getnames()
+                        target  = next(
+                            (m for m in members
+                             if m.endswith(exe_name) or m == exe_name), None)
+                        if not target:
+                            if done_cb:
+                                done_cb(False,
+                                    f"Could not find {exe_name} inside the archive.\n"
+                                    f"Archive contents: {members}")
+                            return
+                        member = tf.getmember(target)
+                        tf.extract(member, tmp)
+                        src = os.path.join(tmp, target)
+                    finally:
+                        tf.close()  # release handle before any rmtree attempt
+
+                if src:
+                    shutil.copy2(src, dest)
+                    if plat != "win32":
+                        os.chmod(dest, 0o755)
+            finally:
+                # Best-effort cleanup — AV scanners on Windows may keep the
+                # zip locked briefly; ignore_errors means we never crash here.
+                shutil.rmtree(tmp, ignore_errors=True)
+
+            if done_cb:
+                app_logger.info(f"Harper download: SUCCESS, binary at {dest}")
+                done_cb(True, version)
+
+        except OSError as e:
+            app_logger.error(f"Harper download OSError: {e}")
+            if done_cb:
+                done_cb(False,
+                    f"Could not write to the app folder.\n\n"
+                    f"Error: {e}\n\n"
+                    f"Try running WhisperR as Administrator, or download harper-ls.exe\n"
+                    f"manually and place it in the same folder as WhisperR.exe.")
+        except Exception as e:
+            app_logger.error(f"Harper download Exception: {e}", exc_info=True)
+            if done_cb:
+                done_cb(False,
+                    f"Download failed: {e}\n\n"
+                    f"Check your internet connection, or download manually from:\n"
+                    f"https://github.com/Automattic/harper/releases/latest")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+class HarperLSPClient:
+    """Manages one harper-ls subprocess and speaks LSP JSON-RPC over stdio.
+
+    Usage:
+        client = HarperLSPClient(on_diagnostics=callback)
+        client.start()
+        client.open_document(uri, text)
+        client.change_document(uri, text)   # debounced internally
+        client.stop()
+
+    on_diagnostics(diags) is called on the main thread with a list of:
+        {"range": {"start": {"line":N,"character":N},
+                   "end":   {"line":N,"character":N}},
+         "message": str,
+         "suggestions": [str, ...]}
+    """
+
+    DEBOUNCE_MS = 400
+
+    def __init__(self, on_diagnostics=None, binary_path=None):
+        self._on_diagnostics = on_diagnostics
+        self._binary   = binary_path or _harper_binary_path()
+        self._proc     = None
+        self._msg_id   = 0
+        self._reader   = None
+        self._lock     = threading.Lock()
+        self._uri      = None
+        self._version  = 0
+        self._debounce  = None   # threading.Timer
+        self._stopping  = False  # set True on explicit stop() to suppress restart
+
+    def _auto_restart(self):
+        """Called on main thread when harper-ls exits unexpectedly. Restart it."""
+        if self._stopping:
+            return
+        app_logger.info("HarperLSPClient: auto-restarting harper-ls")
+        self._proc = None
+        if self.start():
+            uri  = self._uri
+            text = getattr(self, "_last_text", "")
+            if uri:
+                self.open_document(uri, text)
+                app_logger.info("HarperLSPClient: auto-restart successful")
+        else:
+            app_logger.warning("HarperLSPClient: auto-restart failed")
+
+    def available(self):
+        return bool(self._binary and os.path.isfile(self._binary))
+
+    def running(self):
+        return self._proc is not None and self._proc.poll() is None
+
+    def start(self):
+        if not self.available():
+            app_logger.warning(
+                f"HarperLSPClient.start: binary not found at {self._binary!r}")
+            return False
+        if self.running():
+            app_logger.debug("HarperLSPClient.start: already running")
+            return True
+        try:
+            app_logger.info(f"HarperLSPClient.start: launching {self._binary}")
+            # CREATE_NO_WINDOW prevents a console flash on Windows
+            _cflags = 0
+            if sys.platform == "win32":
+                _cflags = subprocess.CREATE_NO_WINDOW
+            self._proc = subprocess.Popen(
+                [self._binary, "--stdio"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                creationflags=_cflags)
+            self._reader = threading.Thread(
+                target=self._read_loop, daemon=True)
+            self._reader.start()
+            # Also drain stderr so it appears in the app log
+            self._stderr_reader = threading.Thread(
+                target=self._read_stderr_loop, daemon=True)
+            self._stderr_reader.start()
+            self._send_initialize()
+            app_logger.info("HarperLSPClient.start: process started, initialize sent")
+            return True
+        except Exception as _e:
+            app_logger.error(f"HarperLSPClient.start failed: {_e}", exc_info=True)
+            self._proc = None
+            return False
+
+    def stop(self):
+        self._stopping = True
+        if self._debounce:
+            self._debounce.cancel()
+        if self._proc:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=2)
+            except Exception:
+                pass
+            self._proc = None
+
+    def open_document(self, uri, text):
+        self._uri     = uri
+        self._version = 1
+        self._send({
+            "jsonrpc": "2.0",
+            "method":  "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri":        uri,
+                    "languageId": "markdown",
+                    "version":    self._version,
+                    "text":       text,
+                }
+            }
+        })
+        # Send didChange immediately — some harper-ls versions need actual
+        # content change traffic to start producing diagnostics and to
+        # avoid their idle-timeout shutdown.
+        self._send_change(uri, text)
+
+    def change_document(self, uri, text):
+        """Debounced — waits DEBOUNCE_MS ms after last call before sending."""
+        if self._debounce:
+            self._debounce.cancel()
+        self._debounce = threading.Timer(
+            self.DEBOUNCE_MS / 1000.0,
+            self._send_change, args=(uri, text))
+        self._debounce.daemon = True
+        self._debounce.start()
+
+    # ── internal ─────────────────────────────────────────────────────────────
+
+    def _next_id(self):
+        with self._lock:
+            self._msg_id += 1
+            return self._msg_id
+
+    def _send(self, obj):
+        if not self.running():
+            return
+        body_str   = json.dumps(obj, ensure_ascii=False)
+        body_bytes = body_str.encode("utf-8")
+        # Content-Length MUST be byte count, not character count
+        header     = f"Content-Length: {len(body_bytes)}\r\n\r\n"
+        method = obj.get("method", f"response:{obj.get('id', '?')}")
+        app_logger.debug(
+            f"LSP → harper-ls: {method} ({len(body_bytes)}b)")
+        with self._lock:
+            try:
+                self._proc.stdin.write(header.encode("utf-8") + body_bytes)
+                self._proc.stdin.flush()
+            except Exception as _se:
+                app_logger.debug(f"HarperLSPClient._send error: {_se}")
+
+    def _send_initialize(self):
+        _app_dir = (os.path.dirname(sys.executable)
+                    if getattr(sys, "frozen", False)
+                    else os.path.dirname(os.path.abspath(__file__)))
+        _root_uri = "file:///" + _app_dir.replace("\\", "/").lstrip("/")
+        app_logger.info(f"HarperLSPClient: rootUri={_root_uri!r}")
+        _settings = {
+            "harper-ls": {
+                "diagnosticSeverity": "warning",
+                "linters": {
+                    "spell_check": True,
+                    "an_a": True,
+                    "sentence_capitalization": False,
+                    "unclosed_quotes": True,
+                    "wrong_quotes": False,
+                    "long_sentences": False,
+                    "repeated_words": True,
+                    "spaces": True,
+                    "matcher": True,
+                }
+            }
+        }
+        self._send({
+            "jsonrpc": "2.0",
+            "id":      self._next_id(),
+            "method":  "initialize",
+            "params": {
+                "processId":        os.getpid(),
+                "rootUri":          _root_uri,
+                "workspaceFolders": [{"uri": _root_uri, "name": "WhisperR"}],
+                "initializationOptions": _settings,
+                "capabilities": {
+                    "textDocument": {
+                        "publishDiagnostics": {
+                            "relatedInformation": True,
+                            "versionSupport":     True,
+                        },
+                        "synchronization": {"dynamicRegistration": False},
+                    },
+                    "workspace": {
+                        "workspaceFolders":      True,
+                        "didChangeConfiguration": {"dynamicRegistration": False},
+                    }
+                },
+                "clientInfo": {"name": "WhisperR", "version": "2.1.0"}
+            }
+        })
+        # initialized notification — required by LSP spec
+        self._send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        # Also push settings via workspace/didChangeConfiguration
+        # (some harper-ls versions only read one or the other)
+        self._send({
+            "jsonrpc": "2.0",
+            "method":  "workspace/didChangeConfiguration",
+            "params":  {"settings": _settings}
+        })
+
+    def _send_keepalive(self):
+        """Resend the last document text to prevent harper-ls idle timeout."""
+        if not self.running():
+            return
+        uri  = getattr(self, "_uri",       None)
+        text = getattr(self, "_last_text", None)
+        if uri and text is not None:
+            app_logger.debug("HarperLSPClient: keepalive ping")
+            self._send_change(uri, text)
+
+    def _send_change(self, uri, text):
+        self._last_text = text   # cache for auto-restart
+        self._version += 1
+        app_logger.debug(
+            f"LSP _send_change: version={self._version} "
+            f"text_len={len(text)} preview={text[:40]!r}")
+        self._send({
+            "jsonrpc": "2.0",
+            "method":  "textDocument/didChange",
+            "params": {
+                "textDocument": {
+                    "uri":     uri,
+                    "version": self._version,
+                },
+                "contentChanges": [{"text": text}]
+            }
+        })
+
+    def _read_loop(self):
+        """Read LSP messages from harper-ls stdout in a dedicated thread."""
+        buf = b""
+        while self._proc and self._proc.poll() is None:
+            try:
+                chunk = self._proc.stdout.read(4096)
+                if not chunk:
+                    app_logger.info("HarperLSPClient: stdout closed (harper-ls exited)")
+                    # Schedule auto-restart on the main Qt thread
+                    if self._on_diagnostics and not self._stopping:
+                        from PyQt6.QtCore import QTimer
+                        QTimer.singleShot(
+                            2000, self._auto_restart)
+                    break
+                buf += chunk
+                while True:
+                    # Parse Content-Length header
+                    hdr_end = buf.find(b"\r\n\r\n")
+                    sep_len = 4
+                    if hdr_end < 0:
+                        # Try \n\n fallback
+                        hdr_end = buf.find(b"\n\n")
+                        sep_len = 2
+                    if hdr_end < 0:
+                        break
+                    header  = buf[:hdr_end].decode("utf-8", errors="ignore")
+                    length  = 0
+                    for line in header.splitlines():
+                        if line.lower().startswith("content-length:"):
+                            try:
+                                length = int(line.split(":", 1)[1].strip())
+                            except ValueError:
+                                pass
+                    body_start = hdr_end + sep_len
+                    if len(buf) < body_start + length:
+                        break   # need more data
+                    body = buf[body_start:body_start + length]
+                    buf  = buf[body_start + length:]
+                    try:
+                        msg = json.loads(body.decode("utf-8"))
+                        self._handle_message(msg)
+                    except Exception as _he:
+                        app_logger.warning(
+                            f"HarperLSPClient._handle_message error: {_he}")
+            except Exception as _rle:
+                app_logger.warning(
+                    f"HarperLSPClient read_loop exception: {_rle}")
+                break
+
+    def _read_stderr_loop(self):
+        """Read harper-ls stderr and log it for diagnostics."""
+        try:
+            for line in iter(self._proc.stderr.readline, b""):
+                txt = line.decode("utf-8", errors="replace").rstrip()
+                if txt:
+                    app_logger.debug(f"harper-ls stderr: {txt}")
         except Exception:
-            return []
+            pass
+
+    def _handle_message(self, msg):
+        method   = msg.get("method", "")
+        _msg_id  = msg.get("id", "")
+        _is_req  = "id" in msg and "method" in msg   # server→client request
+        _is_resp = "id" in msg and "result" in msg    # our request's response
+        app_logger.debug(
+            f"LSP ← harper-ls: {method!r} id={_msg_id!r} "
+            f"req={_is_req} resp={_is_resp}")
+        if method == "textDocument/publishDiagnostics":
+            diags_raw = msg.get("params", {}).get("diagnostics", [])
+            app_logger.debug(
+                f"Harper LSP: received {len(diags_raw)} diagnostic(s)")
+            diags = []
+            for d in diags_raw:
+                rng    = d.get("range", {})
+                start  = rng.get("start", {})
+                end    = rng.get("end", {})
+                # Extract suggestions from codeActions if present
+                suggs  = []
+                for action in d.get("relatedInformation", []):
+                    msg_txt = action.get("message", "")
+                    if msg_txt:
+                        suggs.append(msg_txt)
+                # harper-ls puts suggestions in data.suggestions
+                data = d.get("data") or {}
+                if isinstance(data, dict):
+                    suggs = data.get("suggestions", suggs)
+                diags.append({
+                    "range":       {"start": start, "end": end},
+                    "message":     d.get("message", ""),
+                    "suggestions": suggs,
+                })
+            if self._on_diagnostics:
+                # Schedule callback on main Qt thread
+                from PyQt6.QtCore import QTimer
+                QTimer.singleShot(0, lambda d=diags: self._on_diagnostics(d))
+
+        elif method == "workspace/configuration":
+            # harper-ls REQUIRES a response to workspace/configuration —
+            # without it, it blocks indefinitely and never sends diagnostics.
+            _req_id = msg.get("id")
+            _items  = msg.get("params", {}).get("items", [])
+            # harper-ls expects each result item to be {"harper-ls": {<settings>}}
+            # It does result_item["harper-ls"] internally — unwrapped settings
+            # cause "Settings must contain a 'harper-ls' key" error.
+            _inner_cfg = {
+                "diagnosticSeverity": "warning",
+                "linters": {
+                    "spell_check":             True,
+                    "an_a":                    True,
+                    "sentence_capitalization": False,
+                    "unclosed_quotes":         True,
+                    "wrong_quotes":            False,
+                    "long_sentences":          False,
+                    "repeated_words":          True,
+                    "spaces":                  True,
+                    "matcher":                 True,
+                }
+            }
+            _harper_cfg = {"harper-ls": _inner_cfg}
+            _results = []
+            for _item in _items:
+                _sec = _item.get("section", "")
+                # If requesting "harper-ls" section specifically, return
+                # the inner dict (per LSP spec). If requesting "" or full
+                # settings object, return the wrapped form.
+                if _sec == "harper-ls":
+                    _results.append(_inner_cfg)
+                elif _sec == "":
+                    _results.append(_harper_cfg)
+                else:
+                    _results.append(None)
+            if not _items:
+                _results = [_harper_cfg]
+            self._send({"jsonrpc": "2.0", "id": _req_id, "result": _results})
+            app_logger.debug(
+                f"LSP: replied to workspace/configuration id={_req_id} "
+                f"({len(_results)} section(s))")
+
+        elif msg.get("id") is not None and "result" in msg:
+            app_logger.info(
+                f"Harper LSP response id={msg['id']}: "
+                f"result keys={list((msg.get('result') or {}).keys())}")
+        elif msg.get("id") is not None and "error" in msg:
+            app_logger.error(
+                f"Harper LSP error id={msg['id']}: {msg['error']}")
+
+
+
 
 
 
@@ -4201,13 +4753,14 @@ class WhisperEditor(QWidget):
         self._history_timer.timeout.connect(self._push_history)
         self._history_timer.timeout.connect(self._snap_on_editor_change)
         self.editor.textChanged.connect(lambda: self._history_timer.start())
-        # Harper spell/grammar check — debounced 2 s
-        self._lint_timer = QTimer(self)
-        self._lint_timer.setSingleShot(True)
-        self._lint_timer.setInterval(2000)
-        self._lint_timer.timeout.connect(self._run_lint)
-        self.editor.textChanged.connect(lambda: self._lint_timer.start())
+        # Harper LSP — start if binary available; textChanged drives debounced check
         self._lint_errors: list = []  # [(start,end,msg,[sugg])]
+        self._harper_client = None
+        self._harper_uri    = "file:///whisperr_editor_doc"
+        # Start Harper automatically if the binary is present
+        QTimer.singleShot(500, self._start_harper)
+        # textChanged → debouncing is done inside HarperLSPClient
+        self.editor.textChanged.connect(self._run_lint)
         # Drop support
         self.editor.dragEnterEvent = self._drag_enter
         self.editor.dropEvent = self._drop_event
@@ -4265,6 +4818,13 @@ class WhisperEditor(QWidget):
         _m_edit = _menubar.addMenu("Edit")
         _ma(_m_edit, "Copy All",             self._copy_all,         "Ctrl+Shift+C")
         _ma(_m_edit, "Find && Replace",      self._show_find_replace, "Ctrl+H")
+        _m_edit.addSeparator()
+        from PyQt6.QtGui import QAction as _QActSC
+        self._harper_menu_act = _QActSC("Spell && Grammar Checking: OFF", self)
+        self._harper_menu_act.setCheckable(True)
+        self._harper_menu_act.setChecked(False)
+        self._harper_menu_act.triggered.connect(self._toggle_harper)
+        _m_edit.addAction(self._harper_menu_act)
 
         # History menu (project version history — populated dynamically)
         self._m_history = _menubar.addMenu("History")
@@ -4372,6 +4932,19 @@ class WhisperEditor(QWidget):
             "border-radius:4px;color:#fff;font-weight:bold;}"
             "QPushButton:hover{background:#005fa3;}")
         btn_row.addWidget(self.btn_paste_app)
+
+        # ── Harper spell-check indicator ────────────────────────────────
+        self._harper_indicator = QPushButton("📝")
+        self._harper_indicator.setFixedSize(32, 28)
+        self._harper_indicator.setToolTip(
+            "Spell & grammar checking: initialising…\n"
+            "Go to Settings → Optional Tools to install Harper.")
+        self._harper_indicator.setStyleSheet(
+            "QPushButton{background:#2a2a2a;border:1px solid #444;"
+            "border-radius:4px;color:#666;font-size:13px;padding:2px 6px;}"
+            "QPushButton:hover{background:#353535;border-color:#888;}")
+        self._harper_indicator.clicked.connect(self._toggle_harper)
+        btn_row.addWidget(self._harper_indicator)
 
         root.addLayout(btn_row)
 
@@ -5012,8 +5585,9 @@ class WhisperEditor(QWidget):
                 self.editor.setPlainText(history[_i]["text"])))
             parent.addAction(act)
         if span_days <= 1:
-            for i, dt, e in reversed(history[-20:] if len(history) > 20
-                                      else history):
+            entries = by_day[all_days[0]]
+            for i, dt, e in reversed(entries[-20:] if len(entries) > 20
+                                      else entries):
                 _add_entry(m, i, dt, e)
         elif span_days <= 7:
             for day in reversed(all_days):
@@ -5107,27 +5681,171 @@ class WhisperEditor(QWidget):
                     for i, dt, s in reversed(by_month[mo][day]):
                         _add_snap(day_sub, i, dt, s)
 
+    def _start_harper(self):
+        """Start the Harper LSP client for this editor document."""
+        try:
+            binary = _harper_binary_path()
+            app_logger.info(f"_start_harper: binary={binary!r}")
+            # Guard: if already running, nothing to do
+            existing = getattr(self, "_harper_client", None)
+            if existing is not None:
+                try:
+                    if existing.running():
+                        app_logger.debug("_start_harper: already running")
+                        return
+                except Exception as _re:
+                    app_logger.warning(f"_start_harper: existing client check failed: {_re}")
+            app_logger.info("_start_harper: creating HarperLSPClient")
+            client = HarperLSPClient(on_diagnostics=self._apply_lint_results)
+            app_logger.info("_start_harper: HarperLSPClient created, calling start()")
+            ok = client.start()
+            app_logger.info(f"_start_harper: client.start() returned {ok}")
+            if ok:
+                self._harper_client = client
+                # Use a file: URI within the workspace root so harper-ls
+                # document filters match. The file does not need to exist
+                # on disk — LSP carries the full content in open/change
+                # notifications. This is standard LSP behaviour.
+                _app_dir2 = (os.path.dirname(sys.executable)
+                             if getattr(sys, "frozen", False)
+                             else os.path.dirname(os.path.abspath(__file__)))
+                _uri_base = ("file:///" +
+                    _app_dir2.replace("\\", "/").lstrip("/"))
+                uri = _uri_base + "/whisperr-document.md"
+                _doc_text = self.editor.toPlainText()
+                self._harper_client.open_document(uri, _doc_text)
+                self._harper_uri = uri
+                app_logger.info(f"_start_harper: opened doc uri={uri!r}")
+                # Keepalive timer — created on main thread, fires every 20s
+                from PyQt6.QtCore import QTimer as _QTka
+                self._harper_keepalive = _QTka(self)
+                self._harper_keepalive.setInterval(20000)
+                self._harper_keepalive.timeout.connect(
+                    lambda: (
+                        self._harper_client._send_keepalive()
+                        if self._harper_client and self._harper_client.running()
+                        else None))
+                self._harper_keepalive.start()
+                app_logger.info("_start_harper: keepalive timer started (20s)")
+                self._update_harper_indicator(True)
+                app_logger.info("_start_harper: Harper LSP active")
+            else:
+                self._harper_client = None
+                self._update_harper_indicator(False)
+                app_logger.warning("_start_harper: Harper LSP did not start")
+        except Exception as _se:
+            app_logger.error(f"_start_harper exception: {_se}", exc_info=True)
+            self._harper_client = None
+            self._update_harper_indicator(False)
+
+    def _stop_harper(self):
+        """Stop the Harper LSP client."""
+        ka = getattr(self, "_harper_keepalive", None)
+        if ka:
+            ka.stop()
+            self._harper_keepalive = None
+        client = getattr(self, "_harper_client", None)
+        if client:
+            client.stop()
+        self._harper_client = None
+        self._lint_errors = []
+        if hasattr(self, "_highlighter"):
+            self._highlighter.set_lint_errors([])
+        self._update_harper_indicator(False)
+
+    def _toggle_harper(self):
+        """Toggle spell/grammar checking on or off."""
+        try:
+            client = getattr(self, "_harper_client", None)
+            is_running = False
+            if client is not None:
+                try:
+                    is_running = client.running()
+                except Exception:
+                    pass
+            if is_running:
+                self._stop_harper()
+            else:
+                self._start_harper()
+        except Exception as _te:
+            app_logger.error(f"_toggle_harper exception: {_te}", exc_info=True)
+
     def _run_lint(self):
-        """Run Harper lint in a background thread; update highlighter on finish."""
-        if not _HarperLint.available():
+        """Send the current document to harper-ls (debounced via HarperLSPClient)."""
+        client = getattr(self, "_harper_client", None)
+        if not client or not client.running():
+            return
+        uri  = getattr(self, "_harper_uri", None)
+        if not uri:
             return
         text = self.editor.toPlainText()
-        import threading as _thr_lint
-        def _lint_worker():
-            errs = _HarperLint.lint(text)
-            # Back on main thread via QTimer.singleShot
-            from PyQt6.QtCore import QTimer as _QTlint
-            _QTlint.singleShot(0, lambda: self._apply_lint_results(errs))
-        _thr_lint.Thread(target=_lint_worker, daemon=True).start()
+        app_logger.debug(
+            f"_run_lint: editor text_len={len(text)} preview={text[:40]!r}")
+        client.change_document(uri, text)
 
-    def _apply_lint_results(self, errors):
+    def _apply_lint_results(self, diags):
+        """Receive LSP publishDiagnostics and convert to highlight spans.
+        diags: list of {"range":{start,end}, "message":str, "suggestions":[str]}
+        """
+        # Convert LSP line/char ranges to absolute char offsets
+        text  = self.editor.toPlainText()
+        lines = text.split("\n")
+        # Build cumulative line-start offsets
+        offsets = [0]
+        for ln in lines:
+            offsets.append(offsets[-1] + len(ln) + 1)
+        errors = []
+        for d in diags:
+            rng   = d.get("range", {})
+            sl    = rng.get("start", {}).get("line", 0)
+            sc    = rng.get("start", {}).get("character", 0)
+            el    = rng.get("end",   {}).get("line", 0)
+            ec    = rng.get("end",   {}).get("character", 0)
+            start = min(offsets[sl] + sc, len(text)) if sl < len(offsets) else 0
+            end   = min(offsets[el] + ec, len(text)) if el < len(offsets) else 0
+            if start < end:
+                errors.append((
+                    start, end,
+                    d.get("message", ""),
+                    d.get("suggestions", [])))
         self._lint_errors = errors
         if hasattr(self, "_highlighter"):
             self._highlighter.set_lint_errors(errors)
 
+    def _update_harper_indicator(self, active: bool):
+        """Update the Harper status indicator in the toolbar and Edit menu."""
+        btn = getattr(self, "_harper_indicator", None)
+        # Sync Edit menu action
+        act = getattr(self, "_harper_menu_act", None)
+        if act:
+            act.setChecked(active)
+            act.setText(
+                "Spell && Grammar Checking: ON"
+                if active else
+                "Spell && Grammar Checking: OFF")
+        if btn is None:
+            return
+        if active:
+            btn.setText("📝")
+            btn.setToolTip("Spell & grammar checking: ON\nClick to disable")
+            btn.setStyleSheet(
+                "QPushButton{background:#1a3a1a;border:1px solid #4caf50;"
+                "border-radius:4px;color:#4caf50;font-size:13px;padding:2px 6px;}"
+                "QPushButton:hover{background:#2a5a2a;}")
+        else:
+            btn.setText("📝")
+            btn.setToolTip(
+                "Spell & grammar checking: OFF\n"
+                "Click to enable  (requires harper-ls)\n"
+                "Go to Settings → Optional Tools to install Harper.")
+            btn.setStyleSheet(
+                "QPushButton{background:#2a2a2a;border:1px solid #444;"
+                "border-radius:4px;color:#666;font-size:13px;padding:2px 6px;}"
+                "QPushButton:hover{background:#353535;border-color:#888;}")
+
     def _lint_at_cursor(self, pos):
         """Return (msg, suggestions) for the lint error at char position, or None."""
-        for (start, end, msg, sugg) in self._lint_errors:
+        for (start, end, msg, sugg) in getattr(self, "_lint_errors", []):
             if start <= pos < end:
                 return msg, sugg
         return None
@@ -5809,6 +6527,8 @@ class WhisperEditor(QWidget):
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        # Stop Harper LSP client cleanly
+        self._stop_harper()
         # NOTE: clipboard monitor is NOT stopped here — it lives on the host
         # app and persists across hide/close. Only turning off the toggle stops it.
         for sc in self._hotkeys_active:
@@ -7587,7 +8307,8 @@ class WhisperRApp(QMainWindow):
             return row
 
         def _chk_harper():
-            import harper  # noqa
+            if not _harper_binary_path():
+                raise RuntimeError("harper-ls binary not found")
         def _chk_pandoc():
             import subprocess as _sp2
             if _sp2.run(["pandoc","--version"], capture_output=True,
@@ -7607,28 +8328,8 @@ class WhisperRApp(QMainWindow):
             "Size: ~100 MB. Free, no account needed.\n"
             "Clicking OK will open the download page.")
 
-        # Harper — NOT a pip package on Windows yet; must be bundled at build time
-        # For frozen app users: not installable after the fact
-        # For developers: pip install harper-py before PyInstaller build
-        _harper_msg_frozen = (
-            "Harper spell/grammar checking is not available in this build of WhisperR.\n\n"
-            "Harper cannot be installed separately into the compiled app.\n"
-            "It must be included when the app is built from source.\n\n"
-            "If you need this feature, check the WhisperR GitHub page for\n"
-            "a build that includes Harper, or build from source yourself.\n\n"
-            "Clicking OK will open the Harper project page for reference.")
-        _harper_msg_dev = (
-            "Harper adds spell and grammar checking to the text editor.\n\n"
-            "To bundle it with the app, run this BEFORE building with PyInstaller:\n"
-            "  pip install harper-py\n\n"
-            "Note: harper-py may not yet have Windows wheels on PyPI.\n"
-            "Check the Harper GitHub page for the latest install instructions.\n\n"
-            "Clicking OK will open the Harper GitHub page.")
-
-        # python-docx — pip package; bundled at build time for frozen app
         _docx_msg_frozen = (
             "python-docx (basic Word export) is not available in this build.\n\n"
-            "It must be included when the app is built from source.\n"
             "If you have Pandoc installed, Word export will use that instead\n"
             "and python-docx is not needed.\n\n"
             "Clicking OK will open the python-docx documentation page.")
@@ -7641,11 +8342,29 @@ class WhisperRApp(QMainWindow):
             "in preference to python-docx, so both can coexist.\n\n"
             "Clicking OK will open the python-docx page.")
 
-        opt_layout.addLayout(_opt_row(
-            "Harper  (spell & grammar check)",
-            _chk_harper,
-            _harper_msg_frozen, _harper_msg_dev,
-            "https://github.com/Automattic/harper"))
+        # Harper — auto-download button instead of generic _opt_row
+        _harper_ok = False
+        try: _chk_harper(); _harper_ok = True
+        except Exception: pass
+        _harper_row = QHBoxLayout()
+        if _harper_ok:
+            _hl = QLabel("✅  Harper  (spell & grammar)  —  installed")
+            _hl.setStyleSheet("color:#4caf50;font-size:11px;")
+            _harper_row.addWidget(_hl)
+        else:
+            _hl = QLabel("❌  Harper  (spell & grammar)  —  not installed")
+            _hl.setStyleSheet("color:#cc4444;font-size:11px;")
+            _harper_row.addWidget(_hl)
+            _hbtn = QPushButton("Enable Spell && Grammar Checking (Harper)")
+            _hbtn.setFixedHeight(24)
+            _hbtn.setStyleSheet(
+                "QPushButton{background:#0a3a6a;border:1px solid #0078d7;"
+                "color:#7ec8ff;font-size:10px;padding:2px 10px;border-radius:3px;}"
+                "QPushButton:hover{background:#0a4a8a;}")
+            _hbtn.clicked.connect(lambda: self._show_harper_install_dialog())
+            _harper_row.addWidget(_hbtn)
+        _harper_row.addStretch()
+        opt_layout.addLayout(_harper_row)
         opt_layout.addLayout(_opt_row(
             "Pandoc  (Word & PDF export)",
             _chk_pandoc,
@@ -10650,6 +11369,108 @@ class WhisperRApp(QMainWindow):
                         QMessageBox.StandardButton.No)
                     if reply == QMessageBox.StandardButton.Yes:
                         self._restore_app_snapshot(snaps[idx])
+
+    def _show_harper_install_dialog(self):
+        """Show the Harper installation dialog with auto-download option."""
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel,
+                                     QDialogButtonBox, QPushButton, QProgressBar)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Enable Spell & Grammar Checking")
+        dlg.setMinimumWidth(520)
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(10)
+
+        title = QLabel("📝  Harper — Fast, Private Grammar & Spell Checking")
+        title.setStyleSheet("font-weight:bold;font-size:13px;color:#ddd;")
+        lay.addWidget(title)
+
+        desc = QLabel(
+            "Harper checks your spelling and grammar as you type — completely "
+            "offline, with no data sent anywhere. It's fast, lightweight, and "
+            "free.\n\n"
+            "To use it, WhisperR needs the <b>harper-ls</b> executable placed in "
+            "the same folder as WhisperR.exe.\n\n"
+            "<b>Manual install:</b> Download <tt>harper-ls.exe</tt> from "
+            "<tt>https://github.com/Automattic/harper/releases/latest</tt> "
+            "and place it next to WhisperR.exe.")
+        desc.setWordWrap(True)
+        desc.setOpenExternalLinks(True)
+        desc.setStyleSheet("color:#ccc;font-size:11px;")
+        lay.addWidget(desc)
+
+        status_lbl = QLabel("")
+        status_lbl.setWordWrap(True)
+        status_lbl.setStyleSheet("color:#aaa;font-size:10px;")
+        lay.addWidget(status_lbl)
+
+        progress = QProgressBar()
+        progress.setRange(0, 0)   # indeterminate
+        progress.setVisible(False)
+        progress.setStyleSheet(
+            "QProgressBar{border:1px solid #444;border-radius:3px;background:#1e1e1e;}"
+            "QProgressBar::chunk{background:#0078d7;}")
+        lay.addWidget(progress)
+
+        auto_btn = QPushButton("⬇  Try Installing Automatically")
+        auto_btn.setStyleSheet(
+            "QPushButton{background:#0a3a6a;border:1px solid #0078d7;color:#7ec8ff;"
+            "padding:6px 16px;border-radius:4px;font-weight:bold;}"
+            "QPushButton:hover{background:#0a4a8a;}"
+            "QPushButton:disabled{background:#1a1a1a;color:#555;border-color:#333;}")
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        btns.accepted.connect(dlg.accept)
+
+        lay.addWidget(auto_btn)
+        lay.addWidget(btns)
+
+        def _on_progress(msg):
+            status_lbl.setText(msg)
+            QApplication.processEvents()
+
+        def _on_done(success, msg):
+            progress.setVisible(False)
+            auto_btn.setEnabled(True)
+            if success:
+                version = msg
+                # Save to config
+                self.config.settings["harper"] = {
+                    "installed": True,
+                    "version": version,
+                }
+                try: self.config.save()
+                except Exception: pass
+                status_lbl.setStyleSheet("color:#4caf50;font-size:10px;")
+                status_lbl.setText(
+                    f"✅  Harper {version} installed successfully!\n"
+                    "Spell checking is now active in the text editor.\n"
+                    "Reopen Settings to see the updated status.")
+                # Update the harper status label in Optional Tools if visible
+                for _hl_lbl in self.findChildren(QLabel):
+                    if "Harper" in _hl_lbl.text() and "not installed" in _hl_lbl.text():
+                        _hl_lbl.setText("✅  Harper  (spell & grammar)  —  installed")
+                        _hl_lbl.setStyleSheet("color:#4caf50;font-size:11px;")
+                        break
+                # Start harper in any open editors
+                for w in QApplication.topLevelWidgets():
+                    ed = getattr(w, "_editor", None)
+                    if ed:
+                        ed._start_harper()
+            else:
+                status_lbl.setStyleSheet("color:#ff6b6b;font-size:10px;")
+                status_lbl.setText(f"❌  {msg}")
+
+        def _auto_install():
+            auto_btn.setEnabled(False)
+            progress.setVisible(True)
+            status_lbl.setStyleSheet("color:#aaa;font-size:10px;")
+            _harper_download(
+                progress_cb=_on_progress,
+                done_cb=_on_done)
+
+        auto_btn.clicked.connect(_auto_install)
+        dlg.exec()
 
     def _quit_app(self):
         """Save persistent state then exit."""
