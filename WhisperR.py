@@ -1003,7 +1003,8 @@ def _ai_worker_process(task_q, result_q, log_q):
                 vad_filter=use_vad,
                 vad_parameters=vad_params if (use_vad and vad_params) else None,
                 initial_prompt=prompt or None,
-                hotwords=hotwords if hotwords else None,
+                # faster-whisper expects hotwords as a single string, not a list
+                hotwords=(" ".join(hotwords) if hotwords else None),
             )
             seg_list = list(segments)
             # Emit each segment with its logprob so the main process can filter.
@@ -3027,6 +3028,7 @@ class HarperLSPClient:
     def open_document(self, uri, text):
         self._uri     = uri
         self._version = 1
+        app_logger.info(f"HarperLSPClient.open_document: uri={uri!r} text_len={len(text)}")
         self._send({
             "jsonrpc": "2.0",
             "method":  "textDocument/didOpen",
@@ -3088,15 +3090,15 @@ class HarperLSPClient:
             "harper-ls": {
                 "diagnosticSeverity": "warning",
                 "linters": {
-                    "spell_check": True,
-                    "an_a": True,
-                    "sentence_capitalization": False,
-                    "unclosed_quotes": True,
-                    "wrong_quotes": False,
-                    "long_sentences": False,
-                    "repeated_words": True,
-                    "spaces": True,
-                    "matcher": True,
+                    "SpellCheck": True,
+                    "AnA": True,
+                    "SentenceCapitalization": False,
+                    "UnclosedQuotes": True,
+                    "WrongQuotes": False,
+                    "LongSentences": False,
+                    "RepeatedWords": True,
+                    "Spaces": True,
+                    "Matcher": True,
                 }
             }
         }
@@ -3232,8 +3234,13 @@ class HarperLSPClient:
             f"req={_is_req} resp={_is_resp}")
         if method == "textDocument/publishDiagnostics":
             diags_raw = msg.get("params", {}).get("diagnostics", [])
+            _doc_uri  = msg.get("params", {}).get("uri", "?")
             app_logger.debug(
-                f"Harper LSP: received {len(diags_raw)} diagnostic(s)")
+                f"Harper LSP: received {len(diags_raw)} diagnostic(s) "
+                f"for uri={_doc_uri!r}")
+            if diags_raw:
+                for _d in diags_raw[:3]:
+                    app_logger.debug(f"  diag: {_d}")
             diags = []
             for d in diags_raw:
                 rng    = d.get("range", {})
@@ -3270,15 +3277,15 @@ class HarperLSPClient:
             _inner_cfg = {
                 "diagnosticSeverity": "warning",
                 "linters": {
-                    "spell_check":             True,
-                    "an_a":                    True,
-                    "sentence_capitalization": False,
-                    "unclosed_quotes":         True,
-                    "wrong_quotes":            False,
-                    "long_sentences":          False,
-                    "repeated_words":          True,
-                    "spaces":                  True,
-                    "matcher":                 True,
+                    "SpellCheck":             True,
+                    "AnA":                    True,
+                    "SentenceCapitalization": False,
+                    "UnclosedQuotes":         True,
+                    "WrongQuotes":            False,
+                    "LongSentences":          False,
+                    "RepeatedWords":          True,
+                    "Spaces":                  True,
+                    "Matcher":                 True,
                 }
             }
             _harper_cfg = {"harper-ls": _inner_cfg}
@@ -5659,7 +5666,9 @@ class WhisperEditor(QWidget):
                 lambda _c=False, _s=s: _app_w._restore_app_snapshot(_s))
             parent.addAction(act)
         if span_days <= 1:
-            for i, dt, s in reversed(snaps[-20:]):
+            entries = by_day[all_days[0]]
+            for i, dt, s in reversed(entries[-20:] if len(entries) > 20
+                                      else entries):
                 _add_snap(m, i, dt, s)
         elif span_days <= 7:
             for day in reversed(all_days):
