@@ -1315,6 +1315,9 @@ class AppConfig:
             "ind_hide_idle": True,
             "log_level": "NONE", "use_vad": True,
             "vad_threshold": 0.5,
+            "hotkey_cooldown_ms": 400,
+            "manual_sentence_split": False,
+            "mss_break_key": "shift",
             "harper": {"installed": False, "version": None},
             "vad_min_silence_ms": 2000,
             "vad_min_speech_ms": 250,
@@ -3041,10 +3044,9 @@ class HarperLSPClient:
                 }
             }
         })
-        # Send didChange immediately — some harper-ls versions need actual
-        # content change traffic to start producing diagnostics and to
-        # avoid their idle-timeout shutdown.
-        self._send_change(uri, text)
+        # Note: do NOT send immediate didChange here — it confuses harper-ls
+        # which hasn't finished processing didOpen yet. The keepalive timer
+        # and user typing will trigger didChange naturally.
 
     def change_document(self, uri, text):
         """Debounced — waits DEBOUNCE_MS ms after last call before sending."""
@@ -3172,12 +3174,19 @@ class HarperLSPClient:
             try:
                 chunk = self._proc.stdout.read(4096)
                 if not chunk:
-                    app_logger.info("HarperLSPClient: stdout closed (harper-ls exited)")
+                    _exit_code = self._proc.poll()
+                    app_logger.info(
+                        f"HarperLSPClient: stdout closed "
+                        f"(harper-ls exited, code={_exit_code})")
+                    if _exit_code not in (0, None):
+                        app_logger.error(
+                            f"harper-ls exit code: {_exit_code} "
+                            f"(non-zero = crash or error)")
                     # Schedule auto-restart on the main Qt thread
                     if self._on_diagnostics and not self._stopping:
                         from PyQt6.QtCore import QTimer
                         QTimer.singleShot(
-                            2000, self._auto_restart)
+                            5000, self._auto_restart)
                     break
                 buf += chunk
                 while True:
@@ -3288,25 +3297,17 @@ class HarperLSPClient:
                     "Matcher":                 True,
                 }
             }
-            _harper_cfg = {"harper-ls": _inner_cfg}
-            _results = []
-            for _item in _items:
-                _sec = _item.get("section", "")
-                # If requesting "harper-ls" section specifically, return
-                # the inner dict (per LSP spec). If requesting "" or full
-                # settings object, return the wrapped form.
-                if _sec == "harper-ls":
-                    _results.append(_inner_cfg)
-                elif _sec == "":
-                    _results.append(_harper_cfg)
-                else:
-                    _results.append(None)
-            if not _items:
-                _results = [_harper_cfg]
+            # Always return the inner settings dict (no "harper-ls" wrapper).
+            # harper-ls sends workspace/configuration with no section field;
+            # it expects the raw settings object back, not wrapped.
+            _results = [_inner_cfg for _ in _items] if _items else [_inner_cfg]
             self._send({"jsonrpc": "2.0", "id": _req_id, "result": _results})
+            _sections_sent = [list(_r.keys()) if isinstance(_r, dict) else _r
+                              for _r in _results]
             app_logger.debug(
                 f"LSP: replied to workspace/configuration id={_req_id} "
-                f"({len(_results)} section(s))")
+                f"sections={[i.get('section','?') for i in _items]} "
+                f"result_keys={_sections_sent}")
 
         elif msg.get("id") is not None and "result" in msg:
             app_logger.info(
@@ -4766,6 +4767,8 @@ class WhisperEditor(QWidget):
         self._harper_uri    = "file:///whisperr_editor_doc"
         # Start Harper automatically if the binary is present
         QTimer.singleShot(500, self._start_harper)
+        # MSS state — next segment starts capitalised by default
+        self._mss_next_capital = True
         # textChanged → debouncing is done inside HarperLSPClient
         self.editor.textChanged.connect(self._run_lint)
         # Drop support
@@ -5281,7 +5284,8 @@ class WhisperEditor(QWidget):
             (cfg.get("editor_hk_kbd",       "Ctrl+Shift+D"),    self._fmt_kbd),
             (cfg.get("editor_hk_tagwrap",   "Ctrl+Shift+W"),    self._fmt_tagwrap),
             (cfg.get("editor_hk_link",      "Ctrl+K"),          self._fmt_link),
-            ("Ctrl+Shift+K",                                     lambda: self._fmt_link(use_clipboard=True)),
+            # Ctrl+Shift+K registered separately with ApplicationShortcut
+            # so it works even when focus is inside the text widget
             ("Ctrl+H",                                           self._show_find_replace),
             ("Ctrl+Alt+H",                                       self._show_history),
         ]
@@ -5293,8 +5297,71 @@ class WhisperEditor(QWidget):
                 self._hotkeys_active.append(sc)
             except Exception:
                 pass
+        # Ctrl+Shift+K: paste clipboard as URL — needs WindowShortcut so
+        # it fires even when the QTextEdit has focus and captures keypresses
+        try:
+            _sc_url = QShortcut(QKeySequence("Ctrl+Shift+K"), self)
+            _sc_url.setContext(Qt.ShortcutContext.WindowShortcut)
+            _sc_url.activated.connect(lambda: self._fmt_link(use_clipboard=True))
+            self._hotkeys_active.append(_sc_url)
+        except Exception:
+            pass
 
     # ── Voice operations (called from WhisperRApp.on_text) ────────────────────
+
+    # ── Manual Sentence Splitting ─────────────────────────────────────────────
+    #
+    # When enabled: each dictated segment is "stitched" — trailing punctuation
+    # is stripped and the next segment starts lowercase, all joined with a space.
+    # Pressing the "sentence break" key (default: Left Shift, configurable) marks
+    # the END of a sentence: a full stop is appended and the NEXT segment begins
+    # with a capital letter.
+    #
+    # State: self._mss_next_capital (bool) — True = next text starts uppercase
+
+    def _mss_apply(self, text: str) -> str:
+        """Apply Manual Sentence Splitting rules to incoming text.
+
+        Returns the transformed text to insert.
+        """
+        import re as _re_mss
+        # Strip trailing sentence-ending punctuation from Whisper output
+        # (period, comma, ellipsis, exclamation, question mark, colon, semicolon)
+        stripped = _re_mss.sub(r'[\.,;:!?\u2026]+$', '', text.rstrip()).rstrip()
+        if not stripped:
+            return ''
+
+        if getattr(self, '_mss_next_capital', True):
+            # Start of a new sentence — capitalise first letter
+            result = stripped[0].upper() + stripped[1:] if stripped else stripped
+        else:
+            # Mid-sentence continuation — force lowercase first letter
+            result = stripped[0].lower() + stripped[1:] if stripped else stripped
+
+        # Next segment will be lowercase (mid-sentence) until user presses break key
+        self._mss_next_capital = False
+        return result
+
+    def _mss_sentence_break(self):
+        """Called when the user presses the sentence-break key.
+
+        Appends '. ' to the current editor content (if the last char isn't already
+        punctuation) and sets _mss_next_capital so the next segment starts uppercase.
+        """
+        import re as _re_msb
+        self._mss_next_capital = True
+        cur = self.editor.textCursor()
+        cur.clearSelection()
+        doc_text = self.editor.toPlainText()
+        pos = cur.position()
+        # Only append period if the text before cursor doesn't already end in punctuation
+        if pos > 0:
+            last_non_space = doc_text[:pos].rstrip()
+            if last_non_space and last_non_space[-1] not in '.!?…':
+                cur.insertText('. ')
+        self.editor.setTextCursor(cur)
+        self.editor.ensureCursorVisible()
+
 
     def append_text(self, text: str):
         """Insert dictated text at the current cursor position.
@@ -5302,7 +5369,13 @@ class WhisperEditor(QWidget):
         - If text is selected, the selection is replaced.
         - If cursor is at end of non-empty, non-newline text, a space is prepended.
         - Otherwise text is inserted exactly at the cursor.
+        - If Manual Sentence Splitting is enabled, text is transformed first.
         """
+        cfg = getattr(self, "config", None)
+        if cfg and cfg.settings.get("manual_sentence_split", False):
+            text = self._mss_apply(text)
+            if not text:
+                return
         cur = self.editor.textCursor()
         if cur.hasSelection():
             cur.insertText(text)
@@ -5310,6 +5383,7 @@ class WhisperEditor(QWidget):
             # Peek at the character immediately before the cursor
             pos = cur.position()
             doc_text = self.editor.toPlainText()
+            # In MSS mode always add space; otherwise only if not already spaced
             if pos > 0 and doc_text[pos - 1] not in (" ", "\n", "\t"):
                 text = " " + text
             cur.insertText(text)
@@ -6937,7 +7011,8 @@ class WhisperRApp(QMainWindow):
             self._pre_clip_capture = None  # set by hotkey handler before Qt signal
             self._editor: WhisperEditor | None = None
             # Persisted editor state — defaults overwritten by JSON load below
-            self._editor_remember: bool = False
+            self._editor_remember: bool = True
+            self._last_hk_time: float = 0.0
             self._editor_saved_content: str = ""
             self._editor_clipboard_prefill: bool = False
             self._editor_saved_target: int = 0
@@ -7732,6 +7807,28 @@ class WhisperRApp(QMainWindow):
         )
         dict_layout.addRow(self.cfg_space)
 
+        # Manual Sentence Splitting
+        self.cfg_mss = QCheckBox("Manual Sentence Splitting")
+        self.cfg_mss.setChecked(
+            self.config.settings.get("manual_sentence_split", False))
+        self.cfg_mss.setToolTip(
+            "When enabled, Whisper's trailing punctuation is stripped from each\n"
+            "segment and the next segment begins lowercase (continuing the\n"
+            "sentence). Press the Sentence Break key to end a sentence:\n"
+            "a full stop is appended and the next segment starts with a capital.\n\n"
+            "Useful for long dictation where you want explicit control over\n"
+            "sentence boundaries rather than relying on Whisper's auto-punctuation.")
+        dict_layout.addRow(self.cfg_mss)
+        from PyQt6.QtWidgets import QLineEdit as _QLE_mss
+        self.cfg_mss_key = _QLE_mss()
+        self.cfg_mss_key.setText(
+            self.config.settings.get("mss_break_key", "shift"))
+        self.cfg_mss_key.setToolTip(
+            "Key to press to end the current sentence and start a new one.\n"
+            "Default: shift  (Left Shift key)\n"
+            "Enter the pynput key name, e.g.: shift, ctrl, alt, f1, space")
+        self.cfg_mss_key.setMaximumWidth(120)
+        dict_layout.addRow("Sentence Break key:", self.cfg_mss_key)
         dict_group.setLayout(dict_layout)
         main_layout.addWidget(dict_group)
 
@@ -7804,6 +7901,19 @@ class WhisperRApp(QMainWindow):
         hotkey_layout.addRow("Push-to-Talk:", _hk_row(self.btn_hk2,
             lambda: self.btn_hk2.setText("")))
 
+        from PyQt6.QtWidgets import QSpinBox as _SB2cd
+        _cd_spin = _SB2cd()
+        _cd_spin.setRange(0, 2000)
+        _cd_spin.setSuffix(" ms")
+        _cd_spin.setValue(
+            int(self.config.settings.get("hotkey_cooldown_ms", 400)))
+        _cd_spin.setToolTip(
+            "After any hotkey fires, other hotkeys are ignored for this many\n"
+            "milliseconds. This prevents Ctrl+Shift+Alt+Z from also triggering\n"
+            "Ctrl+Alt+Z when you release Shift a fraction of a second later.\n"
+            "Set to 0 to disable. Default: 400 ms.")
+        self.cfg_hk_cooldown = _cd_spin
+        hotkey_layout.addRow("Hotkey detection delay:", self.cfg_hk_cooldown)
         hotkey_group.setLayout(hotkey_layout)
         main_layout.addWidget(hotkey_group)
 
@@ -8952,6 +9062,8 @@ class WhisperRApp(QMainWindow):
             "input_device_name": self.cfg_mic.currentText().strip(),
             "input_device_index": self.cfg_mic.currentData() if self.cfg_mic.currentData() != -1 else None,
             "dict_mode": self.cfg_dict_m.currentText(),
+            "manual_sentence_split": self.cfg_mss.isChecked(),
+            "mss_break_key": self.cfg_mss_key.text().strip() or "shift",
             "auto_pause_sec": self.cfg_p_sec.value(),
             "paste_delay": self.cfg_p_win.value(),
             "hotkey": self.btn_hk1.text(),
@@ -9015,6 +9127,7 @@ class WhisperRApp(QMainWindow):
             "ft_mon_folder": self.ft_mon_folder.text(),
             "ft_mon_enabled": self.ft_mon_enabled.isChecked(),
             "use_vad": self.cfg_use_vad.isChecked(),
+            "hotkey_cooldown_ms": self.cfg_hk_cooldown.value(),
             "vad_threshold": round(self.cfg_vad_threshold.value(), 2),
             "vad_min_silence_ms": self.cfg_vad_min_silence.value(),
             "vad_min_speech_ms": self.cfg_vad_min_speech.value(),
@@ -9797,7 +9910,7 @@ class WhisperRApp(QMainWindow):
                      self._editor.clipboard_monitor_toggle):
             _tog.blockSignals(True)
         self._editor.remember_toggle.setChecked(
-            bool(getattr(self, "_editor_remember", False)))
+            bool(getattr(self, "_editor_remember", True)))
         self._editor.clipboard_prefill_toggle.setChecked(
             bool(getattr(self, "_editor_clipboard_prefill", False)))
         self._editor.clipboard_monitor_toggle.setChecked(
@@ -11092,6 +11205,17 @@ class WhisperRApp(QMainWindow):
                 hotkey_map[editor_edit_hotkey] = self.on_editor_edit_hotkey
             if rollback_hotkey:
                 hotkey_map[rollback_hotkey] = self.rollback_transcription
+            # MSS break key — only registered when MSS is enabled
+            if self.config.settings.get("manual_sentence_split", False):
+                _mss_raw = self.config.settings.get("mss_break_key", "shift")
+                try:
+                    _mss_norm = self.normalize_hotkey(_mss_raw)
+                    if _mss_norm and _mss_norm not in hotkey_map:
+                        hotkey_map[_mss_norm] = self.on_mss_break
+                        app_logger.info(
+                            f"MSS break key registered: {_mss_norm!r}")
+                except Exception as _me:
+                    app_logger.warning(f"MSS break key error: {_me}")
             app_logger.debug(f"  setup_logic: hotkey_map = {list(hotkey_map.keys())}")
             
             app_logger.debug("  setup_logic: Creating GlobalHotKeys listener...")
@@ -11536,10 +11660,58 @@ class WhisperRApp(QMainWindow):
         except Exception: pass
         QApplication.instance().quit()
 
+    def on_mss_break(self):
+        """Called when the MSS sentence-break key is pressed.
+        Forwards to the editor if open; blocked by cooldown like other hotkeys.
+        """
+        ed = getattr(self, "_editor", None)
+        if ed and ed.isVisible():
+            self.sig_toggle_rec.emit()   # stop current recording first
+        # Schedule the actual break slightly after so current segment lands first
+        from PyQt6.QtCore import QTimer as _QTmss
+        def _do_break():
+            _ed = getattr(self, "_editor", None)
+            if _ed:
+                _ed._mss_sentence_break()
+        _QTmss.singleShot(200, _do_break)
+
+    def _hk_allowed(self) -> bool:
+        """Return True if enough time has passed since the last hotkey fired."""
+        import time as _t
+        cooldown = self.config.settings.get("hotkey_cooldown_ms", 400) / 1000.0
+        now = _t.monotonic()
+        if now - self._last_hk_time < cooldown:
+            app_logger.debug(
+                f"Hotkey suppressed (cooldown {cooldown*1000:.0f}ms active)")
+            return False
+        self._last_hk_time = now
+        return True
+
     def on_toggle_hotkey(self):
         """Handler for toggle dictation hotkey - prevents subset conflicts.
         Captures foreground hwnd HERE (keyboard-thread) before Qt shifts focus.
+        Ignores the press when Shift is held (user is pressing the visibility
+        superset combo Ctrl+Shift+Alt+Z and we must not steal the event).
         """
+        # If the visibility hotkey is a superset (adds Shift to our combo),
+        # skip when Shift is physically held — user pressed the visibility combo.
+        # Use GetAsyncKeyState for reliable real-time key state on Windows.
+        try:
+            _vis_needs_shift = "shift" in getattr(
+                self, "visibility_hotkey_normalized", "").lower()
+            if _vis_needs_shift:
+                import ctypes as _ctks
+                VK_SHIFT = 0x10
+                # High bit set = key is currently physically down
+                _shift_down = bool(
+                    _ctks.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
+                if _shift_down:
+                    app_logger.debug(
+                        "Toggle hotkey skipped — Shift held (visibility combo)")
+                    return
+        except Exception:
+            pass
+        if not self._hk_allowed(): return
         app_logger.debug("Toggle dictation hotkey triggered (exact match)")
         try:
             import ctypes as _ct_hk
@@ -11552,12 +11724,17 @@ class WhisperRApp(QMainWindow):
         self.sig_toggle_rec.emit()
     
     def on_visibility_hotkey(self):
-        """Handler for visibility hotkey - prevents subset conflicts"""
+        """Handler for visibility hotkey.
+        Does NOT use the shared cooldown — the toggle hotkey's cooldown must
+        not suppress this. The Shift-state check in on_toggle_hotkey prevents
+        the reverse problem (toggle firing during visibility combo).
+        """
         app_logger.debug("Visibility hotkey triggered (exact match)")
         self.sig_toggle_vis.emit()
 
     def on_editor_hotkey(self):
         """Handler for editor toggle hotkey — runs on hotkey thread, emit to Qt."""
+        if not self._hk_allowed(): return
         app_logger.debug("Editor hotkey triggered")
         self.sig_toggle_editor.emit()
 
@@ -11570,6 +11747,7 @@ class WhisperRApp(QMainWindow):
         That method does the full refocus → Ctrl+C → poll sequence itself,
         exactly as it does for the voice command.  No separate Ctrl+C here.
         """
+        if not self._hk_allowed(): return
         app_logger.debug("Editor-edit hotkey triggered")
         try:
             import ctypes as _ct_eeh
@@ -12115,6 +12293,16 @@ After placing DLL files, check the logs when transcribing:
             except Exception as e:
                 app_logger.error(f"Failed to clear recordings: {e}")
         
+        # Flush hotwords and prompt from Settings UI to config on close
+        try:
+            hw_edit = getattr(self, "hotwords_edit", None)
+            if hw_edit:
+                self.config.settings["hotwords"] = [
+                    w.strip() for w in hw_edit.toPlainText().splitlines()
+                    if w.strip()]
+                self.config.save()
+        except Exception:
+            pass
         # Stop workers
         if self.recorder:
             self.recorder.active = False
