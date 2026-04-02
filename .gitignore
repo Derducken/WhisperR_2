@@ -12,6 +12,9 @@ Prompts/
 # Old files directory
 OLD_FILES/
 
+# Cline rules
+.clinerules/
+
 # Build output directories
 build/
 dist/
