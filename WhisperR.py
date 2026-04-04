@@ -2027,12 +2027,17 @@ class AudioRecorder(QThread):
         _ptt_was_pressed = False  # track transition for flush-on-release
 
         while self.active:
-            if self.config.settings["live_mode"] == "Push-To-Talk":
-                # Detect release edge: was held, now released → flush immediately
+            # PTT gate — only active when PTT has been pressed this session
+            # (_ptt_was_pressed tracks whether PTT was ever engaged).
+            # During normal toggle-mode dictation, ptt_pressed stays False
+            # and _ptt_was_pressed stays False, so this block is skipped.
+            if self.ptt_pressed or _ptt_was_pressed:
+                # Detect release edge: was held, now released → dispatch immediately
                 if _ptt_was_pressed and not self.ptt_pressed:
                     _ptt_was_pressed = False
                     if len(frames) > 5:
-                        app_logger.debug(f"PTT released — dispatching {len(frames)} frames")
+                        app_logger.debug(
+                            f"PTT released — dispatching {len(frames)} frames")
                         self.speech_active.emit(False)
                         self.dispatch(frames, FIXED_RATE, FIXED_CHANNELS)
                         frames = []
@@ -2040,8 +2045,7 @@ class AudioRecorder(QThread):
                 elif self.ptt_pressed:
                     _ptt_was_pressed = True
                 if not self.ptt_pressed:
-                    # PTT not held — if we were recording, fall through to dispatch
-                    # (handled by the release-edge block above). Otherwise idle-sleep.
+                    # PTT not held — idle-sleep until pressed again
                     if not _ptt_was_pressed:
                         time.sleep(0.05)
                     continue
@@ -2945,7 +2949,7 @@ class HarperLSPClient:
          "suggestions": [str, ...]}
     """
 
-    DEBOUNCE_MS = 400
+    DEBOUNCE_MS = 300
 
     def __init__(self, on_diagnostics=None, binary_path=None):
         self._on_diagnostics = on_diagnostics
@@ -3083,6 +3087,9 @@ class HarperLSPClient:
                 app_logger.debug(f"HarperLSPClient._send error: {_se}")
 
     def _send_initialize(self):
+        _app_dir = (os.path.dirname(sys.executable)
+                    if getattr(sys, "frozen", False)
+                    else os.path.dirname(os.path.abspath(__file__)))
         _app_dir = (os.path.dirname(sys.executable)
                     if getattr(sys, "frozen", False)
                     else os.path.dirname(os.path.abspath(__file__)))
@@ -3297,10 +3304,16 @@ class HarperLSPClient:
                     "Matcher":                 True,
                 }
             }
-            # Always return the inner settings dict (no "harper-ls" wrapper).
-            # harper-ls sends workspace/configuration with no section field;
-            # it expects the raw settings object back, not wrapped.
-            _results = [_inner_cfg for _ in _items] if _items else [_inner_cfg]
+            # harper-ls ALWAYS expects {"harper-ls": {settings}} wrapper
+            # regardless of which section is requested. This is confirmed
+            # by its stderr: "Settings must contain a 'harper-ls' key"
+            # when we send the unwrapped inner dict.
+            _wrapped = {"harper-ls": _inner_cfg}
+            _results = [_wrapped for _ in _items] if _items else [_wrapped]
+            import json as _json_wscfg
+            app_logger.debug(
+                f"LSP workspace/configuration payload: "
+                f"{_json_wscfg.dumps(_results[0] if _results else {}, ensure_ascii=False)[:200]}")
             self._send({"jsonrpc": "2.0", "id": _req_id, "result": _results})
             _sections_sent = [list(_r.keys()) if isinstance(_r, dict) else _r
                               for _r in _results]
@@ -5322,43 +5335,45 @@ class WhisperEditor(QWidget):
     def _mss_apply(self, text: str) -> str:
         """Apply Manual Sentence Splitting rules to incoming text.
 
-        Returns the transformed text to insert.
+        Strips only sentence-ENDING punctuation (.!?…) from the tail.
+        Mid-sentence marks (commas, parentheses, colons, semicolons) are kept.
+        Capitalises the first letter if _mss_next_capital is True (start of
+        a new sentence), otherwise forces it lowercase (mid-sentence continuation).
+        After applying, _mss_next_capital is reset to False.
         """
         import re as _re_mss
-        # Strip trailing sentence-ending punctuation from Whisper output
-        # (period, comma, ellipsis, exclamation, question mark, colon, semicolon)
-        stripped = _re_mss.sub(r'[\.,;:!?\u2026]+$', '', text.rstrip()).rstrip()
+        # Strip ONLY sentence-ending punctuation from the tail.
+        # Commas, colons, semicolons, parentheses are intentionally kept.
+        stripped = _re_mss.sub(r'[.!?\u2026]+$', '', text.rstrip()).rstrip()
         if not stripped:
             return ''
 
         if getattr(self, '_mss_next_capital', True):
-            # Start of a new sentence — capitalise first letter
-            result = stripped[0].upper() + stripped[1:] if stripped else stripped
+            result = stripped[0].upper() + stripped[1:]
         else:
-            # Mid-sentence continuation — force lowercase first letter
-            result = stripped[0].lower() + stripped[1:] if stripped else stripped
+            result = stripped[0].lower() + stripped[1:]
 
-        # Next segment will be lowercase (mid-sentence) until user presses break key
         self._mss_next_capital = False
         return result
 
-    def _mss_sentence_break(self):
-        """Called when the user presses the sentence-break key.
 
-        Appends '. ' to the current editor content (if the last char isn't already
-        punctuation) and sets _mss_next_capital so the next segment starts uppercase.
+    def _mss_sentence_break(self):
+        """Insert a period at the end of the current text and prepare
+        for the next sentence to start with a capital letter.
+        Called when the user presses the sentence-break key during dictation.
         """
-        import re as _re_msb
         self._mss_next_capital = True
+        # Move cursor to document end so period is always appended at the end
         cur = self.editor.textCursor()
-        cur.clearSelection()
+        cur.movePosition(cur.MoveOperation.End)
         doc_text = self.editor.toPlainText()
-        pos = cur.position()
-        # Only append period if the text before cursor doesn't already end in punctuation
-        if pos > 0:
-            last_non_space = doc_text[:pos].rstrip()
-            if last_non_space and last_non_space[-1] not in '.!?…':
-                cur.insertText('. ')
+        last_non_space = doc_text.rstrip()
+        if last_non_space and last_non_space[-1] not in '.!?…':
+            # Strip any trailing spaces first, then add ". "
+            while doc_text.endswith(" "):
+                cur.deletePreviousChar()
+                doc_text = doc_text[:-1]
+            cur.insertText(". ")
         self.editor.setTextCursor(cur)
         self.editor.ensureCursorVisible()
 
@@ -5794,6 +5809,8 @@ class WhisperEditor(QWidget):
                              else os.path.dirname(os.path.abspath(__file__)))
                 _uri_base = ("file:///" +
                     _app_dir2.replace("\\", "/").lstrip("/"))
+                _uri_base = ("file:///" +
+                    _app_dir.replace("\\", "/").lstrip("/"))
                 uri = _uri_base + "/whisperr-document.md"
                 _doc_text = self.editor.toPlainText()
                 self._harper_client.open_document(uri, _doc_text)
@@ -5802,14 +5819,19 @@ class WhisperEditor(QWidget):
                 # Keepalive timer — created on main thread, fires every 20s
                 from PyQt6.QtCore import QTimer as _QTka
                 self._harper_keepalive = _QTka(self)
-                self._harper_keepalive.setInterval(20000)
+                self._harper_keepalive.setInterval(5000)
                 self._harper_keepalive.timeout.connect(
                     lambda: (
                         self._harper_client._send_keepalive()
                         if self._harper_client and self._harper_client.running()
                         else None))
                 self._harper_keepalive.start()
-                app_logger.info("_start_harper: keepalive timer started (20s)")
+                app_logger.info("_start_harper: keepalive timer started (5s)")
+                # Trigger an initial lint after a short delay so harper-ls
+                # gets content immediately after initialization
+                from PyQt6.QtCore import QTimer as _QTinit
+                _ed_ref = self  # capture for lambda
+                _QTinit.singleShot(1000, _ed_ref._run_lint)
                 self._update_harper_indicator(True)
                 app_logger.info("_start_harper: Harper LSP active")
             else:
@@ -9507,10 +9529,28 @@ class WhisperRApp(QMainWindow):
                 if self.recorder and self.recorder.ptt_pressed:
                     self.recorder.ptt_pressed = False
                     app_logger.debug("PTT deactivated (poll)")
-                    # Stop the recorder: PTT is hold-to-talk, not a toggle.
-                    # Stopping via toggle_rec must happen on the Qt main thread.
+                    # Stop the recorder immediately on PTT release regardless
+                    # of live_mode — PTT is always hold-to-talk.
                     if self.recorder and self.recorder.active:
                         self.sig_toggle_rec.emit()
+
+            # ── MSS break-key polling ─────────────────────────────────
+            # Poll via GetAsyncKeyState — only fires during active recording.
+            # Avoids GlobalHotKeys <shift> which fires on every Ctrl+Shift+...
+            if (self.config.settings.get("manual_sentence_split", False)
+                    and self.recorder and self.recorder.active):
+                _mss_vk = self._VK_MAP.get(
+                    self.config.settings.get("mss_break_key", "shift")
+                    .lower().strip(), 0)
+                if _mss_vk:
+                    import ctypes as _ct_mss
+                    _mss_down = bool(
+                        _ct_mss.windll.user32.GetAsyncKeyState(_mss_vk) & 0x8000)
+                    if _mss_down and not getattr(self, "_mss_key_was_down", False):
+                        # Rising edge — fire once per press, not while held
+                        app_logger.debug("MSS break key detected (poll)")
+                        self.on_mss_break()
+                    self._mss_key_was_down = _mss_down
         except Exception as e:
             app_logger.error(f"PTT poll error: {e}", exc_info=True)
 
@@ -11662,18 +11702,19 @@ class WhisperRApp(QMainWindow):
 
     def on_mss_break(self):
         """Called when the MSS sentence-break key is pressed.
-        Forwards to the editor if open; blocked by cooldown like other hotkeys.
+        Only acts when dictation is currently active — avoids firing
+        during normal typing or when the editor is idle.
         """
-        ed = getattr(self, "_editor", None)
-        if ed and ed.isVisible():
-            self.sig_toggle_rec.emit()   # stop current recording first
-        # Schedule the actual break slightly after so current segment lands first
+        # Only act while the recorder is actively recording
+        rec = getattr(self, "recorder", None)
+        if not rec or not rec.active:
+            return
         from PyQt6.QtCore import QTimer as _QTmss
         def _do_break():
             _ed = getattr(self, "_editor", None)
-            if _ed:
+            if _ed and _ed.isVisible():
                 _ed._mss_sentence_break()
-        _QTmss.singleShot(200, _do_break)
+        _QTmss.singleShot(0, _do_break)
 
     def _hk_allowed(self) -> bool:
         """Return True if enough time has passed since the last hotkey fired."""
