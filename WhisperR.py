@@ -1170,6 +1170,7 @@ HALLUCINATIONS = [
 DARK_STYLE = """
 QMainWindow, QDialog, QScrollArea, QTabWidget, QTabBar, QStackedWidget { background-color: #121212; }
 QWidget { background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI'; font-size: 9pt; }
+QWidget > QMenu, QMenu { background-color: #1e1e1e; color: #ddd; }
 QFrame { background-color: #121212; }
 QScrollArea > QWidget > QWidget { background-color: #121212; }
 QTabBar::tab { background-color: #1e1e1e; color: #ccc; padding: 6px 14px; border: 1px solid #333; border-bottom: none; border-radius: 3px 3px 0 0; }
@@ -1188,6 +1189,13 @@ QComboBox, QLineEdit { background-color: #2a2a2a; border: 1px solid #444; paddin
 QSpinBox, QDoubleSpinBox { background-color: #2a2a2a; border: 1px solid #444; padding: 4px 6px 4px 6px; min-height: 22px; }
 QSpinBox::up-button, QDoubleSpinBox::up-button { width: 0; border: none; }
 QSpinBox::down-button, QDoubleSpinBox::down-button { width: 0; border: none; }
+QMenu { background-color: #1e1e1e; color: #ddd; border: 1px solid #444; }
+QMenu::item { padding: 4px 20px; }
+QMenu::item:selected { background-color: #1a3a5c; }
+QMenu::item:hover { background-color: #1a3a5c; }
+QMenu::item:pressed { background-color: #0d2a4a; }
+QMenu::separator { height: 1px; background: #333; margin: 2px 0; }
+QMenu::item:disabled { color: #666; }
 """
 
 # --- 4. LOGGING SETUP ---
@@ -1258,6 +1266,21 @@ class AppLogger:
         if not self._disabled: self.logger.error(msg, exc_info=exc_info)
 
 app_logger = AppLogger()
+
+# Harper-specific debug logger — always writes regardless of app log_level.
+_harper_log = logging.getLogger("harper_debug")
+_harper_log.setLevel(logging.DEBUG)
+_harper_path = os.path.join(BASE_DIR, "harper_debug.txt")
+try:
+    _hf = logging.FileHandler(_harper_path, mode='w', encoding='utf-8')
+    _hf.setLevel(logging.DEBUG)
+    _hf.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+    _harper_log.addHandler(_hf)
+except Exception:
+    pass
+
+def harper_log(msg):
+    _harper_log.info(msg)
 
 # --- 5. CONFIGURATION ---
 class AppConfig:
@@ -2932,6 +2955,11 @@ def _harper_download(progress_cb=None, done_cb=None):
     threading.Thread(target=_worker, daemon=True).start()
 
 
+class _DiagBridge(QObject):
+    """Signal bridge to deliver LSP diagnostics from reader thread to main thread."""
+    ready = pyqtSignal(list)
+
+
 class HarperLSPClient:
     """Manages one harper-ls subprocess and speaks LSP JSON-RPC over stdio.
 
@@ -2962,13 +2990,32 @@ class HarperLSPClient:
         self._version  = 0
         self._debounce  = None   # threading.Timer
         self._stopping  = False  # set True on explicit stop() to suppress restart
+        self._init_event = threading.Event()  # set when harper-ls init succeeds
+        self._last_text = ""   # cached doc text for keepalive / auto-restart
+        # Qt signal bridge — emits from reader thread, fires callback on main thread
+        try:
+            self._bridge = _DiagBridge()
+            self._bridge.ready.connect(
+                self._on_diagnostics, type=Qt.ConnectionType.QueuedConnection)
+            harper_log("BRIDGE: created")
+        except Exception as _be:
+            harper_log(f"BRIDGE: creation failed: {_be}")
+            self._bridge = None
+        # Response tracking for sync LSP requests (codeAction, etc.)
+        self._pending_responses = {}  # id -> threading.Event
+        self._response_data = {}       # id -> result dict
 
     def _auto_restart(self):
         """Called on main thread when harper-ls exits unexpectedly. Restart it."""
         if self._stopping:
             return
         app_logger.info("HarperLSPClient: auto-restarting harper-ls")
+        # Kill old process if somehow still alive
+        if self._proc and self._proc.poll() is None:
+            try: self._proc.terminate()
+            except Exception: pass
         self._proc = None
+        self._diag_params_logged = False  # reset so new session logs first diag
         if self.start():
             uri  = self._uri
             text = getattr(self, "_last_text", "")
@@ -2986,13 +3033,17 @@ class HarperLSPClient:
 
     def start(self):
         if not self.available():
+            harper_log(f"START: binary not found at {self._binary!r}")
             app_logger.warning(
                 f"HarperLSPClient.start: binary not found at {self._binary!r}")
             return False
         if self.running():
+            harper_log("START: already running")
             app_logger.debug("HarperLSPClient.start: already running")
             return True
         try:
+            self._init_event.clear()
+            harper_log(f"START: launching {self._binary}")
             app_logger.info(f"HarperLSPClient.start: launching {self._binary}")
             # CREATE_NO_WINDOW prevents a console flash on Windows
             _cflags = 0
@@ -3005,6 +3056,7 @@ class HarperLSPClient:
                 stderr=subprocess.PIPE,
                 bufsize=0,
                 creationflags=_cflags)
+            harper_log(f"START: pid={self._proc.pid}")
             self._reader = threading.Thread(
                 target=self._read_loop, daemon=True)
             self._reader.start()
@@ -3013,15 +3065,33 @@ class HarperLSPClient:
                 target=self._read_stderr_loop, daemon=True)
             self._stderr_reader.start()
             self._send_initialize()
-            app_logger.info("HarperLSPClient.start: process started, initialize sent")
-            return True
+            # Wait for harper-ls to respond to initialize (max 10s)
+            if not self._init_event.wait(timeout=10.0):
+                harper_log("START: initialization timed out")
+                app_logger.warning(
+                    "HarperLSPClient.start: initialization timed out")
+            else:
+                harper_log("START: initialization confirmed")
+                app_logger.info(
+                    "HarperLSPClient.start: initialization confirmed")
+            return self.running()
         except Exception as _e:
+            harper_log(f"START: failed: {_e}")
             app_logger.error(f"HarperLSPClient.start failed: {_e}", exc_info=True)
             self._proc = None
             return False
 
     def stop(self):
         self._stopping = True
+        # Clean up the on-disk document file
+        try:
+            _uri = getattr(self, "_uri", None)
+            if _uri and _uri.startswith("file:///"):
+                _p = _uri[len("file:///"):].replace("/", os.sep)
+                if os.path.exists(_p):
+                    os.remove(_p)
+        except Exception:
+            pass
         if self._debounce:
             self._debounce.cancel()
         if self._proc:
@@ -3035,7 +3105,12 @@ class HarperLSPClient:
     def open_document(self, uri, text):
         self._uri     = uri
         self._version = 1
+        harper_log(f"OPEN: uri={uri!r} text_len={len(text)}")
         app_logger.info(f"HarperLSPClient.open_document: uri={uri!r} text_len={len(text)}")
+        # Write document to disk so harper-ls can resolve its path.
+        # harper-ls checks if the file URI exists for file-local dictionaries.
+        # This is a one-time write; subsequent changes go through didChange.
+        self._write_doc_to_disk(uri, text)
         self._send({
             "jsonrpc": "2.0",
             "method":  "textDocument/didOpen",
@@ -3048,9 +3123,6 @@ class HarperLSPClient:
                 }
             }
         })
-        # Note: do NOT send immediate didChange here — it confuses harper-ls
-        # which hasn't finished processing didOpen yet. The keepalive timer
-        # and user typing will trigger didChange naturally.
 
     def change_document(self, uri, text):
         """Debounced — waits DEBOUNCE_MS ms after last call before sending."""
@@ -3061,6 +3133,49 @@ class HarperLSPClient:
             self._send_change, args=(uri, text))
         self._debounce.daemon = True
         self._debounce.start()
+
+    def request_code_actions(self, uri, line, char_start, char_end, timeout=3.0):
+        """Send textDocument/codeAction request and return list of suggestions.
+
+        Runs synchronously — blocks until harper-ls responds or timeout.
+        Returns list of {"title": str, "edit": dict} for each code action.
+        """
+        if not self.running():
+            harper_log("CODE_ACTION: not running")
+            return []
+        req_id = self._next_id()
+        evt = threading.Event()
+        with self._lock:
+            self._pending_responses[req_id] = evt
+        harper_log(f"CODE_ACTION: sending request id={req_id} range={line}:{char_start}-{char_end}")
+        self._send({
+            "jsonrpc": "2.0",
+            "id":      req_id,
+            "method":  "textDocument/codeAction",
+            "params": {
+                "textDocument": {"uri": uri},
+                "range": {
+                    "start": {"line": line, "character": char_start},
+                    "end":   {"line": line, "character": char_end},
+                },
+                "context": {"diagnostics": []},
+            }
+        })
+        if evt.wait(timeout=timeout):
+            with self._lock:
+                result = self._response_data.pop(req_id, None)
+                self._pending_responses.pop(req_id, None)
+            if isinstance(result, list):
+                harper_log(f"CODE_ACTION: got {len(result)} action(s)")
+                return result
+            else:
+                harper_log(f"CODE_ACTION: unexpected result type: {type(result)}")
+                return []
+        else:
+            harper_log(f"CODE_ACTION: timeout after {timeout}s")
+            with self._lock:
+                self._pending_responses.pop(req_id, None)
+            return []
 
     # ── internal ─────────────────────────────────────────────────────────────
 
@@ -3087,17 +3202,19 @@ class HarperLSPClient:
                 app_logger.debug(f"HarperLSPClient._send error: {_se}")
 
     def _send_initialize(self):
-        _app_dir = (os.path.dirname(sys.executable)
-                    if getattr(sys, "frozen", False)
-                    else os.path.dirname(os.path.abspath(__file__)))
+        # rootUri MUST point to a directory that exists on disk.
+        # harper-ls calls canonicalize() on it; if it fails (e.g. file:///
+        # resolves to \ on Windows which doesn't exist), from_lsp_config
+        # returns an Err and ALL linter config is silently discarded.
         _app_dir = (os.path.dirname(sys.executable)
                     if getattr(sys, "frozen", False)
                     else os.path.dirname(os.path.abspath(__file__)))
         _root_uri = "file:///" + _app_dir.replace("\\", "/").lstrip("/")
+        harper_log(f"INIT: rootUri={_root_uri!r}")
         app_logger.info(f"HarperLSPClient: rootUri={_root_uri!r}")
         _settings = {
             "harper-ls": {
-                "diagnosticSeverity": "warning",
+                "diagnosticSeverity": "hint",
                 "linters": {
                     "SpellCheck": True,
                     "AnA": True,
@@ -3111,9 +3228,11 @@ class HarperLSPClient:
                 }
             }
         }
+        init_id = self._next_id()
+        harper_log(f"INIT: sending initialize id={init_id}")
         self._send({
             "jsonrpc": "2.0",
-            "id":      self._next_id(),
+            "id":      init_id,
             "method":  "initialize",
             "params": {
                 "processId":        os.getpid(),
@@ -3131,13 +3250,16 @@ class HarperLSPClient:
                     "workspace": {
                         "workspaceFolders":      True,
                         "didChangeConfiguration": {"dynamicRegistration": False},
+                        "configuration":          True,
                     }
                 },
                 "clientInfo": {"name": "WhisperR", "version": "2.1.0"}
             }
         })
+        harper_log("INIT: sending initialized notification")
         # initialized notification — required by LSP spec
         self._send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        harper_log("INIT: sending workspace/didChangeConfiguration")
         # Also push settings via workspace/didChangeConfiguration
         # (some harper-ls versions only read one or the other)
         self._send({
@@ -3156,12 +3278,25 @@ class HarperLSPClient:
             app_logger.debug("HarperLSPClient: keepalive ping")
             self._send_change(uri, text)
 
+    def _write_doc_to_disk(self, uri, text):
+        """Write the LSP document to disk so harper-ls can resolve it."""
+        try:
+            # Convert file:///E:/path/to/file.md → E:\path\to\file.md
+            _path = uri[len("file:///"):].replace("/", os.sep)
+            with open(_path, "w", encoding="utf-8") as _f:
+                _f.write(text)
+            app_logger.debug(f"HarperLSPClient: wrote doc to {_path!r}")
+        except Exception as _we:
+            app_logger.debug(f"HarperLSPClient: doc write skipped: {_we}")
+
     def _send_change(self, uri, text):
         self._last_text = text   # cache for auto-restart
         self._version += 1
+        harper_log(f"CHANGE: version={self._version} text_len={len(text)}")
         app_logger.debug(
             f"LSP _send_change: version={self._version} "
             f"text_len={len(text)} preview={text[:40]!r}")
+        self._write_doc_to_disk(uri, text)
         self._send({
             "jsonrpc": "2.0",
             "method":  "textDocument/didChange",
@@ -3182,10 +3317,12 @@ class HarperLSPClient:
                 chunk = self._proc.stdout.read(4096)
                 if not chunk:
                     _exit_code = self._proc.poll()
+                    harper_log(f"STDOUT CLOSED: harper-ls exit code={_exit_code}")
                     app_logger.info(
                         f"HarperLSPClient: stdout closed "
                         f"(harper-ls exited, code={_exit_code})")
                     if _exit_code not in (0, None):
+                        harper_log(f"ERROR: harper-ls exit code {_exit_code}")
                         app_logger.error(
                             f"harper-ls exit code: {_exit_code} "
                             f"(non-zero = crash or error)")
@@ -3221,8 +3358,10 @@ class HarperLSPClient:
                     buf  = buf[body_start + length:]
                     try:
                         msg = json.loads(body.decode("utf-8"))
+                        harper_log(f"RECV: {len(body)}b parsed")
                         self._handle_message(msg)
                     except Exception as _he:
+                        harper_log(f"PARSE ERROR: {_he}")
                         app_logger.warning(
                             f"HarperLSPClient._handle_message error: {_he}")
             except Exception as _rle:
@@ -3245,17 +3384,30 @@ class HarperLSPClient:
         _msg_id  = msg.get("id", "")
         _is_req  = "id" in msg and "method" in msg   # server→client request
         _is_resp = "id" in msg and "result" in msg    # our request's response
+        if method:
+            harper_log(f"MSG ← {method!r} id={_msg_id!r} req={_is_req} resp={_is_resp}")
         app_logger.debug(
             f"LSP ← harper-ls: {method!r} id={_msg_id!r} "
             f"req={_is_req} resp={_is_resp}")
         if method == "textDocument/publishDiagnostics":
-            diags_raw = msg.get("params", {}).get("diagnostics", [])
-            _doc_uri  = msg.get("params", {}).get("uri", "?")
+            _params   = msg.get("params", {})
+            diags_raw = _params.get("diagnostics", [])
+            _doc_uri  = _params.get("uri", "?")
+            harper_log(f"DIAG: {len(diags_raw)} diagnostic(s) for uri={_doc_uri!r}")
+            # Log full raw message on first call
+            if not getattr(self, "_diag_params_logged", False):
+                import json as _jd
+                harper_log(f"DIAG RAW: {_jd.dumps(msg, ensure_ascii=False)[:600]}")
+                app_logger.info(
+                    f"Harper LSP: RAW publishDiagnostics: "
+                    f"{_jd.dumps(msg, ensure_ascii=False)[:800]}")
+                self._diag_params_logged = True
             app_logger.debug(
                 f"Harper LSP: received {len(diags_raw)} diagnostic(s) "
                 f"for uri={_doc_uri!r}")
             if diags_raw:
                 for _d in diags_raw[:3]:
+                    harper_log(f"DIAG item: {_d}")
                     app_logger.debug(f"  diag: {_d}")
             diags = []
             for d in diags_raw:
@@ -3278,20 +3430,24 @@ class HarperLSPClient:
                     "suggestions": suggs,
                 })
             if self._on_diagnostics:
-                # Schedule callback on main Qt thread
-                from PyQt6.QtCore import QTimer
-                QTimer.singleShot(0, lambda d=diags: self._on_diagnostics(d))
+                harper_log(f"DIAG: emitting {len(diags)} diag(s) via bridge")
+                if self._bridge:
+                    self._bridge.ready.emit(diags)
+                else:
+                    harper_log("DIAG: bridge is None, calling callback directly")
+                    self._on_diagnostics(diags)
 
         elif method == "workspace/configuration":
             # harper-ls REQUIRES a response to workspace/configuration —
             # without it, it blocks indefinitely and never sends diagnostics.
             _req_id = msg.get("id")
             _items  = msg.get("params", {}).get("items", [])
+            harper_log(f"WSCFG: request id={_req_id} items={len(_items)}")
             # harper-ls expects each result item to be {"harper-ls": {<settings>}}
             # It does result_item["harper-ls"] internally — unwrapped settings
             # cause "Settings must contain a 'harper-ls' key" error.
             _inner_cfg = {
-                "diagnosticSeverity": "warning",
+                "diagnosticSeverity": "hint",
                 "linters": {
                     "SpellCheck":             True,
                     "AnA":                    True,
@@ -3311,24 +3467,54 @@ class HarperLSPClient:
             _wrapped = {"harper-ls": _inner_cfg}
             _results = [_wrapped for _ in _items] if _items else [_wrapped]
             import json as _json_wscfg
+            harper_log(f"WSCFG: sending reply id={_req_id}")
             app_logger.debug(
                 f"LSP workspace/configuration payload: "
                 f"{_json_wscfg.dumps(_results[0] if _results else {}, ensure_ascii=False)[:200]}")
             self._send({"jsonrpc": "2.0", "id": _req_id, "result": _results})
             _sections_sent = [list(_r.keys()) if isinstance(_r, dict) else _r
                               for _r in _results]
+            harper_log(f"WSCFG: reply sent, sections={_sections_sent}")
             app_logger.debug(
                 f"LSP: replied to workspace/configuration id={_req_id} "
                 f"sections={[i.get('section','?') for i in _items]} "
                 f"result_keys={_sections_sent}")
 
         elif msg.get("id") is not None and "result" in msg:
-            app_logger.info(
-                f"Harper LSP response id={msg['id']}: "
-                f"result keys={list((msg.get('result') or {}).keys())}")
+            _res = msg.get("result")
+            _rid = msg.get("id")
+            if isinstance(_res, dict):
+                _si = _res.get("serverInfo", {})
+                if _si:
+                    harper_log(f"INIT OK: server={_si.get('name','?')} v{_si.get('version','?')}")
+                    app_logger.info(
+                        f"Harper LSP server: {_si.get('name','?')} "
+                        f"v{_si.get('version','?')} "
+                        f"(result keys={list(_res.keys())})")
+                    self._init_event.set()
+                else:
+                    harper_log(f"RESP: id={_rid} result keys={list(_res.keys())}")
+                    app_logger.info(
+                        f"Harper LSP response id={_rid}: "
+                        f"result keys={list(_res.keys())}")
+            else:
+                harper_log(f"RESP: id={_rid} result type={type(_res).__name__} (list/scalar)")
+            # Signal any pending request waiting for this response
+            if _rid is not None:
+                with self._lock:
+                    self._response_data[_rid] = _res
+                    if _rid in self._pending_responses:
+                        self._pending_responses[_rid].set()
         elif msg.get("id") is not None and "error" in msg:
+            harper_log(f"ERROR: id={msg['id']} error={msg['error']}")
             app_logger.error(
                 f"Harper LSP error id={msg['id']}: {msg['error']}")
+            _rid = msg.get("id")
+            if _rid is not None:
+                with self._lock:
+                    self._response_data[_rid] = msg.get("error")
+                    if _rid in self._pending_responses:
+                        self._pending_responses[_rid].set()
 
 
 
@@ -3388,8 +3574,20 @@ class _MdHighlighter(QSyntaxHighlighter):
 
     def set_lint_errors(self, lint_list):
         """Update error spans and re-highlight. lint_list: [(start,end,msg,[sugg])]"""
+        harper_log(f"set_lint_errors: {len(lint_list)} items, existing={len(getattr(self, '_lint_errors', []))}")
+        if lint_list == getattr(self, "_lint_errors", None):
+            harper_log("set_lint_errors: unchanged, skipping")
+            return  # unchanged — skip rehighlight to avoid cursor jump
         self._lint_errors = lint_list
+        harper_log("set_lint_errors: calling rehighlight()")
+        # Save and restore cursor: rehighlight() can move it in some Qt builds.
+        # QTextDocument.views() is not exposed in PyQt6 — use parent widget.
+        _parent = self.parent()
+        _saved = _parent.textCursor() if hasattr(_parent, "textCursor") else None
         self.rehighlight()
+        harper_log("set_lint_errors: rehighlight() done")
+        if _saved is not None:
+            _parent.setTextCursor(_saved)
 
     def _apply_lint(self, block_start, text):
         """Apply wavy-underline format to lint spans overlapping this block."""
@@ -3400,12 +3598,16 @@ class _MdHighlighter(QSyntaxHighlighter):
         err_fmt.setUnderlineColor(QColor("#ff4444"))
         err_fmt.setUnderlineStyle(
             QTextCharFormat.UnderlineStyle.SpellCheckUnderline)
+        harper_log(f"_apply_lint: block={block_start}-{block_end} text_len={len(text)} errors={len(self._lint_errors)}")
         for (start, end, _msg, _sugg) in self._lint_errors:
+            harper_log(f"  error span: {start}-{end}")
             # Clamp to this block
             s = max(start - block_start, 0)
             e = min(end   - block_start, len(text))
+            harper_log(f"  clamped: {s}-{e}")
             if s < e:
                 self.setFormat(s, e - s, err_fmt)
+                harper_log(f"  APPLIED format at {s} len={e-s}")
 
 
 
@@ -4745,26 +4947,140 @@ class WhisperEditor(QWidget):
             char_pos = cursor.position()
             lint_hit = _editor_ref._lint_at_cursor(char_pos)
             menu = self.editor.createStandardContextMenu()
+            # Force proper hover highlighting on the context menu
+            menu.setStyleSheet(
+                "QMenu{background:#1e1e1e;color:#ddd;border:1px solid #444;}"
+                "QMenu::item{padding:4px 20px;}"
+                "QMenu::item:selected{background:#1a3a5c;}"
+                "QMenu::item:hover{background:#1a3a5c;}"
+                "QMenu::item:pressed{background:#0d2a4a;}"
+                "QMenu::separator{height:1px;background:#333;margin:2px 0;}"
+                "QMenu::item:disabled{color:#666;}")
             if lint_hit:
                 msg, suggestions = lint_hit
-                menu.insertSeparator(menu.actions()[0])
-                _info = _QActCtx(f"⚠️ {msg}", menu)
-                _info.setEnabled(False)
-                menu.insertAction(menu.actions()[0], _info)
-                for sugg in suggestions[:5]:
-                    def _make_fix(s=sugg, pos=char_pos):
-                        # Find the error span and replace it
-                        for (st, en, _m, _sg) in _editor_ref._lint_errors:
-                            if st <= pos < en:
-                                cur = self.editor.textCursor()
-                                cur.setPosition(st)
-                                cur.setPosition(en,
-                                    cur.MoveMode.KeepAnchor)
-                                cur.insertText(s)
-                                break
-                    act = _QActCtx(f"✓ {sugg}", menu)
-                    act.triggered.connect(_make_fix)
-                    menu.insertAction(menu.actions()[2], act)
+                # Find the error span so we can highlight the word
+                _err_start = _err_end = None
+                for (st, en, _m, _sg) in _editor_ref._lint_errors:
+                    if st <= char_pos < en:
+                        _err_start, _err_end = st, en
+                        break
+                if _err_start is not None:
+                    # Select the error word so user sees which word suggestions are for
+                    _sel = self.editor.textCursor()
+                    _sel.setPosition(_err_start)
+                    _sel.setPosition(_err_end, _sel.MoveMode.KeepAnchor)
+                    self.editor.setTextCursor(_sel)
+                    menu.insertSeparator(menu.actions()[0])
+                    _info = _QActCtx(f"⚠️ {msg}", menu)
+                    _info.setEnabled(False)
+                    menu.insertAction(menu.actions()[0], _info)
+                    for sugg in suggestions:
+                        def _make_fix(_checked=False, s=sugg, pos=char_pos):
+                            # Find the error span and replace it
+                            for (st, en, _m, _sg) in _editor_ref._lint_errors:
+                                if st <= pos < en:
+                                    cur = self.editor.textCursor()
+                                    cur.setPosition(st)
+                                    cur.setPosition(en,
+                                        cur.MoveMode.KeepAnchor)
+                                    cur.insertText(s)
+                                    break
+                        act = _QActCtx(f"✓ {sugg}", menu)
+                        act.triggered.connect(_make_fix)
+                        menu.insertAction(menu.actions()[2], act)
+            # ── Quick-add from selection ──────────────────────────
+            sel_text = self.editor.textCursor().selectedText().strip()
+            if sel_text:
+                menu.addSeparator()
+                from PyQt6.QtWidgets import QApplication as _QAppc
+                _app_w = next((w for w in _QAppc.topLevelWidgets()
+                               if w.__class__.__name__ == "WhisperRApp"), None)
+
+                def _make_hw_adder(t, aw):
+                    def _do(_checked=False):
+                        if not aw: return
+                        hw = list(aw.config.settings.get("hotwords", []))
+                        if t not in hw:
+                            hw.append(t)
+                            aw.config.settings["hotwords"] = hw
+                            he = getattr(aw, "hotwords_edit", None)
+                            if he: he.setPlainText("\n".join(hw))
+                            aw.config.save()
+                    return _do
+
+                def _make_hall_adder(t, aw):
+                    def _do(_checked=False):
+                        if not aw: return
+                        hall = list(aw.config.settings.get("hallucinations", []))
+                        if t.lower() not in [h.lower() for h in hall]:
+                            hall.append(t)
+                            aw.config.settings["hallucinations"] = hall
+                            hl = getattr(aw, "hall_list", None)
+                            if hl:
+                                from PyQt6.QtWidgets import QListWidgetItem as _LWI
+                                hl.addItem(_LWI(t))
+                            aw.config.save()
+                    return _do
+
+                def _make_term_adder_recog(t, aw):
+                    def _do(_checked=False):
+                        if not aw: return
+                        from PyQt6.QtWidgets import QInputDialog, QLineEdit
+                        repl, ok = QInputDialog.getText(
+                            None, "Add Term Pair",
+                            f'Replacement text for recognized phrase "{t}":',
+                            QLineEdit.EchoMode.Normal, "")
+                        if not ok or not repl.strip(): return
+                        terms = dict(aw.config.settings.get("terms", {}))
+                        terms[t.lower()] = repl.strip()
+                        aw.config.settings["terms"] = terms
+                        tt = getattr(aw, "terms_table", None)
+                        if tt:
+                            from PyQt6.QtWidgets import QTableWidgetItem
+                            r = tt.rowCount(); tt.insertRow(r)
+                            tt.setItem(r, 0, QTableWidgetItem(t.lower()))
+                            tt.setItem(r, 1, QTableWidgetItem(repl.strip()))
+                        aw.config.save()
+                    return _do
+
+                def _make_term_adder_repl(t, aw):
+                    def _do(_checked=False):
+                        if not aw: return
+                        from PyQt6.QtWidgets import QInputDialog, QLineEdit
+                        phrase, ok = QInputDialog.getText(
+                            None, "Add Term Pair",
+                            f'Recognized phrase that becomes "{t}":',
+                            QLineEdit.EchoMode.Normal, "")
+                        if not ok or not phrase.strip(): return
+                        terms = dict(aw.config.settings.get("terms", {}))
+                        terms[phrase.strip().lower()] = t
+                        aw.config.settings["terms"] = terms
+                        tt = getattr(aw, "terms_table", None)
+                        if tt:
+                            from PyQt6.QtWidgets import QTableWidgetItem
+                            r = tt.rowCount(); tt.insertRow(r)
+                            tt.setItem(r, 0, QTableWidgetItem(phrase.strip().lower()))
+                            tt.setItem(r, 1, QTableWidgetItem(t))
+                        aw.config.save()
+                    return _do
+
+                _lbl = sel_text[:25] + ("…" if len(sel_text) > 25 else "")
+                _ah = _QActCtx(f'📖 Add "{_lbl}" to Vocabulary Boost', menu)
+                _ah.triggered.connect(_make_hw_adder(sel_text, _app_w))
+                menu.addAction(_ah)
+
+                _ahal = _QActCtx(f'🚫 Add "{_lbl}" to Hallucinations', menu)
+                _ahal.triggered.connect(_make_hall_adder(sel_text, _app_w))
+                menu.addAction(_ahal)
+
+                _ar = _QActCtx(f'🔁 Add "{_lbl}" as Recognized Phrase…', menu)
+                _ar.triggered.connect(_make_term_adder_recog(sel_text, _app_w))
+                menu.addAction(_ar)
+
+                _arp = _QActCtx(f'🔁 Add "{_lbl}" as Replacement Text…', menu)
+                _arp.triggered.connect(_make_term_adder_repl(sel_text, _app_w))
+                menu.addAction(_arp)
+
             menu.exec(ev.globalPos())
         self.editor.contextMenuEvent = _ctx_menu
         # Debounced history snapshot
@@ -5300,6 +5616,7 @@ class WhisperEditor(QWidget):
             # Ctrl+Shift+K registered separately with ApplicationShortcut
             # so it works even when focus is inside the text widget
             ("Ctrl+H",                                           self._show_find_replace),
+            ("Ctrl+Y",                                           self.editor.redo),
             ("Ctrl+Alt+H",                                       self._show_history),
         ]
         for keys, slot in shortcuts:
@@ -5392,17 +5709,21 @@ class WhisperEditor(QWidget):
             if not text:
                 return
         cur = self.editor.textCursor()
+        # Wrap in an edit block so each append_text call is ONE undo step.
+        # Without this, Qt merges consecutive insertions, making Ctrl+Z
+        # undo multiple transcribed sentences at once.
+        cur.beginEditBlock()
         if cur.hasSelection():
             cur.insertText(text)
         else:
-            # Peek at the character immediately before the cursor
             pos = cur.position()
             doc_text = self.editor.toPlainText()
-            # In MSS mode always add space; otherwise only if not already spaced
             if pos > 0 and doc_text[pos - 1] not in (" ", "\n", "\t"):
                 text = " " + text
             cur.insertText(text)
+        cur.endEditBlock()
         self.editor.setTextCursor(cur)
+        # Only scroll to cursor — don't force visual focus jump
         self.editor.ensureCursorVisible()
 
     def set_voice_state(self, active: bool):
@@ -5783,20 +6104,31 @@ class WhisperEditor(QWidget):
         """Start the Harper LSP client for this editor document."""
         try:
             binary = _harper_binary_path()
+            harper_log(f"_start_harper: binary={binary!r}")
             app_logger.info(f"_start_harper: binary={binary!r}")
             # Guard: if already running, nothing to do
             existing = getattr(self, "_harper_client", None)
             if existing is not None:
                 try:
                     if existing.running():
+                        harper_log("_start_harper: already running")
                         app_logger.debug("_start_harper: already running")
                         return
                 except Exception as _re:
+                    harper_log(f"_start_harper: existing client check failed: {_re}")
                     app_logger.warning(f"_start_harper: existing client check failed: {_re}")
+            harper_log("_start_harper: creating HarperLSPClient")
             app_logger.info("_start_harper: creating HarperLSPClient")
-            client = HarperLSPClient(on_diagnostics=self._apply_lint_results)
+            try:
+                client = HarperLSPClient(on_diagnostics=self._apply_lint_results)
+            except Exception as _ce:
+                harper_log(f"_start_harper: client creation failed: {_ce}")
+                app_logger.error(f"_start_harper: client creation failed: {_ce}", exc_info=True)
+                return
+            harper_log("_start_harper: calling client.start()")
             app_logger.info("_start_harper: HarperLSPClient created, calling start()")
             ok = client.start()
+            harper_log(f"_start_harper: client.start() returned {ok}")
             app_logger.info(f"_start_harper: client.start() returned {ok}")
             if ok:
                 self._harper_client = client
@@ -5804,14 +6136,15 @@ class WhisperEditor(QWidget):
                 # document filters match. The file does not need to exist
                 # on disk — LSP carries the full content in open/change
                 # notifications. This is standard LSP behaviour.
-                _app_dir2 = (os.path.dirname(sys.executable)
-                             if getattr(sys, "frozen", False)
-                             else os.path.dirname(os.path.abspath(__file__)))
-                _uri_base = ("file:///" +
-                    _app_dir2.replace("\\", "/").lstrip("/"))
-                _uri_base = ("file:///" +
-                    _app_dir.replace("\\", "/").lstrip("/"))
-                uri = _uri_base + "/whisperr-document.md"
+                # Simple in-memory document URI — no app-dir dependency.
+                # rootUri is file:/// so document must also use file: scheme.
+                # Document URI must be inside the workspace root
+                _app_dir_e = (os.path.dirname(sys.executable)
+                              if getattr(sys, "frozen", False)
+                              else os.path.dirname(os.path.abspath(__file__)))
+                _doc_base = ("file:///" +
+                    _app_dir_e.replace("\\", "/").lstrip("/"))
+                uri = _doc_base + "/whisperr-document.md"
                 _doc_text = self.editor.toPlainText()
                 self._harper_client.open_document(uri, _doc_text)
                 self._harper_uri = uri
@@ -5879,11 +6212,14 @@ class WhisperEditor(QWidget):
         """Send the current document to harper-ls (debounced via HarperLSPClient)."""
         client = getattr(self, "_harper_client", None)
         if not client or not client.running():
+            harper_log("_run_lint: no running client")
             return
         uri  = getattr(self, "_harper_uri", None)
         if not uri:
+            harper_log("_run_lint: no uri")
             return
         text = self.editor.toPlainText()
+        harper_log(f"_run_lint: sending text_len={len(text)}")
         app_logger.debug(
             f"_run_lint: editor text_len={len(text)} preview={text[:40]!r}")
         client.change_document(uri, text)
@@ -5892,6 +6228,7 @@ class WhisperEditor(QWidget):
         """Receive LSP publishDiagnostics and convert to highlight spans.
         diags: list of {"range":{start,end}, "message":str, "suggestions":[str]}
         """
+        harper_log(f"_apply_lint_results: {len(diags)} diag(s)")
         # Convert LSP line/char ranges to absolute char offsets
         text  = self.editor.toPlainText()
         lines = text.split("\n")
@@ -5908,14 +6245,18 @@ class WhisperEditor(QWidget):
             ec    = rng.get("end",   {}).get("character", 0)
             start = min(offsets[sl] + sc, len(text)) if sl < len(offsets) else 0
             end   = min(offsets[el] + ec, len(text)) if el < len(offsets) else 0
+            harper_log(f"  diag: line={sl} ch={sc}-{ec} → offsets {start}-{end} text_len={len(text)}")
             if start < end:
                 errors.append((
                     start, end,
                     d.get("message", ""),
                     d.get("suggestions", [])))
         self._lint_errors = errors
+        harper_log(f"_apply_lint_results: {len(errors)} error(s) highlighted")
         if hasattr(self, "_highlighter"):
             self._highlighter.set_lint_errors(errors)
+        else:
+            harper_log("_apply_lint_results: NO HIGHLIGHTER FOUND")
 
     def _update_harper_indicator(self, active: bool):
         """Update the Harper status indicator in the toolbar and Edit menu."""
@@ -5952,6 +6293,31 @@ class WhisperEditor(QWidget):
         """Return (msg, suggestions) for the lint error at char position, or None."""
         for (start, end, msg, sugg) in getattr(self, "_lint_errors", []):
             if start <= pos < end:
+                # If no suggestions cached, fetch code actions from harper-ls
+                if not sugg:
+                    client = getattr(self, "_harper_client", None)
+                    uri = getattr(self, "_harper_uri", None)
+                    if client and client.running() and uri:
+                        text = self.editor.toPlainText()
+                        lines = text[:start].split("\n")
+                        line = len(lines) - 1
+                        char_start = len(lines[-1])
+                        char_end = char_start + (end - start)
+                        harper_log(f"_lint_at_cursor: fetching code actions at L{line}:{char_start}-{char_end}")
+                        actions = client.request_code_actions(uri, line, char_start, char_end)
+                        # Extract suggestions from code action titles
+                        # Harper "Replace with" actions use curly quotes: Replace with: "word"
+                        # Skip "Add to dictionary" and "Ignore" actions
+                        import re
+                        for action in actions:
+                            title = action.get("title", "")
+                            if title.startswith("Replace with"):
+                                # Match both curly quotes and straight quotes
+                                m = re.search(r':\s*["\u201c]([^"\u201d]+)["\u201d]', title)
+                                if m:
+                                    sugg.append(m.group(1))
+                                    harper_log(f"  suggestion: {m.group(1)}")
+                        harper_log(f"_lint_at_cursor: extracted {len(sugg)} suggestion(s): {sugg}")
                 return msg, sugg
         return None
 
@@ -7851,6 +8217,7 @@ class WhisperRApp(QMainWindow):
             "Enter the pynput key name, e.g.: shift, ctrl, alt, f1, space")
         self.cfg_mss_key.setMaximumWidth(120)
         dict_layout.addRow("Sentence Break key:", self.cfg_mss_key)
+
         dict_group.setLayout(dict_layout)
         main_layout.addWidget(dict_group)
 
@@ -9315,6 +9682,11 @@ class WhisperRApp(QMainWindow):
             self._speech_active = False
             self._update_app_state()
             app_logger.info("Dictation stopped")
+            # Reset MSS flag so next dictation session starts capitalised
+            if self.config.settings.get("manual_sentence_split", False):
+                _ed2 = getattr(self, "_editor", None)
+                if _ed2:
+                    _ed2._mss_next_capital = True
         else:
             app_logger.info("toggle_rec: Starting dictation")
             # _pre_rec_hwnd was already captured in on_toggle_hotkey (keyboard thread)
@@ -9542,13 +9914,16 @@ class WhisperRApp(QMainWindow):
                 _mss_vk = self._VK_MAP.get(
                     self.config.settings.get("mss_break_key", "shift")
                     .lower().strip(), 0)
-                if _mss_vk:
-                    import ctypes as _ct_mss
-                    _mss_down = bool(
-                        _ct_mss.windll.user32.GetAsyncKeyState(_mss_vk) & 0x8000)
+                import ctypes as _ct_mss
+                _mss_raw_key = self.config.settings.get("mss_break_key","shift").lower().strip()
+                _mss_parts = [p.strip() for p in _mss_raw_key.replace("<","").replace(">","").split("+")]
+                _mss_vks = [self._VK_MAP.get(p, 0) for p in _mss_parts]
+                if _mss_vks and all(_mss_vks):
+                    _mss_down = all(
+                        _ct_mss.windll.user32.GetAsyncKeyState(v) & 0x8000
+                        for v in _mss_vks)
                     if _mss_down and not getattr(self, "_mss_key_was_down", False):
-                        # Rising edge — fire once per press, not while held
-                        app_logger.debug("MSS break key detected (poll)")
+                        app_logger.debug(f"MSS break key detected: {_mss_raw_key!r}")
                         self.on_mss_break()
                     self._mss_key_was_down = _mss_down
         except Exception as e:
@@ -12544,6 +12919,9 @@ class StatusOverlay(QWidget):
         super().deleteLater()
 
 
+# Single-instance mutex handle — kept at module level so it is never GC'd
+_WHISPERR_MUTEX_HANDLE = None
+
 if __name__ == "__main__":
     # freeze_support() already called at module top — do not call again.
     app_logger.info("="*60)
@@ -12552,6 +12930,29 @@ if __name__ == "__main__":
     app_logger.info(f"Platform: {sys.platform}\"")
     app_logger.info("="*60)
     
+    # ── Single-instance guard ────────────────────────────────────
+    # Handle stored at module level (_WHISPERR_MUTEX_HANDLE) so Python
+    # never GC's it, keeping the Win32 mutex owned for the process lifetime.
+    if sys.platform == "win32":
+        try:
+            import ctypes as _ctm
+            _WHISPERR_MUTEX_HANDLE = _ctm.windll.kernel32.CreateMutexW(
+                None, True, "WhisperR_SingleInstance_v210")
+            if _ctm.windll.kernel32.GetLastError() == 183:
+                # Another instance owns the mutex — show message and exit
+                try:
+                    _ctm.windll.kernel32.CloseHandle(_WHISPERR_MUTEX_HANDLE)
+                except Exception: pass
+                import tkinter as _tk, tkinter.messagebox as _mb
+                _r = _tk.Tk(); _r.withdraw()
+                _mb.showerror("WhisperR Already Running",
+                    "WhisperR is already running.\nCheck the system tray.")
+                _r.destroy()
+                sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception as _me:
+            app_logger.warning(f"Single-instance check failed: {_me}")
     try:
         app_logger.debug("→ Creating QApplication instance...")
         app = QApplication(sys.argv)
