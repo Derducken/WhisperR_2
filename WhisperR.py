@@ -33,6 +33,36 @@ _HF_FALLBACK_FILES = {
 }
 _HF_CORE_REQUIRED = {"config.json", "model.bin", "tokenizer.json"}
 
+# Harper-ls linter definitions: (internal_name, display_label, default, tooltip)
+HARPER_LINTERS = [
+    ("SpellCheck",                 "Spell Check",                  True,  "Detects misspelled words"),
+    ("AnA",                        "A/An Usage",                   True,  "Detects wrong 'a' vs 'an' usage"),
+    ("RepeatedWords",              "Repeated Words",               True,  "Detects repeated words (e.g. 'the the')"),
+    ("Spaces",                     "Spacing Errors",               True,  "Detects double or missing spaces"),
+    ("UnclosedQuotes",             "Unclosed Quotes",              True,  "Detects unclosed quote marks"),
+    ("Matcher",                    "Common Errors",                True,  "Rule-based detection of common mistakes"),
+    ("SentenceCapitalization",     "Capitalization",               True,  "Sentences must start with a capital letter"),
+    ("LongSentences",              "Long Sentences",               True,  "Warns about overly long sentences"),
+    ("MultipleSequentialPronouns", "Stacked Pronouns",             True,  "Detects stacked pronouns (e.g. 'I he went')"),
+    ("Ellipsis",                   "Ellipsis Usage",               True,  "Proper ellipsis formatting"),
+    ("Dashes",                     "Dash Spacing",                 True,  "Em-dash / en-dash spacing"),
+    ("CompoundNouns",              "Compound Nouns",               True,  "Hyphenation of compound nouns"),
+    ("PronounContractions",        "Pronoun Contractions",         True,  "Correct pronoun vs contraction usage"),
+    ("WrongQuotes",                "Smart Quotes",                 False, "Converts straight quotes to typographic curly quotes"),
+    ("SpelledNumbers",             "Spelled Numbers",              False, "Numbers should be spelled out"),
+    ("CorrectNumberSuffix",        "Number Suffixes",              False, "Correct suffix usage (e.g. '1st' vs '1th')"),
+    ("NumberSuffixCapitalization", "Ordinal Capitalization",       False, "Capitalization of ordinal suffixes"),
+    ("LinkingVerbs",               "Linking Verbs",                False, "Checks linking verb usage"),
+    ("AvoidCurses",                "Flag Profanity",               False, "Detects and flags curse words"),
+    ("TerminatingConjunctions",    "Sentence-End Conjunctions",    False, "Conjunctions at the end of sentences"),
+    ("OxfordComma",                "Oxford Comma",                 False, "Detects missing Oxford comma in lists"),
+    ("BoringWords",                "Boring / Overused Words",      False, "Flags overused words (e.g. 'very', 'really')"),
+]
+
+def _harper_default_linters():
+    """Return dict of linter → bool using HARPER_LINTERS defaults."""
+    return {name: default for (name, _, default, _) in HARPER_LINTERS}
+
 
 def _get_hf_file_list(model_name, ssl_ctx, log_fn):
     """Fetch the exact file list from the HF API. Returns list of filenames
@@ -1138,7 +1168,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox, QProgressBar, QFormLayout, QLineEdit, QGroupBox, QSpinBox, QPlainTextEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea, QDialog, QMessageBox,
     QSystemTrayIcon, QMenu, QSlider, QListWidget, QListWidgetItem, QRadioButton, QAbstractItemView, QSplitter,
-    QFrame, QSizePolicy
+    QFrame, QSizePolicy, QGridLayout
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QPoint, QObject, QEvent
 from PyQt6.QtGui import (QPainter, QColor, QFont, QIcon, QAction, QKeyEvent, QPixmap, QPen,
@@ -2979,7 +3009,7 @@ class HarperLSPClient:
 
     DEBOUNCE_MS = 300
 
-    def __init__(self, on_diagnostics=None, binary_path=None):
+    def __init__(self, on_diagnostics=None, binary_path=None, linters_callback=None):
         self._on_diagnostics = on_diagnostics
         self._binary   = binary_path or _harper_binary_path()
         self._proc     = None
@@ -2992,6 +3022,7 @@ class HarperLSPClient:
         self._stopping  = False  # set True on explicit stop() to suppress restart
         self._init_event = threading.Event()  # set when harper-ls init succeeds
         self._last_text = ""   # cached doc text for keepalive / auto-restart
+        self._linters_callback = linters_callback  # callable() -> dict{name: bool}
         # Qt signal bridge — emits from reader thread, fires callback on main thread
         try:
             self._bridge = _DiagBridge()
@@ -3004,6 +3035,38 @@ class HarperLSPClient:
         # Response tracking for sync LSP requests (codeAction, etc.)
         self._pending_responses = {}  # id -> threading.Event
         self._response_data = {}       # id -> result dict
+
+    def _get_linters_dict(self):
+        """Return current linter config from callback, or defaults."""
+        if self._linters_callback:
+            try:
+                cfg = self._linters_callback()
+                if isinstance(cfg, dict):
+                    return cfg
+            except Exception:
+                pass
+        return _harper_default_linters()
+
+    def refresh_linter_config(self):
+        """Push updated linter config to harper-ls at runtime (no restart needed)."""
+        if not self.running():
+            return
+        linters = self._get_linters_dict()
+        settings = {
+            "harper-ls": {
+                "diagnosticSeverity": "hint",
+                "linters": linters,
+            }
+        }
+        harper_log(f"refresh_linter_config: pushing {linters}")
+        self._send({
+            "jsonrpc": "2.0",
+            "method":  "workspace/didChangeConfiguration",
+            "params":  {"settings": settings}
+        })
+        # Also trigger re-check by sending a new document change
+        if self._uri and self._last_text:
+            self._send_change(self._uri, self._last_text)
 
     def _auto_restart(self):
         """Called on main thread when harper-ls exits unexpectedly. Restart it."""
@@ -3212,20 +3275,11 @@ class HarperLSPClient:
         _root_uri = "file:///" + _app_dir.replace("\\", "/").lstrip("/")
         harper_log(f"INIT: rootUri={_root_uri!r}")
         app_logger.info(f"HarperLSPClient: rootUri={_root_uri!r}")
+        _linters = self._get_linters_dict()
         _settings = {
             "harper-ls": {
                 "diagnosticSeverity": "hint",
-                "linters": {
-                    "SpellCheck": True,
-                    "AnA": True,
-                    "SentenceCapitalization": False,
-                    "UnclosedQuotes": True,
-                    "WrongQuotes": False,
-                    "LongSentences": False,
-                    "RepeatedWords": True,
-                    "Spaces": True,
-                    "Matcher": True,
-                }
+                "linters": _linters,
             }
         }
         init_id = self._next_id()
@@ -3446,19 +3500,10 @@ class HarperLSPClient:
             # harper-ls expects each result item to be {"harper-ls": {<settings>}}
             # It does result_item["harper-ls"] internally — unwrapped settings
             # cause "Settings must contain a 'harper-ls' key" error.
+            _linters = self._get_linters_dict()
             _inner_cfg = {
                 "diagnosticSeverity": "hint",
-                "linters": {
-                    "SpellCheck":             True,
-                    "AnA":                    True,
-                    "SentenceCapitalization": False,
-                    "UnclosedQuotes":         True,
-                    "WrongQuotes":            False,
-                    "LongSentences":          False,
-                    "RepeatedWords":          True,
-                    "Spaces":                  True,
-                    "Matcher":                 True,
-                }
+                "linters": _linters,
             }
             # harper-ls ALWAYS expects {"harper-ls": {settings}} wrapper
             # regardless of which section is requested. This is confirmed
@@ -6120,7 +6165,10 @@ class WhisperEditor(QWidget):
             harper_log("_start_harper: creating HarperLSPClient")
             app_logger.info("_start_harper: creating HarperLSPClient")
             try:
-                client = HarperLSPClient(on_diagnostics=self._apply_lint_results)
+                client = HarperLSPClient(
+                    on_diagnostics=self._apply_lint_results,
+                    linters_callback=lambda: self.config.settings.get("harper", {}).get("linters", {}),
+                )
             except Exception as _ce:
                 harper_log(f"_start_harper: client creation failed: {_ce}")
                 app_logger.error(f"_start_harper: client creation failed: {_ce}", exc_info=True)
@@ -8221,6 +8269,37 @@ class WhisperRApp(QMainWindow):
         dict_group.setLayout(dict_layout)
         main_layout.addWidget(dict_group)
 
+        # --- Spell & Grammar Linters ---
+        linter_group = QGroupBox("Spell & Grammar Linters")
+        linter_grid = QGridLayout()
+        linter_grid.setSpacing(4)
+        linter_grid.setContentsMargins(6, 8, 6, 8)
+        linter_col = 0
+        linter_row = 0
+        COLS = 3
+        # Load saved linter config; merge with defaults for any missing keys
+        _harper = self.config.settings.get("harper", {})
+        if not isinstance(_harper, dict):
+            _harper = {}
+        _saved_linters = _harper.get("linters", {})
+        if not isinstance(_saved_linters, dict):
+            _saved_linters = {}
+        _all_defaults = _harper_default_linters()
+        self._linter_checkboxes = {}
+        for (lname, label, default, tip) in HARPER_LINTERS:
+            cb = QCheckBox(label)
+            cb.setChecked(bool(_saved_linters.get(lname, default)))
+            cb.setToolTip(tip)
+            cb.toggled.connect(lambda checked, n=lname: self._on_linter_toggled(n, checked))
+            self._linter_checkboxes[lname] = cb
+            linter_grid.addWidget(cb, linter_row, linter_col)
+            linter_col += 1
+            if linter_col >= COLS:
+                linter_col = 0
+                linter_row += 1
+        linter_group.setLayout(linter_grid)
+        main_layout.addWidget(linter_group)
+
         # --- Hotkeys ---
         hotkey_group = QGroupBox("Hotkeys  (click to re-assign · × to clear)")
         hotkey_layout = QFormLayout()
@@ -9028,6 +9107,25 @@ class WhisperRApp(QMainWindow):
             app_logger.debug("_autosave_data: saved terms/hall/cmds/prompt")
         except Exception as _e:
             app_logger.warning(f"_autosave_data failed: {_e}")
+
+    def _on_linter_toggled(self, name: str, checked: bool):
+        """Save linter toggle to config and push to harper-ls immediately."""
+        try:
+            _harper = self.config.settings.get("harper", {})
+            if not isinstance(_harper, dict):
+                _harper = {}
+            _linters = _harper.get("linters", {})
+            if not isinstance(_linters, dict):
+                _linters = {}
+            _linters[name] = checked
+            _harper["linters"] = _linters
+            self.config.settings["harper"] = _harper
+            self.config.save()
+            # Push to harper-ls immediately — no restart needed
+            if hasattr(self, "_harper_client") and self._harper_client:
+                self._harper_client.refresh_linter_config()
+        except Exception as _e:
+            app_logger.warning(f"_on_linter_toggled failed for {name}: {_e}")
 
     def _import_terms(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import Terms", "", "Text Files (*.txt)")
