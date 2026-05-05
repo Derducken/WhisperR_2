@@ -1075,11 +1075,11 @@ from pathlib import Path
 import logging
 import platform
 
-# Optional: Import diff_engine for version history comparison
+# Diff engine - enables word-level comparison in version history
 try:
     from core.diff_engine import compute_word_diff
     _diff_engine_available = True
-except (ImportError, Exception) as e:
+except Exception:
     _diff_engine_available = False
     compute_word_diff = None
 
@@ -8120,6 +8120,11 @@ class WhisperRApp(QMainWindow):
         settings_sc = QShortcut(QKeySequence("Ctrl+,"), self)
         settings_sc.activated.connect(self._show_settings)
         self._hotkeys_active.append(settings_sc)
+        
+        # Add keyboard shortcut for Find (Ctrl+F)
+        find_sc = QShortcut(QKeySequence("Ctrl+F"), self)
+        find_sc.activated.connect(self._show_find_dialog)
+        self._hotkeys_active.append(find_sc)
         self.btn_settings.setStyleSheet(
             "QPushButton{background:#1e1e1e;border:1px solid #444;"
             "color:#ddd;padding:4px;border-radius:4px;}"
@@ -9802,11 +9807,25 @@ class WhisperRApp(QMainWindow):
         """Meter is now driven by AudioRecorder.volume_out signal — no-op here."""
         pass
 
-
     def _show_settings(self):
         """Switch to the Settings tab."""
         self.tabs.setCurrentIndex(6)  # Settings tab is at index 6
-
+    
+    def _show_find_dialog(self):
+        """Show find dialog (Ctrl+F) to search in scratchpad"""
+        from PyQt6.QtWidgets import QInputDialog, QLineEdit
+        from PyQt6.QtGui import QTextDocument
+        text, ok = QInputDialog.getText(
+            self, "Find Text", "Search for:",
+            QLineEdit.EchoMode.Normal, ""
+        )
+        if ok and text:
+            flags = QTextDocument.FindFlags(QTextDocument.FindCaseSensitively)
+            if self.log_area.find(text, flags):
+                self.scratchpad.append(f"🔍 Found: '{text}'")
+            else:
+                self.scratchpad.append(f"🔍 Not found: '{text}'")
+    
     def _on_settings_tab_changed(self, idx):
         """Flush pending auto-save only when leaving a live-edit tab.
         Tab indices: 0=Main, 1=Transcription Steering, 2=Terms,
