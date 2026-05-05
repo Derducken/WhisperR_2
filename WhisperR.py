@@ -1070,21 +1070,88 @@ import zipfile
 import urllib.request
 import traceback
 import logging
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+import logging
+import platform
+
+# Optional: Import diff_engine for version history comparison
+try:
+    from core.diff_engine import compute_word_diff
+    _diff_engine_available = True
+except (ImportError, Exception) as e:
+    _diff_engine_available = False
+    compute_word_diff = None
 
 # Application version
 __version__ = "2.1.0"
 APP_NAME = "WhisperR"
 
 # --- 1. GLOBAL CRASH LOGGING ---
+# Use enhanced crash handler from utils (with system info collection)
 def crash_logger(etype, value, tb):
+    """Enhanced crash handler - collects system info before logging"""
     try:
-        with open("CRASH_LOG.txt", "w") as f:
-            f.write(f"--- CRASH REPORT {datetime.now()} ---\n")
-            f.write(f"{APP_NAME} v{__version__}\n\n")
+        # Try to get system info
+        os_info = f"{platform.system()} {platform.version()}"
+        python_ver = f"Python {platform.python_version()}"
+        
+        # Try to get RAM info
+        ram_info = "unknown"
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            ram_info = f"{vm.total / (1024**3):.1f}GB total, {vm.available / (1024**3):.1f}GB available"
+        except:
+            pass
+        
+        # Try to get PyQt version
+        pyqt_ver = "unknown"
+        try:
+            from PyQt6.QtCore import PYQT_VERSION_STR
+            pyqt_ver = PYQT_VERSION_STR
+        except:
+            pass
+        
+        # Read recent logs if available
+        log_content = ""
+        log_path = os.path.join(BASE_DIR, "app_log.txt") if 'BASE_DIR' in dir() else "app_log.txt"
+        try:
+            if os.path.exists(log_path):
+                with open(log_path, 'r', encoding='utf-8') as lf:
+                    lines = lf.readlines()
+                    log_content = "".join(lines[-30:])
+        except:
+            pass
+        
+        # Write enhanced crash report
+        with open("CRASH_LOG.txt", "w", encoding="utf-8") as f:
+            f.write("=" * 50 + "\n")
+            f.write("WHISPERR CRASH REPORT\n")
+            f.write("=" * 50 + "\n\n")
+            f.write(f"Time: {datetime.now()}\n")
+            f.write(f"Version: {APP_NAME} v{__version__}\n")
+            f.write(f"OS: {os_info}\n")
+            f.write(f"{python_ver}\n")
+            f.write(f"PyQt: {pyqt_ver}\n")
+            f.write(f"RAM: {ram_info}\n")
+            f.write("\n--- Recent Logs ---\n")
+            f.write(log_content if log_content else "(no logs)")
+            f.write("\n\n--- Traceback ---\n")
             traceback.print_exception(etype, value, tb, file=f)
-    except: pass
+            f.write("\n\n--- Report this crash ---\n")
+            f.write("https://github.com/WhisperR/WhisperR/issues\n")
+            
+    except Exception as e:
+        # Fallback to simple handler if enhanced fails
+        try:
+            with open("CRASH_LOG.txt", "w") as f:
+                f.write(f"--- CRASH REPORT {datetime.now()} ---\n")
+                f.write(f"{APP_NAME} v{__version__}\n\n")
+                traceback.print_exception(etype, value, tb, file=f)
+        except:
+            pass
+
 sys.excepthook = crash_logger
 
 # --- 2. DLL & ENVIRONMENT HARDENING ---
@@ -1336,6 +1403,7 @@ class AppConfig:
             "editor_edit_hotkey": "ctrl+shift+x",
             "rollback_hotkey": "ctrl+shift+z",
             "always_on_top": True,
+            "theme": "Dark",
             "aot_main": True, "aot_editor": True,
             "aot_notes": True, "aot_cheatsheet": True,
             "auto_backup_enabled": False,
@@ -3791,7 +3859,8 @@ class _NoteWidget(QWidget):
                 f"border-radius:2px;padding:0;}}"
                 f"QPushButton:hover{{border:2px solid #555;}}")
             sw.clicked.connect(lambda _, idx=i: self._set_color(idx))
-            sw.setToolTip(f"Colour {i+1}")
+            color_names = ["Yellow", "Orange", "Deep Orange", "Red", "Pink", "Purple", "Indigo", "Blue", "Green", "Blue Grey"]
+            sw.setToolTip(f"Set note color: {color_names[i]}")
             top.addWidget(sw)
             self._swatches.append(sw)
         top.addStretch()
@@ -4590,6 +4659,16 @@ class _CheatsheetWindow(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
+        # Search box
+        self._search_box = QLineEdit()
+        self._search_box.setPlaceholderText("🔍 Search shortcuts...")
+        self._search_box.setStyleSheet(
+            "QLineEdit{background:#252525;border:1px solid #444;color:#ddd;"
+            "padding:6px;border-radius:4px;}"
+            "QLineEdit:focus{border-color:#0078d7;}")
+        self._search_box.textChanged.connect(self._filter_shortcuts)
+        outer.addWidget(self._search_box)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -4600,7 +4679,48 @@ class _CheatsheetWindow(QWidget):
         scroll.setWidget(inner)
         outer.addWidget(scroll)
 
+        self._all_rows = []  # Store all rows for filtering
         self._populate()
+
+    def _filter_shortcuts(self, text: str):
+        """Filter shortcuts based on search text"""
+        search = text.lower().strip()
+        
+        # Hide/show all sections based on search
+        for i in range(self._inner_layout.count()):
+            section = self._inner_layout.itemAt(i).widget()
+            if section is None:
+                continue
+                
+            # Check if section has any matching rows
+            section_has_match = True
+            if search:
+                section_has_match = False
+                # Get the body widget (contains rows)
+                for j in range(section.layout().count()):
+                    item = section.layout().itemAt(j)
+                    if item and item.widget():
+                        # Check if this is the body widget
+                        body = item.widget()
+                        if hasattr(body, 'layout'):
+                            for k in range(body.layout().count()):
+                                row_item = body.layout().itemAt(k)
+                                if row_item and row_item.widget():
+                                    row = row_item.widget()
+                                    # Check if row text matches
+                                    for child in row.findChildren(QLabel):
+                                        if search in child.text().lower():
+                                            section_has_match = True
+                                            break
+                                    if section_has_match:
+                                        break
+            
+            section.setVisible(section_has_match)
+            # Update header button text
+            header = section.layout().itemAt(0).widget()
+            if header and hasattr(header, 'setText'):
+                title = header.text().replace('▾  ', '').replace('▸  ', '')
+                header.setText(("▾  " if section_has_match else "▸  ") + title)
 
     def _populate(self):
         lay = self._inner_layout
@@ -4874,8 +4994,11 @@ class WhisperEditor(QWidget):
 
         stats_row.addSpacing(8)
         self.lbl_words = QLabel("Words: 0")
+        self.lbl_words.setToolTip("Current word count in the editor")
         self.lbl_chars = QLabel("Chars: 0")
+        self.lbl_chars.setToolTip("Total character count")
         self.lbl_remain = QLabel("")
+        self.lbl_remain.setToolTip("Words remaining to reach target (if set)")
         for lbl in (self.lbl_words, self.lbl_chars, self.lbl_remain):
             lbl.setStyleSheet("color: #aaa; font-size: 9pt;")
             stats_row.addWidget(lbl)
@@ -4901,24 +5024,26 @@ class WhisperEditor(QWidget):
         # Grouped button definitions: (label, tip, hotkey_key, default_hk, slot)
         # Groups separated by None entries (rendered as vertical dividers)
         self._fmt_btns = [
-            ("**B**", "Bold",           "editor_hk_bold",      "Ctrl+B",          self._fmt_bold),
-            ("*I*",   "Italic",         "editor_hk_italic",    "Ctrl+I",          self._fmt_italic),
-            ("~~S~~", "Strikethrough",  "editor_hk_strike",    "Ctrl+Shift+S",    self._fmt_strike),
-            ("==H==", "Highlight",      "editor_hk_highlight", "Ctrl+Shift+H",    self._fmt_highlight),
+            ("**B**", "Bold text",                          "editor_hk_bold",      "Ctrl+B",          self._fmt_bold),
+            ("*I*",   "Italic text",                        "editor_hk_italic",    "Ctrl+I",          self._fmt_italic),
+            ("~~S~~", "Strikethrough text",                  "editor_hk_strike",    "Ctrl+Shift+S",    self._fmt_strike),
+            ("==H==", "Highlight text (yellow)",            "editor_hk_highlight", "Ctrl+Shift+H",    self._fmt_highlight),
             None,  # ── group separator ──
-            ("`C`",   "Inline code",    "editor_hk_code",      "Ctrl+`",          self._fmt_code),
-            ("<kbd>", "Keyboard key",   "editor_hk_kbd",       "Ctrl+Shift+D",    self._fmt_kbd),
-            ("<>",    "Wrap in HTML/XML tag\nleft-click: <tag>text</tag>\nright-click: [tag]text[/tag]",
+            ("`C`",   "Inline code (monospace)",            "editor_hk_code",      "Ctrl+`",          self._fmt_code),
+            ("<kbd>", "Keyboard key tag <kbd></kbd>",       "editor_hk_kbd",       "Ctrl+Shift+D",    self._fmt_kbd),
+            ("<>",    "Wrap in HTML/XML tag\nLeft-click: <tag>text</tag>\nRight-click: [tag]text[/tag]",
                       "editor_hk_tagwrap",   "Ctrl+Shift+W",    self._fmt_tagwrap),
-            ("🔗",    "Link\nleft-click [Ctrl+K]: [text](placeholder-url)\nright-click [Ctrl+Shift+K]: [text](clipboard url)",           "editor_hk_link",      "Ctrl+K",          self._fmt_link),
+            ("🔗",    "Insert hyperlink\nLeft-click: [text](placeholder-url)\nRight-click: [text](clipboard url)",           
+                      "editor_hk_link",      "Ctrl+K",          self._fmt_link),
             None,  # ── group separator ──
-            ("H1",    "Heading 1",      "editor_hk_h1",        "Ctrl+1",          lambda: self._fmt_heading(1)),
-            ("H2",    "Heading 2",      "editor_hk_h2",        "Ctrl+2",          lambda: self._fmt_heading(2)),
-            ("H3",    "Heading 3",      "editor_hk_h3",        "Ctrl+3",          lambda: self._fmt_heading(3)),
+            ("H1",    "Heading level 1 (large)",            "editor_hk_h1",        "Ctrl+1",          lambda: self._fmt_heading(1)),
+            ("H2",    "Heading level 2 (medium)",            "editor_hk_h2",        "Ctrl+2",          lambda: self._fmt_heading(2)),
+            ("H3",    "Heading level 3 (small)",             "editor_hk_h3",        "Ctrl+3",          lambda: self._fmt_heading(3)),
             None,  # ── group separator ──
-            ("•",     "Bullet list",    "editor_hk_bullet",    "Ctrl+Shift+B",    self._fmt_bullet),
-            ("1.",    "Numbered list",  "editor_hk_numlist",   "Ctrl+Shift+N",    self._fmt_numlist),
-            ("☐",     "Task list",      "editor_hk_tasklist",  "Ctrl+Shift+T",    self._fmt_tasklist),
+            ("•",     "Bullet/numbered list item",          "editor_hk_bullet",    "Ctrl+Shift+B",    self._fmt_bullet),
+            ("1.",    "Numbered list item",                 "editor_hk_numlist",   "Ctrl+Shift+N",    self._fmt_numlist),
+            ("☐",     "Task/checkbox item (- [ ])",          "editor_hk_tasklist",  "Ctrl+Shift+T",    self._fmt_tasklist),
+            ("▦",     "Insert table (rows x columns)",      "editor_hk_table",    "",                self._insert_table),
         ]
 
         _btn_ss = ("QPushButton{background:#2a2a2a;border:1px solid #444;border-radius:3px;"
@@ -4951,6 +5076,24 @@ class WhisperEditor(QWidget):
                 btn.customContextMenuRequested.connect(
                     lambda _: self._fmt_tagwrap(square=True))
             fmt_row.addWidget(btn)
+
+        # Write/Preview toggle
+        fmt_row.addSpacing(10)
+        self._preview_toggle = QPushButton("👁 Preview")
+        self._preview_toggle.setCheckable(True)
+        self._preview_toggle.setFixedSize(70, 28)
+        self._preview_toggle.setToolTip(
+            "Toggle Markdown preview mode\n"
+            "Preview shows rendered HTML, Write shows raw Markdown\n"
+            "Keyboard shortcut: Ctrl+Shift+P")
+        self._preview_toggle.setStyleSheet(
+            "QPushButton{background:#2a2a2a;border:1px solid #444;border-radius:3px;"
+            "color:#888;font-size:9pt;}"
+            "QPushButton:checked{background:#0078d7;border-color:#005fa3;color:#fff;}")
+        self._preview_toggle.clicked.connect(self._toggle_preview)
+        self._preview_shortcut = QShortcut(QKeySequence("Ctrl+Shift+P"), self)
+        self._preview_shortcut.activated.connect(self._toggle_preview)
+        fmt_row.addWidget(self._preview_toggle)
 
         fmt_row.addStretch()
 
@@ -5290,10 +5433,14 @@ class WhisperEditor(QWidget):
         # ── Notes / Cheatsheet (dual) ────────────────────────────────────
         self.btn_notes = QPushButton("📝 Notes")
         self.btn_notes.setToolTip(
-            "Show / hide the Notes panel\nRight-click: show / hide Cheatsheet")
+            "Show / hide the Notes panel\nRight-click: show / hide Cheatsheet\nKeyboard shortcuts: Ctrl+Shift+N (Notes), Ctrl+Shift+G (Cheatsheet)")
         self.btn_notes.setCheckable(True)
         self.btn_notes.setStyleSheet(_btn_ss)
         self.btn_notes.clicked.connect(self._toggle_notes)
+        self._notes_shortcut = QShortcut(QKeySequence("Ctrl+Shift+N"), self)
+        self._notes_shortcut.activated.connect(self._toggle_notes)
+        self._cheatsheet_shortcut = QShortcut(QKeySequence("Ctrl+Shift+G"), self)
+        self._cheatsheet_shortcut.activated.connect(self._toggle_cheatsheet)
         self.btn_notes.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.btn_notes.customContextMenuRequested.connect(lambda _: self._toggle_cheatsheet())
         btn_row.addWidget(self.btn_notes)
@@ -5447,8 +5594,107 @@ class WhisperEditor(QWidget):
     def _fmt_bold(self):      self._wrap_selection("**")
     def _fmt_italic(self):    self._wrap_selection("*")
     def _fmt_strike(self):    self._wrap_selection("~~")
+    def _fmt_highlight(self): self._wrap_selection("==")
     def _fmt_code(self):      self._wrap_selection("`")
     def _fmt_kbd(self):       self._wrap_selection("<kbd>", "</kbd>")
+    
+    def _toggle_preview(self):
+        """Toggle between Write and Preview modes"""
+        is_preview = self._preview_toggle.isChecked()
+        
+        if is_preview:
+            # Switch to preview - need to create/render markdown
+            if not hasattr(self, '_preview_widget') or self._preview_widget is None:
+                # Create preview widget
+                from PyQt6.QtWebEngineWidgets import QWebEngineView
+                from PyQt6.QtWidgets import QStackedWidget
+                
+                # Create stacked widget to hold editor and preview
+                if not hasattr(self, '_editor_stack'):
+                    self._editor_stack = QStackedWidget()
+                    # Replace editor in layout
+                    self._editor_placeholder = self.editor
+                    self._editor_stack.addWidget(self.editor)
+                    
+                    # Create preview view
+                    self._preview_view = QWebEngineView()
+                    self._editor_stack.addWidget(self._preview_view)
+                    
+                    # Find the central widget and replace editor with stack
+                    # For now, we'll just use a simpler approach - overlay
+                    self._preview_overlay = QWidget()
+                    self._preview_overlay.setStyleSheet("background: #1e1e1e;")
+                    overlay_layout = QVBoxLayout(self._preview_overlay)
+                    overlay_layout.setContentsMargins(0, 0, 0, 0)
+                    overlay_layout.addWidget(self._preview_view)
+            
+            # Render markdown
+            self._render_preview()
+            self._preview_overlay.setVisible(True)
+            self.editor.setVisible(False)
+        else:
+            # Switch back to edit mode
+            if hasattr(self, '_preview_overlay'):
+                self._preview_overlay.setVisible(False)
+            self.editor.setVisible(True)
+    
+    def _render_preview(self):
+        """Render current editor content as HTML"""
+        import markdown
+        
+        text = self.editor.toPlainText()
+        
+        # Convert markdown to HTML
+        html = markdown.markdown(text, extensions=['extra', 'codehilite'])
+        
+        # Add styling
+        styled_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <style>
+                body {{
+                    background-color: #1e1e1e;
+                    color: #ffffff;
+                    font-family: 'Segoe UI', sans-serif;
+                    font-size: 14px;
+                    line-height: 1.6;
+                    padding: 20px;
+                    margin: 0;
+                }}
+                h1, h2, h3 {{ color: #0078d7; margin-top: 20px; }}
+                code {{
+                    background: #2d2d2d;
+                    padding: 2px 6px;
+                    border-radius: 3px;
+                    font-family: Consolas, monospace;
+                }}
+                pre {{
+                    background: #2d2d2d;
+                    padding: 10px;
+                    border-radius: 5px;
+                    overflow-x: auto;
+                }}
+                blockquote {{
+                    border-left: 4px solid #0078d7;
+                    margin: 0;
+                    padding-left: 16px;
+                    color: #aaa;
+                }}
+                a {{ color: #4da6ff; }}
+                ul, ol {{ padding-left: 24px; }}
+                li {{ margin: 4px 0; }}
+                hr {{ border: none; border-top: 1px solid #333; }}
+                table {{ border-collapse: collapse; width: 100%; }}
+                th, td {{ border: 1px solid #333; padding: 8px; }}
+            </style>
+        </head>
+        <body>{html}</body>
+        </html>
+        """
+        
+        self._preview_view.setHtml(styled_html)
 
     def _autocorrect_terms(self):
         """Check if the last typed word matches a Term phrase; expand if so.
@@ -5575,6 +5821,68 @@ class WhisperEditor(QWidget):
 
     def _fmt_tasklist(self):
         self._fmt_lines(lambda i, ln: "- [ ] " + ln)
+
+    def _insert_table(self):
+        """Show dialog to insert a markdown table"""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QPushButton
+        
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Insert Table")
+        dlg.setModal(True)
+        layout = QVBoxLayout(dlg)
+        
+        # Rows
+        row_layout = QHBoxLayout()
+        row_layout.addWidget(QLabel("Rows:"))
+        rows_spin = QSpinBox()
+        rows_spin.setRange(1, 20)
+        rows_spin.setValue(3)
+        row_layout.addWidget(rows_spin)
+        layout.addLayout(row_layout)
+        
+        # Columns
+        col_layout = QHBoxLayout()
+        col_layout.addWidget(QLabel("Columns:"))
+        cols_spin = QSpinBox()
+        cols_spin.setRange(1, 10)
+        cols_spin.setValue(3)
+        col_layout.addWidget(cols_spin)
+        layout.addLayout(col_layout)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        insert_btn = QPushButton("Insert")
+        insert_btn.setDefault(True)
+        
+        def do_insert():
+            rows = rows_spin.value()
+            cols = cols_spin.value()
+            
+            # Generate markdown table
+            # Header row
+            header = "| " + " | ".join(["Header"] * cols) + " |"
+            # Divider row
+            divider = "| " + " | ".join(["---"] * cols) + " |"
+            # Data rows
+            data_rows = []
+            for _ in range(rows):
+                data_rows.append("| " + " | ".join([""] * cols) + " |")
+            
+            table_text = "\n".join([header, divider] + data_rows)
+            
+            # Insert at cursor
+            cursor = self.editor.textCursor()
+            cursor.insertText("\n" + table_text + "\n")
+            dlg.accept()
+        
+        insert_btn.clicked.connect(do_insert)
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addWidget(insert_btn)
+        layout.addLayout(btn_layout)
+        
+        dlg.exec()
 
     # ── Clipboard monitor (delegated to WhisperRApp for persistence) ────────
 
@@ -6657,6 +6965,38 @@ class WhisperEditor(QWidget):
                 f"Snapshot {idx+1}/{len(history)}  •  {w} words  •  {c} chars  •  {ts}")
 
         tree.itemSelectionChanged.connect(_on_selection)
+        
+        # Add diff stats label
+        diff_lbl = QLabel("")
+        diff_lbl.setStyleSheet("color:#888;font-size:10pt;padding:4px;")
+        lay.addWidget(diff_lbl)
+        
+        def _update_diff():
+            items = tree.selectedItems()
+            if items:
+                idx = items[0].data(0, _Qt.ItemDataRole.UserRole)
+                if idx is not None:
+                    old_text = history[idx].get("text", "")
+                    new_text = self.editor.toPlainText()
+                    # Use diff_engine if available
+                    if _diff_engine_available and compute_word_diff:
+                        diff_result = compute_word_diff(old_text, new_text)
+                        added = sum(1 for d in diff_result if d.get("type") == "added")
+                        removed = sum(1 for d in diff_result if d.get("type") == "removed")
+                        diff_lbl.setText(f"📊 Compared to current: +{added} words, -{removed} words (via diff_engine)")
+                    else:
+                        # Fallback to simple word set diff
+                        old_words = set(old_text.split())
+                        new_words = set(new_text.split())
+                        added = len(new_words - old_words)
+                        removed = len(old_words - new_words)
+                        diff_lbl.setText(f"📊 Compared to current: +{added} words, -{removed} words")
+                else:
+                    diff_lbl.setText("")
+            else:
+                diff_lbl.setText("")
+        
+        tree.itemSelectionChanged.connect(_update_diff)
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
@@ -6701,13 +7041,20 @@ class WhisperEditor(QWidget):
         _ss = ("QPushButton{background:#2a2a2a;border:1px solid #555;color:#ddd;"
                "padding:3px 8px;border-radius:3px;}"
                "QPushButton:hover{background:#353535;border-color:#0078d7;}")
-        _btn_find = QPushButton("▶ Find"); _btn_find.setStyleSheet(_ss)
-        _btn_repl = QPushButton("Replace"); _btn_repl.setStyleSheet(_ss)
-        _btn_all  = QPushButton("Replace All"); _btn_all.setStyleSheet(_ss)
+        _btn_find = QPushButton("▶ Find")
+        _btn_find.setStyleSheet(_ss)
+        _btn_find.setToolTip("Find next occurrence (F3)")
+        _btn_repl = QPushButton("Replace")
+        _btn_repl.setStyleSheet(_ss)
+        _btn_repl.setToolTip("Replace current occurrence")
+        _btn_all  = QPushButton("Replace All")
+        _btn_all.setStyleSheet(_ss)
+        _btn_all.setToolTip("Replace all occurrences in document")
         _lbl_count = QLabel(""); _lbl_count.setStyleSheet("color:#aaa;font-size:9pt;")
         _btn_re   = QCheckBox(".*"); _btn_re.setToolTip("Use regular expressions")
         _btn_re.setStyleSheet("QCheckBox{color:#aaa;}")
         _btn_close = QPushButton("✕"); _btn_close.setFixedSize(22,22); _btn_close.setStyleSheet(_ss)
+        _btn_close.setToolTip("Close Find/Replace bar (Esc)")
         for w in (_btn_find, _btn_repl, _btn_all, _lbl_count, _btn_re, _btn_close):
             h.addWidget(w)
         h.addStretch()
@@ -6861,6 +7208,10 @@ class WhisperEditor(QWidget):
                 try: Path(old).unlink()
                 except Exception: pass
             app_logger.info(f"Auto-backup saved: {backup_path.name}")
+            # Show brief save indicator in scratchpad (auto-save feedback)
+            from datetime import datetime as _dt_now
+            ts_short = _dt_now.strftime("%H:%M:%S")
+            self.scratchpad.append(f"💾 Auto-saved at {ts_short}")
         except Exception as e:
             app_logger.warning(f"Auto-backup failed: {e}")
 
@@ -7319,6 +7670,9 @@ class WhisperRApp(QMainWindow):
         app_logger.info(f"Base directory: {BASE_DIR}")
         app_logger.info(f"Frozen: {getattr(sys, 'frozen', False)}")
         
+        # Initialize keyboard shortcuts list
+        self._hotkeys_active = []
+        
         try:
             app_logger.debug("Initializing configuration...")
             self.config = AppConfig()
@@ -7724,11 +8078,18 @@ class WhisperRApp(QMainWindow):
             "color: #888888; font-size: 13px; font-weight: bold; "
             "background: #1e1e1e; border-radius: 4px; padding: 2px 8px;"
         )
+        self.app_state_label.setToolTip(
+            "Current status: Idle (grey) / Recording (red) / Transcribing (blue)\n"
+            "Shows the current state of the dictation system")
         l1.addWidget(self.app_state_label)
 
         hb = QHBoxLayout()
         self.btn_toggle = QPushButton("Start Dictation")
         self.btn_toggle.setFixedHeight(40)
+        self.btn_toggle.setToolTip(
+            "Start or stop voice recording\n"
+            "Keyboard shortcut: Ctrl+Alt+Z\n"
+            "Mode: Dictation / Push-to-Talk / Auto-Pause")
         self.btn_toggle.clicked.connect(self.toggle_rec)
         hb.addWidget(self.btn_toggle)
         l1.addLayout(hb)
@@ -7745,6 +8106,25 @@ class WhisperRApp(QMainWindow):
             "color:#88cc88;padding:4px;border-radius:4px;}"
             "QPushButton:hover{background:#2d6a2d;color:#fff;border-color:#4caf50;}")
         l1.addWidget(self.btn_editor)
+        
+        # Add Settings button with tooltip
+        self.btn_settings = QPushButton("⚙️ Settings")
+        self.btn_settings.setFixedHeight(36)
+        self.btn_settings.setToolTip(
+            "Open settings and configuration\n"
+            "Configure model, language, hotkeys, audio input, and more\n"
+            "Keyboard: Ctrl+,")
+        self.btn_settings.clicked.connect(self._show_settings)
+        # Add keyboard shortcut for Settings
+        from PyQt6.QtGui import QShortcut, QKeySequence
+        settings_sc = QShortcut(QKeySequence("Ctrl+,"), self)
+        settings_sc.activated.connect(self._show_settings)
+        self._hotkeys_active.append(settings_sc)
+        self.btn_settings.setStyleSheet(
+            "QPushButton{background:#1e1e1e;border:1px solid #444;"
+            "color:#ddd;padding:4px;border-radius:4px;}"
+            "QPushButton:hover{background:#333;color:#fff;}")
+        l1.addWidget(self.btn_settings)
         
         self.tabs.addTab(t1, "Main")
         
@@ -7766,10 +8146,18 @@ class WhisperRApp(QMainWindow):
         lp.addWidget(_sp_help)
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setText(self.config.settings["initial_prompt"])
+        self.prompt_edit.setToolTip(
+            "Guiding context sent before each transcription.\n"
+            "Mention speaker names, technical terms, accents, etc.\n"
+            "Helps Whisper produce more accurate transcriptions.")
         lp.addWidget(self.prompt_edit, 3)   # stretch=3 → ~60%
         hbp = QHBoxLayout()
-        bi = QPushButton("Import .txt"); bi.clicked.connect(self.import_p)
-        be = QPushButton("Export .txt"); be.clicked.connect(self.export_p)
+        bi = QPushButton("Import .txt")
+        bi.setToolTip("Import steering prompt from a .txt file")
+        bi.clicked.connect(self.import_p)
+        be = QPushButton("Export .txt")
+        be.setToolTip("Export current steering prompt to a .txt file")
+        be.clicked.connect(self.export_p)
         hbp.addWidget(bi); hbp.addWidget(be); hbp.addStretch()
         lp.addLayout(hbp)
 
@@ -7785,12 +8173,17 @@ class WhisperRApp(QMainWindow):
         lp.addWidget(_hw_help)
         self.hotwords_edit = QPlainTextEdit()
         self.hotwords_edit.setPlaceholderText("e.g.\nWhisperR\nHexagon Software")
+        self.hotwords_edit.setToolTip(
+            "Words that should always be transcribed exactly as written.\n"
+            "One word/phrase per line. Case-insensitive.")
         self.hotwords_edit.setPlainText(
             "\n".join(self.config.settings.get("hotwords", [])))
         lp.addWidget(self.hotwords_edit, 2)   # stretch=2 → ~40%
         hbhw = QHBoxLayout()
         bi_hw = QPushButton("Import .txt")
+        bi_hw.setToolTip("Import hotwords from a .txt file (one per line)")
         be_hw = QPushButton("Export .txt")
+        be_hw.setToolTip("Export current hotwords to a .txt file")
         bi_hw.clicked.connect(self._import_hotwords)
         be_hw.clicked.connect(self._export_hotwords)
         hbhw.addWidget(bi_hw); hbhw.addWidget(be_hw); hbhw.addStretch()
@@ -7991,6 +8384,7 @@ class WhisperRApp(QMainWindow):
         ft_mon_layout.addRow("Watch folder:", ft_mon_row)
         self.ft_mon_enabled = QCheckBox("Enable folder monitoring (new audio files auto-added to queue)")
         self.ft_mon_enabled.setChecked(self.config.settings.get("ft_mon_enabled", False))
+        self.ft_mon_enabled.setToolTip("When enabled, WhisperR will automatically detect and add new audio files from the watch folder to the transcription queue.")
         self.ft_mon_enabled.toggled.connect(self._ft_mon_toggled)
         ft_mon_layout.addRow(self.ft_mon_enabled)
         ft_mon_group.setLayout(ft_mon_layout)
@@ -8364,7 +8758,8 @@ class WhisperRApp(QMainWindow):
         self.btn_hk2.setToolTip(
             "Hold this key/combo to record (Push-To-Talk).\n"
             "Works regardless of Dictation Mode. Keys are suppressed\n"
-            "while held so they don't reach other apps."
+            "while held so they don't reach other apps.\n"
+            "Tip: Use a thumb key for comfortable long-press."
         )
         hotkey_layout.addRow("Push-to-Talk:", _hk_row(self.btn_hk2,
             lambda: self.btn_hk2.setText("")))
@@ -8399,15 +8794,19 @@ class WhisperRApp(QMainWindow):
         _aot_indent_ss = "QCheckBox{margin-left:20px;}"
         self.cfg_aot_main = QCheckBox("Main window")
         self.cfg_aot_main.setChecked(self.config.settings.get("aot_main", False))
+        self.cfg_aot_main.setToolTip("Keep the main transcription window always on top of other applications.")
         self.cfg_aot_main.setStyleSheet(_aot_indent_ss)
         self.cfg_aot_editor = QCheckBox("Text Editor")
         self.cfg_aot_editor.setChecked(self.config.settings.get("aot_editor", False))
+        self.cfg_aot_editor.setToolTip("Keep the text editor window always on top of other applications.")
         self.cfg_aot_editor.setStyleSheet(_aot_indent_ss)
         self.cfg_aot_notes = QCheckBox("Notes panel")
         self.cfg_aot_notes.setChecked(self.config.settings.get("aot_notes", False))
+        self.cfg_aot_notes.setToolTip("Keep the notes panel always on top of other applications.")
         self.cfg_aot_notes.setStyleSheet(_aot_indent_ss)
         self.cfg_aot_cheatsheet = QCheckBox("Cheatsheet panel")
         self.cfg_aot_cheatsheet.setChecked(self.config.settings.get("aot_cheatsheet", False))
+        self.cfg_aot_cheatsheet.setToolTip("Keep the cheatsheet panel always on top of other applications.")
         self.cfg_aot_cheatsheet.setStyleSheet(_aot_indent_ss)
         for _aw in (self.cfg_aot_main, self.cfg_aot_editor,
                     self.cfg_aot_notes, self.cfg_aot_cheatsheet):
@@ -8420,6 +8819,24 @@ class WhisperRApp(QMainWindow):
         self.cfg_aot_master.toggled.connect(_aot_master_changed)
         aot_group.setLayout(aot_layout)
         main_layout.addWidget(aot_group)
+
+        # --- Appearance / Theme ---
+        appearance_group = QGroupBox("Appearance")
+        appearance_layout = QFormLayout()
+
+        self.cfg_theme = QComboBox()
+        self.cfg_theme.addItems(["Dark", "True Black (OLED)", "Light"])
+        current_theme = self.config.settings.get("theme", "dark")
+        theme_map = {"dark": "Dark", "dark_true_black": "True Black (OLED)", "light": "Light"}
+        self.cfg_theme.setCurrentText(theme_map.get(current_theme, "Dark"))
+        self.cfg_theme.setToolTip(
+            "Dark: Standard dark theme with #121212 background\n"
+            "True Black: Pure #000000 - ideal for OLED screens, saves battery\n"
+            "Light: Classic light theme for daytime use\n"
+            "(Restart may be required for all changes to take effect)")
+        appearance_layout.addRow("Theme:", self.cfg_theme)
+        appearance_group.setLayout(appearance_layout)
+        main_layout.addWidget(appearance_group)
 
         # --- Visual Indicators ---
         visual_group = QGroupBox("Visual Indicators")
@@ -8448,12 +8865,17 @@ class WhisperRApp(QMainWindow):
 
         self.cfg_ind_sz = SpinWidget(min_v=8, max_v=128, step=2,
                                value=self.config.settings.get("ind_size", 32))
-        self.cfg_ind_sz.setToolTip("Size of the dot indicator in pixels.")
+        self.cfg_ind_sz.setToolTip(
+            "Size of the dot indicator in pixels.\n"
+            "Larger = more visible but more intrusive.\n"
+            "Recommended: 24-48px for normal use.")
         visual_layout.addRow("Dot Size (px):", self.cfg_ind_sz)
 
         self.cfg_ind_off = SpinWidget(min_v=0, max_v=200, step=2,
                                value=self.config.settings.get("ind_off", 20))
-        self.cfg_ind_off.setToolTip("Pixel offset from the screen edge.")
+        self.cfg_ind_off.setToolTip(
+            "Pixel offset from the screen edge.\n"
+            "Higher values move the indicator further from the corner.")
         visual_layout.addRow("Dot Offset (px):", self.cfg_ind_off)
 
         self.cfg_bar_thickness = SpinWidget(min_v=1, max_v=30, step=1,
@@ -8497,9 +8919,8 @@ class WhisperRApp(QMainWindow):
         self.cfg_tray = QCheckBox("Minimize to system tray")
         self.cfg_tray.setChecked(self.config.settings["min_to_tray"])
         self.cfg_tray.setToolTip(
-            "Closing the window hides to tray instead of quitting.\n"
-            "Right-click the tray icon to quit."
-        )
+            "When closing the window, minimize to system tray instead of exiting.\n"
+            "Click the tray icon to restore the window.")
         storage_layout.addRow(self.cfg_tray)
 
         storage_group.setLayout(storage_layout)
@@ -8520,8 +8941,10 @@ class WhisperRApp(QMainWindow):
         self.cfg_backup_interval.setRange(1, 120)
         self.cfg_backup_interval.setSuffix(" min")
         self.cfg_backup_interval.setValue(
-            int(self.config.settings.get("auto_backup_interval", 10)))
-        self.cfg_backup_interval.setToolTip("How often to take a backup snapshot.")
+            self.config.settings.get("auto_backup_interval", 10))
+        self.cfg_backup_interval.setToolTip(
+            "How often (in minutes) to take a backup snapshot while editing.\n"
+            "Requires 'Enable auto-backup' to be checked.")
         backup_layout.addRow("Backup every:", self.cfg_backup_interval)
         self.cfg_backup_keep = _SB2()
         self.cfg_backup_keep.setRange(1, 100)
@@ -8840,10 +9263,14 @@ class WhisperRApp(QMainWindow):
 
         self.btn_setup = QPushButton("GPU Acceleration Setup Guide")
         self.btn_setup.setStyleSheet("background-color: #27ae60; color: white;")
+        self.btn_setup.setToolTip(
+            "Open the GPU setup guide to configure CUDA for faster transcription.\n"
+            "Requires NVIDIA GPU with CUDA drivers installed.")
         self.btn_setup.clicked.connect(self.setup_deps)
         advanced_layout.addRow(self.btn_setup)
 
         btn_open_log = QPushButton("Open Log File")
+        btn_open_log.setToolTip("Open the current log file (app_log.txt) in default text editor")
         btn_open_log.clicked.connect(self.open_log_file)
         advanced_layout.addRow(btn_open_log)
 
@@ -9376,6 +9803,10 @@ class WhisperRApp(QMainWindow):
         pass
 
 
+    def _show_settings(self):
+        """Switch to the Settings tab."""
+        self.tabs.setCurrentIndex(6)  # Settings tab is at index 6
+
     def _on_settings_tab_changed(self, idx):
         """Flush pending auto-save only when leaving a live-edit tab.
         Tab indices: 0=Main, 1=Transcription Steering, 2=Terms,
@@ -9532,7 +9963,7 @@ class WhisperRApp(QMainWindow):
                       "auto_backup_keep", "cb_source_tag",
                       "min_to_tray", "auto_space",
                       "always_on_top", "aot_main", "aot_editor",
-                      "aot_notes", "aot_cheatsheet",
+                      "aot_notes", "aot_cheatsheet", "theme",
                       "ind_show", "ind_type", "ind_pos", "ind_size",
                       "noise_floor", "speech_vol")
         }
@@ -9582,6 +10013,7 @@ class WhisperRApp(QMainWindow):
             "aot_editor": self.cfg_aot_editor.isChecked(),
             "aot_notes": self.cfg_aot_notes.isChecked(),
             "aot_cheatsheet": self.cfg_aot_cheatsheet.isChecked(),
+            "theme": self.cfg_theme.currentText(),
             "auto_backup_enabled":  self.cfg_backup_enabled.isChecked(),
             "auto_backup_interval": self.cfg_backup_interval.value(),
             "auto_backup_keep":     self.cfg_backup_keep.value(),
@@ -9776,6 +10208,10 @@ class WhisperRApp(QMainWindow):
             except Exception:
                 pass
             self.btn_toggle.setText("Start Dictation")
+            self.btn_toggle.setToolTip(
+                "Start voice recording\n"
+                "Keyboard: Ctrl+Alt+Z\n"
+                "Mode: " + self.config.settings.get("dict_mode", "Auto-Pause"))
             self._is_listening  = False
             self._speech_active = False
             self._update_app_state()
@@ -9840,6 +10276,9 @@ class WhisperRApp(QMainWindow):
             app_logger.debug("toggle_rec: AudioRecorder thread started")
             
             self.btn_toggle.setText("⏹ STOP DICTATION")
+            self.btn_toggle.setToolTip(
+                "Stop voice recording and transcribe\n"
+                "Keyboard: Ctrl+Alt+Z")
             self._is_listening = True
             self._update_app_state()
             app_logger.info("Dictation started")
