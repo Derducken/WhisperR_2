@@ -1,6 +1,6 @@
 # WhisperR Upgrade Plan
 
-> Last updated: 2026-05-05
+> Last updated: 2026-05-06
 > Version: 2.1.0 → 2.2.0
 
 ## Overview
@@ -21,6 +21,18 @@
 - ✅ Phase 1.5: Utility modules (logging_utils.py, file_utils.py)
 - ✅ Phase 1.6: Theme system (3 themes + style generator)
 - ✅ Integration: Enhanced crash_logger (collects OS, RAM, PyQt version info)
+- ✅ Task 2.1: Comprehensive Tooltips (all major UI elements)
+- ✅ Task 2.2: Auto-Save Indicator (shows timestamped "💾 Auto-saved at HH:MM:SS")
+- ✅ Task 2.3: Enhanced Keyboard Cheat Sheet (searchable)
+- ✅ Task 2.4: Theme System (Dark/True Black/Light selector)
+- ✅ Task 3.1: Write/Preview Toggle (Markdown rendering)
+- ✅ Task 3.2: Word-Level Diff (integrated diff_engine)
+- ✅ Task 3.3: Table Support (insert table dialog)
+- ✅ NEW: Ctrl+, for Settings
+- ✅ NEW: Ctrl+Shift+P for Markdown Preview
+- ✅ NEW: Ctrl+Shift+N for Notes panel
+- ✅ NEW: Ctrl+Shift+G for Cheatsheet panel
+- ✅ NEW: Ctrl+F for Find in scratchpad
 
 ### Files Created:
 - `core/config.py` - AppConfig class (standalone, for future integration)
@@ -85,6 +97,8 @@
 | 23 | Markdown Preview keyboard shortcut (Ctrl+Shift+P) | ✅ |
 | 24 | Notes panel keyboard shortcut (Ctrl+Shift+N) | ✅ |
 | 25 | Cheatsheet panel keyboard shortcut (Ctrl+Shift+G) | ✅ |
+| 26 | Find in scratchpad (Ctrl+F) | ✅ |
+| 27 | Shutdown performance fixed | ✅ |
 
 ### Modular Files Created (18 files):
 - `core/config.py` - AppConfig class
@@ -320,7 +334,7 @@ The app now has:
 > Goal: Features users actually see and use
 > Status: 🚧 IN PROGRESS (Most features completed!)
 
-### Task 2.1: Comprehensive Tooltips
+### Task 2.1: Comprehensive Tooltips ✅ COMPLETED
 
 **Description:** Add descriptive tooltips to every UI element
 

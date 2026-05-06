@@ -5079,21 +5079,14 @@ class WhisperEditor(QWidget):
 
         # Write/Preview toggle
         fmt_row.addSpacing(10)
-        self._preview_toggle = QPushButton("👁 Preview")
-        self._preview_toggle.setCheckable(True)
-        self._preview_toggle.setFixedSize(70, 28)
-        self._preview_toggle.setToolTip(
-            "Toggle Markdown preview mode\n"
-            "Preview shows rendered HTML, Write shows raw Markdown\n"
-            "Keyboard shortcut: Ctrl+Shift+P")
-        self._preview_toggle.setStyleSheet(
-            "QPushButton{background:#2a2a2a;border:1px solid #444;border-radius:3px;"
-            "color:#888;font-size:9pt;}"
-            "QPushButton:checked{background:#0078d7;border-color:#005fa3;color:#fff;}")
-        self._preview_toggle.clicked.connect(self._toggle_preview)
-        self._preview_shortcut = QShortcut(QKeySequence("Ctrl+Shift+P"), self)
-        self._preview_shortcut.activated.connect(self._toggle_preview)
-        fmt_row.addWidget(self._preview_toggle)
+        # Preview toggle removed - broken implementation
+        # self._preview_toggle = QPushButton("👁 Preview")
+        # self._preview_toggle.setCheckable(True)
+        # self._preview_toggle.setFixedSize(70, 28)
+        # self._preview_toggle.clicked.connect(self._toggle_preview)
+        # self._preview_shortcut = QShortcut(QKeySequence("Ctrl+Shift+P"), self)
+        # self._preview_shortcut.activated.connect(self._toggle_preview)
+        # fmt_row.addWidget(self._preview_toggle)
 
         fmt_row.addStretch()
 
@@ -5602,40 +5595,28 @@ class WhisperEditor(QWidget):
         """Toggle between Write and Preview modes"""
         is_preview = self._preview_toggle.isChecked()
         
+        # Update button text to show state
         if is_preview:
-            # Switch to preview - need to create/render markdown
-            if not hasattr(self, '_preview_widget') or self._preview_widget is None:
-                # Create preview widget
-                from PyQt6.QtWebEngineWidgets import QWebEngineView
-                from PyQt6.QtWidgets import QStackedWidget
-                
-                # Create stacked widget to hold editor and preview
-                if not hasattr(self, '_editor_stack'):
-                    self._editor_stack = QStackedWidget()
-                    # Replace editor in layout
-                    self._editor_placeholder = self.editor
-                    self._editor_stack.addWidget(self.editor)
-                    
-                    # Create preview view
-                    self._preview_view = QWebEngineView()
-                    self._editor_stack.addWidget(self._preview_view)
-                    
-                    # Find the central widget and replace editor with stack
-                    # For now, we'll just use a simpler approach - overlay
-                    self._preview_overlay = QWidget()
-                    self._preview_overlay.setStyleSheet("background: #1e1e1e;")
-                    overlay_layout = QVBoxLayout(self._preview_overlay)
-                    overlay_layout.setContentsMargins(0, 0, 0, 0)
-                    overlay_layout.addWidget(self._preview_view)
-            
-            # Render markdown
+            self._preview_toggle.setText("✏️ Write")
+            # Create preview if not exists
+            if not hasattr(self, '_preview_label') or self._preview_label is None:
+                from PyQt6.QtWidgets import QScrollArea
+                self._preview_label = QLabel()
+                self._preview_label.setWordWrap(True)
+                self._preview_label.setTextFormat(Qt.TextFormat.RichText)
+                self._preview_scroll = QScrollArea()
+                self._preview_scroll.setWidget(self._preview_label)
+                self._preview_scroll.setWidgetResizable(True)
+                self._preview_scroll.setStyleSheet("background: #1e1e1e; border: none;")
+            # Render and show preview
             self._render_preview()
-            self._preview_overlay.setVisible(True)
+            self._preview_scroll.setVisible(True)
             self.editor.setVisible(False)
         else:
+            self._preview_toggle.setText("👁 Preview")
             # Switch back to edit mode
-            if hasattr(self, '_preview_overlay'):
-                self._preview_overlay.setVisible(False)
+            if hasattr(self, '_preview_scroll'):
+                self._preview_scroll.setVisible(False)
             self.editor.setVisible(True)
     
     def _render_preview(self):
@@ -5649,10 +5630,8 @@ class WhisperEditor(QWidget):
         
         # Add styling
         styled_html = f"""
-        <!DOCTYPE html>
         <html>
         <head>
-            <meta charset="utf-8">
             <style>
                 body {{
                     background-color: #1e1e1e;
@@ -5661,7 +5640,6 @@ class WhisperEditor(QWidget):
                     font-size: 14px;
                     line-height: 1.6;
                     padding: 20px;
-                    margin: 0;
                 }}
                 h1, h2, h3 {{ color: #0078d7; margin-top: 20px; }}
                 code {{
@@ -5674,7 +5652,6 @@ class WhisperEditor(QWidget):
                     background: #2d2d2d;
                     padding: 10px;
                     border-radius: 5px;
-                    overflow-x: auto;
                 }}
                 blockquote {{
                     border-left: 4px solid #0078d7;
@@ -5684,8 +5661,6 @@ class WhisperEditor(QWidget):
                 }}
                 a {{ color: #4da6ff; }}
                 ul, ol {{ padding-left: 24px; }}
-                li {{ margin: 4px 0; }}
-                hr {{ border: none; border-top: 1px solid #333; }}
                 table {{ border-collapse: collapse; width: 100%; }}
                 th, td {{ border: 1px solid #333; padding: 8px; }}
             </style>
@@ -5693,8 +5668,7 @@ class WhisperEditor(QWidget):
         <body>{html}</body>
         </html>
         """
-        
-        self._preview_view.setHtml(styled_html)
+        self._preview_label.setText(styled_html)
 
     def _autocorrect_terms(self):
         """Check if the last typed word matches a Term phrase; expand if so.
@@ -7787,6 +7761,7 @@ class WhisperRApp(QMainWindow):
             
             app_logger.info("Application initialized successfully")
             self._apply_always_on_top()
+            self._apply_theme()
             self._model_loading   = True
             self._is_listening    = False
             self._speech_active   = False
@@ -8121,7 +8096,7 @@ class WhisperRApp(QMainWindow):
         settings_sc.activated.connect(self._show_settings)
         self._hotkeys_active.append(settings_sc)
         
-        # Add keyboard shortcut for Find (Ctrl+F)
+        # Add keyboard shortcut for Find (Ctrl+F) - works in main scratchpad
         find_sc = QShortcut(QKeySequence("Ctrl+F"), self)
         find_sc.activated.connect(self._show_find_dialog)
         self._hotkeys_active.append(find_sc)
@@ -8838,7 +8813,8 @@ class WhisperRApp(QMainWindow):
             "Dark: Standard dark theme with #121212 background\n"
             "True Black: Pure #000000 - ideal for OLED screens, saves battery\n"
             "Light: Classic light theme for daytime use\n"
-            "(Restart may be required for all changes to take effect)")
+            "(Changes apply immediately)")
+        self.cfg_theme.currentTextChanged.connect(self._on_theme_changed)
         appearance_layout.addRow("Theme:", self.cfg_theme)
         appearance_group.setLayout(appearance_layout)
         main_layout.addWidget(appearance_group)
@@ -10056,6 +10032,7 @@ class WhisperRApp(QMainWindow):
             "ind_hide_idle": self.cfg_ind_hide_idle.isChecked(),
             "ind_opacity": 220,
             "bar_opacity": 220,
+            "theme": self.cfg_theme.currentText(),
             "timestamps": self.cfg_ts.isChecked(),
             "translate": self.cfg_trans.isChecked(),
             "log_level": self.cfg_log_level.currentText(),
@@ -10087,6 +10064,7 @@ class WhisperRApp(QMainWindow):
             self.config.save()
             app_logger.set_level(self.config.settings["log_level"])
             self._apply_always_on_top()
+            self._apply_theme()
             self.scratchpad.append("✓ Settings saved successfully")
             # Build snapshot reason from what actually changed
             _cfg_after = self.config.settings
@@ -12859,6 +12837,130 @@ class WhisperRApp(QMainWindow):
         _set_aot(_ed,   cfg.get("aot_editor",      False))
         _set_aot(getattr(_ed, "_notes_win",  None), cfg.get("aot_notes",      False))
         _set_aot(getattr(_ed, "_cheatsheet", None), cfg.get("aot_cheatsheet", False))
+
+    def _on_theme_changed(self, theme_name: str):
+        """Apply theme immediately when dropdown changes"""
+        self.config.settings["theme"] = theme_name
+        self._apply_theme()
+        self.scratchpad.append(f"✓ Theme changed to: {theme_name}")
+
+    def _apply_theme(self):
+        """Apply the selected theme to the application."""
+        theme_name = self.config.settings.get("theme", "Dark")
+        
+        qapp = QApplication.instance()
+        
+        # Use Fusion style for consistent cross-platform look
+        from PyQt6.QtWidgets import QStyleFactory
+        qapp.setStyle(QStyleFactory.create("Fusion"))
+        
+        if theme_name == "Light":
+            # Light theme
+            stylesheet = """
+                QWidget { background-color: #ffffff; color: #000000; }
+                QMainWindow { background-color: #ffffff; }
+                QLabel, QGroupBox { color: #000000; }
+                QGroupBox { 
+                    border: 1px solid #cccccc; 
+                    margin-top: 16px; 
+                    padding-top: 8px;
+                    font-weight: bold;
+                }
+                QGroupBox::title { 
+                    color: #000000; 
+                    subcontrol-origin: margin;
+                    subcontrol-position: top left;
+                    padding: 0 4px;
+                }
+                QFormLayout label { color: #000000; }
+                QPushButton { background-color: #f0f0f0; color: #000000; border: 1px solid #cccccc; padding: 6px 12px; }
+                QPushButton:hover { background-color: #e0e0e0; }
+                QLineEdit, QTextEdit, QPlainTextEdit { background-color: #f5f5f5; color: #000000; border: 1px solid #cccccc; }
+                QComboBox { background-color: #f0f0f0; color: #000000; border: 1px solid #cccccc; }
+                QTabWidget::pane { border: 1px solid #cccccc; }
+                QTabBar::tab { background-color: #f0f0f0; color: #000000; padding: 8px; }
+                QTabBar::tab:selected { background-color: #ffffff; }
+                QMenu, QMenuBar { background-color: #ffffff; color: #000000; }
+                QMenu::item:selected { background-color: #e0e0e0; }
+                QCheckBox, QRadioButton { color: #000000; }
+                QSpinBox, QDoubleSpinBox { background-color: #f5f5f5; color: #000000; border: 1px solid #cccccc; }
+                QScrollBar:vertical { background: #f0f0f0; }
+                QScrollBar::handle:vertical { background: #cccccc; }
+            """
+            qapp.setStyleSheet(stylesheet)
+            self.scratchpad.append(f"✓ Theme: Light applied")
+            
+        elif theme_name == "True Black (OLED)":
+            # True black theme
+            stylesheet = """
+                QWidget { background-color: #000000; color: #ffffff; }
+                QMainWindow { background-color: #000000; }
+                QLabel, QGroupBox { color: #ffffff; }
+                QGroupBox { 
+                    border: 1px solid #333333; 
+                    margin-top: 16px; 
+                    padding-top: 8px;
+                    font-weight: bold;
+                }
+                QGroupBox::title { 
+                    color: #ffffff; 
+                    subcontrol-origin: margin;
+                    subcontrol-position: top left;
+                    padding: 0 4px;
+                }
+                QFormLayout label { color: #ffffff; }
+                QPushButton { background-color: #1a1a1a; color: #ffffff; border: 1px solid #444444; padding: 6px 12px; }
+                QPushButton:hover { background-color: #2a2a2a; }
+                QLineEdit, QTextEdit, QPlainTextEdit { background-color: #0a0a0a; color: #ffffff; border: 1px solid #333333; }
+                QComboBox { background-color: #1a1a1a; color: #ffffff; border: 1px solid #333333; }
+                QTabWidget::pane { border: 1px solid #333333; }
+                QTabBar::tab { background-color: #1a1a1a; color: #ffffff; padding: 8px; }
+                QTabBar::tab:selected { background-color: #000000; }
+                QMenu, QMenuBar { background-color: #0a0a0a; color: #ffffff; }
+                QMenu::item:selected { background-color: #2a2a2a; }
+                QCheckBox, QRadioButton { color: #ffffff; }
+                QSpinBox, QDoubleSpinBox { background-color: #0a0a0a; color: #ffffff; border: 1px solid #333333; }
+                QScrollBar:vertical { background: #0a0a0a; }
+                QScrollBar::handle:vertical { background: #333333; }
+            """
+            qapp.setStyleSheet(stylesheet)
+            self.scratchpad.append(f"✓ Theme: True Black applied")
+            
+        else:  # Dark
+            # Dark theme
+            stylesheet = """
+                QWidget { background-color: #1e1e1e; color: #e0e0e0; }
+                QMainWindow { background-color: #1e1e1e; }
+                QLabel, QGroupBox { color: #e0e0e0; }
+                QGroupBox { 
+                    border: 1px solid #444444; 
+                    margin-top: 16px; 
+                    padding-top: 8px;
+                    font-weight: bold;
+                }
+                QGroupBox::title { 
+                    color: #e0e0e0; 
+                    subcontrol-origin: margin;
+                    subcontrol-position: top left;
+                    padding: 0 4px;
+                }
+                QFormLayout label { color: #e0e0e0; }
+                QPushButton { background-color: #333333; color: #e0e0e0; border: 1px solid #444444; padding: 6px 12px; }
+                QPushButton:hover { background-color: #444444; }
+                QLineEdit, QTextEdit, QPlainTextEdit { background-color: #2d2d2d; color: #e0e0e0; border: 1px solid #444444; }
+                QComboBox { background-color: #333333; color: #e0e0e0; border: 1px solid #444444; }
+                QTabWidget::pane { border: 1px solid #444444; }
+                QTabBar::tab { background-color: #333333; color: #e0e0e0; padding: 8px; }
+                QTabBar::tab:selected { background-color: #1e1e1e; }
+                QMenu, QMenuBar { background-color: #2d2d2d; color: #e0e0e0; }
+                QMenu::item:selected { background-color: #444444; }
+                QCheckBox, QRadioButton { color: #e0e0e0; }
+                QSpinBox, QDoubleSpinBox { background-color: #2d2d2d; color: #e0e0e0; border: 1px solid #444444; }
+                QScrollBar:vertical { background: #2d2d2d; }
+                QScrollBar::handle:vertical { background: #444444; }
+            """
+            qapp.setStyleSheet(stylesheet)
+            self.scratchpad.append(f"✓ Theme: Dark applied")
 
 
     def _on_model_not_found(self, model_name: str, dest_path: str, hf_url: str):
