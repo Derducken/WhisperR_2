@@ -3676,21 +3676,21 @@ class _MdHighlighter(QSyntaxHighlighter):
         # Headings — separate rule per level so each gets its own font size
         _default_pt = 14
         _rule(_re_md.compile(r'^#\s.*$', _re_md.MULTILINE),
-              _fmt('#7ec8e3', bold=True, size_pt=_default_pt * 1.5))
+              _fmt('#4c96b1', bold=True, size_pt=_default_pt * 1.5))
         _rule(_re_md.compile(r'^#{2}\s.*$', _re_md.MULTILINE),
-              _fmt('#7ec8e3', bold=True, size_pt=_default_pt * 1.4))
+              _fmt('#4c96b1', bold=True, size_pt=_default_pt * 1.4))
         _rule(_re_md.compile(r'^#{3}\s.*$', _re_md.MULTILINE),
-              _fmt('#7ec8e3', bold=True, size_pt=_default_pt * 1.3))
+              _fmt('#4c96b1', bold=True, size_pt=_default_pt * 1.3))
         _rule(_re_md.compile(r'^#{4}\s.*$', _re_md.MULTILINE),
-              _fmt('#7ec8e3', bold=True, size_pt=_default_pt * 1.2))
+              _fmt('#4c96b1', bold=True, size_pt=_default_pt * 1.2))
         _rule(_re_md.compile(r'^#{5}\s.*$', _re_md.MULTILINE),
-              _fmt('#7ec8e3', bold=True, size_pt=_default_pt * 1.1))
+              _fmt('#4c96b1', bold=True, size_pt=_default_pt * 1.1))
         _rule(_re_md.compile(r'^#{6}\s.*$', _re_md.MULTILINE),
-              _fmt('#7ec8e3', bold=True))
+              _fmt('#4c96b1', bold=True))
         # Bold **...**
-        _rule(_re_md.compile(r'\*\*[^*]+\*\*'), _fmt('#f9c97c', bold=True))
+        _rule(_re_md.compile(r'\*\*[^*]+\*\*'), _fmt('#c7974a', bold=True))
         # Italic *...*
-        _rule(_re_md.compile(r'(?<!\*)\*[^*]+\*(?!\*)'), _fmt('#c3e88d', italic=True))
+        _rule(_re_md.compile(r'(?<!\*)\*[^*]+\*(?!\*)'), _fmt('#91b65b', italic=True))
         # Inline code `...` with dark blue background
         _rule(_re_md.compile(r'`[^`]+`'), _fmt('#ff9580', bg_color='#141446'))
         # Strikethrough ~~text~~ — red + crossed out
@@ -3698,7 +3698,7 @@ class _MdHighlighter(QSyntaxHighlighter):
         # Horizontal rule / bullets
         _rule(_re_md.compile(r'^[-*+]\s', _re_md.MULTILINE), _fmt('#888'))
         # Markdown links [text](url) — entire span in bold light-blue
-        _rule(_re_md.compile(r'\[[^\]]*\]\([^)]*\)'), _fmt('#5bc8f5', bold=True))
+        _rule(_re_md.compile(r'\[[^\]]*\]\([^)]*\)'), _fmt('#2996c3', bold=True))
         # Highlight ==text==
         _rule(_re_md.compile(r'==[^=]+=={0,2}'), _fmt('#f9e94e'))
 
@@ -4036,7 +4036,7 @@ class _NotesWindow(QWidget):
         _app = QApplication.instance()
         _main = next((w for w in _app.topLevelWidgets()
                       if w.__class__.__name__ == "WhisperRApp"), None)
-        _t = _main.themes[_main.current_theme] if _main and hasattr(_main, 'themes') else {}
+        _t = _main.themes.get(_main.current_theme, {}) if _main and hasattr(_main, 'themes') else {}
         _btn_bg  = _t.get("button_background", "#2a2a2a")
         _btn_hov = _t.get("button_hover",      "#353535")
         _btn_bdr = _t.get("input_border",      "#444444")
@@ -4359,7 +4359,7 @@ class _NotesWindow(QWidget):
         _app = QApplication.instance()
         _main = next((w for w in _app.topLevelWidgets()
                       if w.__class__.__name__ == "WhisperRApp"), None)
-        _t = _main.themes[_main.current_theme] if _main and hasattr(_main, 'themes') else {}
+        _t = _main.themes.get(_main.current_theme, {}) if _main and hasattr(_main, 'themes') else {}
         _surf = _t.get("surface", "#1e1e1e")
         _bdr  = _t.get("input_border", "#444")
         _txt  = _t.get("text", "#ddd")
@@ -4405,7 +4405,7 @@ class _NotesWindow(QWidget):
         _app = QApplication.instance()
         _main = next((w for w in _app.topLevelWidgets()
                       if w.__class__.__name__ == "WhisperRApp"), None)
-        _t = _main.themes[_main.current_theme] if _main and hasattr(_main, 'themes') else {}
+        _t = _main.themes.get(_main.current_theme, {}) if _main and hasattr(_main, 'themes') else {}
         _btn_bg = _t.get("button_background", "#2a2a2a")
         _btn_hov = _t.get("button_hover", "#353535")
         _btn_bdr = _t.get("input_border", "#444")
@@ -4448,7 +4448,7 @@ class _NotesWindow(QWidget):
         _app = QApplication.instance()
         _main = next((w for w in _app.topLevelWidgets()
                       if w.__class__.__name__ == "WhisperRApp"), None)
-        _t = _main.themes[_main.current_theme] if _main and hasattr(_main, 'themes') else {}
+        _t = _main.themes.get(_main.current_theme, {}) if _main and hasattr(_main, 'themes') else {}
         _surf    = _t.get("surface",           "#1e1e1e")
         _btn_txt = _t.get("text",              "#ddd")
         _btn_bg  = _t.get("button_background", "#2a2a2a")
@@ -4993,7 +4993,7 @@ class WhisperEditor(QWidget):
         _app = QApplication.instance()
         _main = next((w for w in _app.topLevelWidgets()
                      if w.__class__.__name__ == "WhisperRApp"), None)
-        self._t = _main.themes[_main.current_theme] if _main and hasattr(_main, 'themes') else {}
+        self._t = _main.themes.get(_main.current_theme, {}) if _main and hasattr(_main, 'themes') else {}
         return (
             self._t.get("button_background", "#2a2a2a"),
             self._t.get("button_hover",      "#353535"),
@@ -7793,6 +7793,12 @@ class WhisperRApp(QMainWindow):
             app_logger.debug("Initializing configuration...")
             self.config = AppConfig()
             self.recorder = None
+            from themes import THEMES as _THEMES
+            self.themes = _THEMES
+            _raw_t = self.config.settings.get("theme", "dark")
+            _tnorm = {"dark": "dark", "Dark": "dark", "light": "light", "Light": "light",
+                      "dark_true_black": "dark_true_black", "True Black (OLED)": "dark_true_black"}
+            self.current_theme = _tnorm.get(_raw_t, "dark")
 
             # Build UI FIRST so self.scratchpad exists before any worker thread
             # can emit log_msg and try to write to it.
@@ -12989,6 +12995,8 @@ class WhisperRApp(QMainWindow):
     def _apply_theme(self):
         """Apply the selected theme to the application."""
         theme_name = self.config.settings.get("theme", "Dark")
+        _theme_rkey = {"Dark": "dark", "Light": "light", "True Black (OLED)": "dark_true_black"}
+        self.current_theme = _theme_rkey.get(theme_name, "dark")
         
         qapp = QApplication.instance()
         
