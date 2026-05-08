@@ -1453,7 +1453,8 @@ class AppConfig:
             "editor_hk_strike":    "Ctrl+Shift+S", "editor_hk_highlight": "Ctrl+Shift+H",
             "editor_hk_code":      "Ctrl+`",
             "editor_hk_h1":        "Ctrl+1",  "editor_hk_h2":        "Ctrl+2",
-            "editor_hk_h3":        "Ctrl+3",  "editor_hk_emdash":    "Ctrl+Shift+Minus",
+            "editor_hk_h3":        "Ctrl+3",  "editor_hk_h4":        "Ctrl+4",
+            "editor_hk_h5":        "Ctrl+5",  "editor_hk_emdash":    "Ctrl+Shift+Minus",
             "editor_hk_bullet":    "Ctrl+Shift+B", "editor_hk_numlist": "Ctrl+Shift+N",
             "editor_hk_tasklist":  "Ctrl+Shift+T", "editor_hk_kbd":     "Ctrl+Shift+D",
             "editor_hk_tagwrap": "Ctrl+Shift+W",
@@ -3639,16 +3640,23 @@ class _MdHighlighter(QSyntaxHighlighter):
 
     Renders bold, italic, heading markers, and code spans with visible styling
     so the editor gives an Obsidian-style feel without a full render pipeline.
+    Uses block-state tracking (currentBlockState / previousBlockState) for
+    multi-line constructs such as fenced code blocks.
     """
 
     def __init__(self, document):
         super().__init__(document)
         self._rules = []
 
+        # Format for fenced code blocks (triple backticks)
+        self._code_block_fmt = QTextCharFormat()
+        self._code_block_fmt.setBackground(QColor('#141446'))
+        self._code_block_fmt.setForeground(QColor('#a0a0a0'))
+
         def _rule(pattern, fmt):
             self._rules.append((pattern, fmt))
 
-        def _fmt(color=None, bold=False, italic=False, size_pt=None):
+        def _fmt(color=None, bold=False, italic=False, size_pt=None, strike=False, bg_color=None):
             f = QTextCharFormat()
             if color:
                 f.setForeground(QColor(color))
@@ -3658,18 +3666,35 @@ class _MdHighlighter(QSyntaxHighlighter):
                 f.setFontItalic(True)
             if size_pt:
                 f.setFontPointSize(size_pt)
+            if strike:
+                f.setFontStrikeOut(True)
+            if bg_color:
+                f.setBackground(QColor(bg_color))
             return f
 
         import re as _re_md
-        # Headings
-        _rule(_re_md.compile(r'^#{1,6}\s.*$', _re_md.MULTILINE),
+        # Headings — separate rule per level so each gets its own font size
+        _default_pt = 14
+        _rule(_re_md.compile(r'^#\s.*$', _re_md.MULTILINE),
+              _fmt('#7ec8e3', bold=True, size_pt=_default_pt * 1.5))
+        _rule(_re_md.compile(r'^#{2}\s.*$', _re_md.MULTILINE),
+              _fmt('#7ec8e3', bold=True, size_pt=_default_pt * 1.4))
+        _rule(_re_md.compile(r'^#{3}\s.*$', _re_md.MULTILINE),
+              _fmt('#7ec8e3', bold=True, size_pt=_default_pt * 1.3))
+        _rule(_re_md.compile(r'^#{4}\s.*$', _re_md.MULTILINE),
+              _fmt('#7ec8e3', bold=True, size_pt=_default_pt * 1.2))
+        _rule(_re_md.compile(r'^#{5}\s.*$', _re_md.MULTILINE),
+              _fmt('#7ec8e3', bold=True, size_pt=_default_pt * 1.1))
+        _rule(_re_md.compile(r'^#{6}\s.*$', _re_md.MULTILINE),
               _fmt('#7ec8e3', bold=True))
         # Bold **...**
         _rule(_re_md.compile(r'\*\*[^*]+\*\*'), _fmt('#f9c97c', bold=True))
         # Italic *...*
         _rule(_re_md.compile(r'(?<!\*)\*[^*]+\*(?!\*)'), _fmt('#c3e88d', italic=True))
-        # Inline code `...`
-        _rule(_re_md.compile(r'`[^`]+`'), _fmt('#ff9580'))
+        # Inline code `...` with dark blue background
+        _rule(_re_md.compile(r'`[^`]+`'), _fmt('#ff9580', bg_color='#141446'))
+        # Strikethrough ~~text~~ — red + crossed out
+        _rule(_re_md.compile(r'~~[^~]+~~'), _fmt('#dc3c3c', strike=True))
         # Horizontal rule / bullets
         _rule(_re_md.compile(r'^[-*+]\s', _re_md.MULTILINE), _fmt('#888'))
         # Markdown links [text](url) — entire span in bold light-blue
@@ -3678,6 +3703,25 @@ class _MdHighlighter(QSyntaxHighlighter):
         _rule(_re_md.compile(r'==[^=]+=={0,2}'), _fmt('#f9e94e'))
 
     def highlightBlock(self, text):
+        prev = self.previousBlockState()
+        stripped = text.strip()
+        is_fence = stripped.startswith('```')
+
+        # ── Handle fenced code blocks via state machine ──
+        if is_fence:
+            # Toggle: opening fence (prev != 1) or closing fence (prev == 1)
+            self.setCurrentBlockState(0 if prev == 1 else 1)
+            self.setFormat(0, len(text), self._code_block_fmt)
+            return
+
+        if prev == 1:
+            # Still inside code block
+            self.setCurrentBlockState(1)
+            self.setFormat(0, len(text), self._code_block_fmt)
+            return
+
+        # ── Normal text: apply Markdown rules ──
+        self.setCurrentBlockState(0)
         for pattern, fmt in self._rules:
             for m in pattern.finditer(text):
                 self.setFormat(m.start(), m.end() - m.start(), fmt)
@@ -3988,32 +4032,49 @@ class _NotesWindow(QWidget):
         event.accept()
 
     def _build_ui(self):
+        # ── Fetch active theme for dynamic styling ──
+        _app = QApplication.instance()
+        _main = next((w for w in _app.topLevelWidgets()
+                      if w.__class__.__name__ == "WhisperRApp"), None)
+        _t = _main.themes[_main.current_theme] if _main and hasattr(_main, 'themes') else {}
+        _btn_bg  = _t.get("button_background", "#2a2a2a")
+        _btn_hov = _t.get("button_hover",      "#353535")
+        _btn_bdr = _t.get("input_border",      "#444444")
+        _btn_txt = _t.get("text",              "#ddd")
+        _btn_stx = _t.get("text_secondary",    "#888")
+        _pri     = _t.get("primary",           "#0078d7")
+        _surf    = _t.get("surface",           "#1e1e1e")
+        _bdr     = _t.get("border",            "#333")
+        _sel_bg  = _t.get("selection_background", "#1a3a5c")
+        _sel_txt = _t.get("selection_text",    "#fff")
+        _txt_dis = _t.get("text_disabled",     "#666")
+
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(4)
-        self.setStyleSheet("QWidget{background:#1e1e1e;color:#e0e0e0;}")
+        self.setStyleSheet(f"QWidget{{background:{_surf};color:{_btn_txt};}}")
 
         # ── header ─────────────────────────────────────────────────────────
         hdr = QHBoxLayout()
         lbl = QLabel("📝 Notes")
-        lbl.setStyleSheet("font-weight:bold;color:#ccc;font-size:10pt;")
+        lbl.setStyleSheet(f"font-weight:bold;color:{_btn_stx};font-size:10pt;")
         hdr.addWidget(lbl)
         hdr.addStretch()
         self._btn_undo_all = QPushButton("↩ Restore All")
         self._btn_undo_all.setToolTip("Restore all notes deleted by Delete All")
         self._btn_undo_all.setStyleSheet(
-            "QPushButton{background:#3a2a00;border:1px solid #cc8800;"
-            "color:#ffcc44;border-radius:4px;padding:3px 8px;font-weight:bold;}"
-            "QPushButton:hover{background:#5a3a00;}")
+            f"QPushButton{{background:#3a2a00;border:1px solid #cc8800;"
+            f"color:#ffcc44;border-radius:4px;padding:3px 8px;font-weight:bold;}}"
+            f"QPushButton:hover{{background:#5a3a00;}}")
         self._btn_undo_all.clicked.connect(self._undo_delete_all)
         self._btn_undo_all.setVisible(False)
         hdr.addWidget(self._btn_undo_all)
         self._btn_undo = QPushButton("↩ Undo")
         self._btn_undo.setToolTip("Restore last deleted note")
         self._btn_undo.setStyleSheet(
-            "QPushButton{background:#2a2a2a;border:1px solid #444;padding:3px 8px;"
-            "border-radius:4px;color:#ddd;font-size:9pt;}"
-            "QPushButton:hover{background:#353535;border-color:#0078d7;}")
+            f"QPushButton{{background:{_btn_bg};border:1px solid {_btn_bdr};padding:3px 8px;"
+            f"border-radius:4px;color:{_btn_txt};font-size:9pt;}}"
+            f"QPushButton:hover{{background:{_btn_hov};border-color:{_pri};}}")
         self._btn_undo.clicked.connect(self._undo_delete)
         self._btn_undo.setVisible(False)
         hdr.addWidget(self._btn_undo)
@@ -4023,9 +4084,9 @@ class _NotesWindow(QWidget):
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._scroll.setStyleSheet("QScrollArea{background:#1e1e1e;border:none;}")
+        self._scroll.setStyleSheet(f"QScrollArea{{background:{_surf};border:none;}}")
         self._inner = QWidget()
-        self._inner.setStyleSheet("QWidget{background:#1e1e1e;}")
+        self._inner.setStyleSheet(f"QWidget{{background:{_surf};}}")
         self._notes_layout = QVBoxLayout(self._inner)
         self._notes_layout.setContentsMargins(4, 4, 4, 4)
         self._notes_layout.setSpacing(20)
@@ -4037,13 +4098,13 @@ class _NotesWindow(QWidget):
         self._drop_line.setFrameShape(QFrame.Shape.HLine)
         self._drop_line.setFixedHeight(5)
         self._drop_line.setStyleSheet(
-            "QFrame{background:#0078d7;border:none;border-radius:2px;}")
+            f"QFrame{{background:{_pri};border:none;border-radius:2px;}}")
         self._drop_line.hide()
 
         # ── footer ──────────────────────────────────────────────────────────
-        _ss = ("QPushButton{background:#2a2a2a;border:1px solid #444;"
-               "border-radius:4px;color:#ddd;}"
-               "QPushButton:hover{background:#353535;border-color:#0078d7;}")
+        _ss = (f"QPushButton{{background:{_btn_bg};border:1px solid {_btn_bdr};"
+               f"border-radius:4px;color:{_btn_txt};}}"
+               f"QPushButton:hover{{background:{_btn_hov};border-color:{_pri};}}")
         foot = QHBoxLayout()
         btn_add = QPushButton("＋ Add Note")
         btn_add.setToolTip(
@@ -4059,9 +4120,9 @@ class _NotesWindow(QWidget):
             "Hold Shift to skip confirmation.\n"
             "Undoable with the Restore All button that appears.")
         self._btn_del_all.setStyleSheet(
-            "QPushButton{background:#2a2a2a;border:1px solid #444;"
-            "border-radius:4px;color:#cc4444;padding:4px 8px;}"
-            "QPushButton:hover{background:#3a1a1a;border-color:#e53935;color:#ff6b6b;}")
+            f"QPushButton{{background:{_btn_bg};border:1px solid {_btn_bdr};"
+            f"border-radius:4px;color:#cc4444;padding:4px 8px;}}"
+            f"QPushButton:hover{{background:#3a1a1a;border-color:#e53935;color:#ff6b6b;}}")
         self._btn_del_all.clicked.connect(self._delete_all_notes)
         foot.addWidget(self._btn_del_all)
         # Ctrl+Enter shortcut — add note after the currently focused one
@@ -4081,9 +4142,9 @@ class _NotesWindow(QWidget):
         self._filter_indicator.setFixedSize(22, 22)
         self._filter_indicator.setToolTip("Some notes are hidden by the color filter")
         self._filter_indicator.setStyleSheet(
-            "QPushButton{background:#5a3a00;border:1px solid #cc8800;"
-            "color:#ffcc44;border-radius:3px;font-size:9px;font-weight:bold;padding:0;}"
-            "QPushButton:hover{background:#7a5000;}")
+            f"QPushButton{{background:#5a3a00;border:1px solid #cc8800;"
+            f"color:#ffcc44;border-radius:3px;font-size:9px;font-weight:bold;padding:0;}}"
+            f"QPushButton:hover{{background:#7a5000;}}")
         self._filter_indicator.hide()
         self._filter_indicator.clicked.connect(self._show_color_filter_menu)
         foot.addStretch()
@@ -4103,9 +4164,9 @@ class _NotesWindow(QWidget):
         foot.addWidget(btn_exp)
         root.addLayout(foot)
         # ── import/export row ───────────────────────────────────────────
-        _ss2 = ("QPushButton{background:#2a2a2a;border:1px solid #444;"
-                "border-radius:4px;color:#aaa;font-size:9pt;padding:3px 8px;}"
-                "QPushButton:hover{background:#353535;border-color:#0078d7;color:#ddd;}")
+        _ss2 = (f"QPushButton{{background:{_btn_bg};border:1px solid {_btn_bdr};"
+                f"border-radius:4px;color:{_btn_stx};font-size:9pt;padding:3px 8px;}}"
+                f"QPushButton:hover{{background:{_btn_hov};border-color:{_pri};color:{_btn_txt};}}")
         io_row = QHBoxLayout()
         btn_imp = QPushButton("↑ Import Notes")
         btn_imp.setToolTip(
@@ -4295,11 +4356,19 @@ class _NotesWindow(QWidget):
 
     def _show_color_filter_menu(self):
         from PyQt6.QtWidgets import QMenu
+        _app = QApplication.instance()
+        _main = next((w for w in _app.topLevelWidgets()
+                      if w.__class__.__name__ == "WhisperRApp"), None)
+        _t = _main.themes[_main.current_theme] if _main and hasattr(_main, 'themes') else {}
+        _surf = _t.get("surface", "#1e1e1e")
+        _bdr  = _t.get("input_border", "#444")
+        _txt  = _t.get("text", "#ddd")
+        _sel  = _t.get("button_background", "#2a2a2a")
         menu = QMenu(self)
         menu.setStyleSheet(
-            "QMenu{background:#1e1e1e;border:1px solid #444;padding:4px;}"
-            "QMenu::item{padding:4px 12px;color:#ddd;}"
-            "QMenu::item:selected{background:#2a2a2a;}")
+            f"QMenu{{background:{_surf};border:1px solid {_bdr};padding:4px;}}"
+            f"QMenu::item{{padding:4px 12px;color:{_txt};}}"
+            f"QMenu::item:selected{{background:{_sel};}}")
         act_all = menu.addAction("Show All Colors")
         act_all.triggered.connect(lambda: self._set_color_filter(set()))
         menu.addSeparator()
@@ -4333,15 +4402,24 @@ class _NotesWindow(QWidget):
                 hidden += 1
             else:
                 note.show()
+        _app = QApplication.instance()
+        _main = next((w for w in _app.topLevelWidgets()
+                      if w.__class__.__name__ == "WhisperRApp"), None)
+        _t = _main.themes[_main.current_theme] if _main and hasattr(_main, 'themes') else {}
+        _btn_bg = _t.get("button_background", "#2a2a2a")
+        _btn_hov = _t.get("button_hover", "#353535")
+        _btn_bdr = _t.get("input_border", "#444")
+        _btn_txt = _t.get("text", "#ddd")
+        _pri     = _t.get("primary", "#0078d7")
         if self._color_filter:
             self._filter_btn.setStyleSheet(
                 "QPushButton{background:#003a1a;border:2px solid #00cc55;"
                 "color:#00ff77;border-radius:4px;font-size:14px;}")
         else:
             self._filter_btn.setStyleSheet(
-                "QPushButton{background:#2a2a2a;border:1px solid #444;"
-                "border-radius:4px;color:#ddd;font-size:14px;}"
-                "QPushButton:hover{background:#353535;border-color:#0078d7;}")
+                f"QPushButton{{background:{_btn_bg};border:1px solid {_btn_bdr};"
+                f"border-radius:4px;color:{_btn_txt};font-size:14px;}}"
+                f"QPushButton:hover{{background:{_btn_hov};border-color:{_pri};}}")
         if hidden > 0:
             self._filter_indicator.setText(f"+{hidden}")
             self._filter_indicator.setToolTip(
@@ -4365,6 +4443,26 @@ class _NotesWindow(QWidget):
                 "Delete ALL notes\n"
                 "Hold Shift to skip confirmation.\n"
                 "Undoable with the Restore All button that appears.")
+
+    def _reapply_theme(self):
+        _app = QApplication.instance()
+        _main = next((w for w in _app.topLevelWidgets()
+                      if w.__class__.__name__ == "WhisperRApp"), None)
+        _t = _main.themes[_main.current_theme] if _main and hasattr(_main, 'themes') else {}
+        _surf    = _t.get("surface",           "#1e1e1e")
+        _btn_txt = _t.get("text",              "#ddd")
+        _btn_bg  = _t.get("button_background", "#2a2a2a")
+        _btn_hov = _t.get("button_hover",      "#353535")
+        _btn_bdr = _t.get("input_border",      "#444444")
+        _btn_stx = _t.get("text_secondary",    "#888")
+        _pri     = _t.get("primary",           "#0078d7")
+        _bdr     = _t.get("border",            "#333")
+        _sel_bg  = _t.get("selection_background", "#1a3a5c")
+        _txt_dis = _t.get("text_disabled",     "#666")
+        self.setStyleSheet(f"QWidget{{background:{_surf};color:{_btn_txt};}}")
+        lbl = self.findChild(QLabel)
+        if lbl:
+            lbl.setStyleSheet(f"font-weight:bold;color:{_btn_stx};font-size:10pt;")
 
     _NOTES_SEPARATOR = "----------"  # ten dashes — delimiter in TXT/MD exports
 
@@ -4803,6 +4901,8 @@ class _CheatsheetWindow(QWidget):
             (hk("editor_hk_h1",        "Ctrl+1"),          "Heading 1  # text"),
             (hk("editor_hk_h2",        "Ctrl+2"),          "Heading 2  ## text"),
             (hk("editor_hk_h3",        "Ctrl+3"),          "Heading 3  ### text"),
+            (hk("editor_hk_h4",        "Ctrl+4"),          "Heading 4  #### text"),
+            (hk("editor_hk_h5",        "Ctrl+5"),          "Heading 5  ##### text"),
             (hk("editor_hk_bullet",    "Ctrl+Shift+B"),    "Bullet list  - text"),
             (hk("editor_hk_numlist",   "Ctrl+Shift+N"),    "Numbered list  1. text"),
             (hk("editor_hk_tasklist",  "Ctrl+Shift+T"),    "Task list  - [ ] text"),
@@ -4889,7 +4989,33 @@ class WhisperEditor(QWidget):
         self._notes_win: "_NotesWindow | None" = None
         self._project_path = None  # Path to currently loaded .wrp project file
 
+    def _fetch_theme_vars(self):
+        _app = QApplication.instance()
+        _main = next((w for w in _app.topLevelWidgets()
+                     if w.__class__.__name__ == "WhisperRApp"), None)
+        self._t = _main.themes[_main.current_theme] if _main and hasattr(_main, 'themes') else {}
+        return (
+            self._t.get("button_background", "#2a2a2a"),
+            self._t.get("button_hover",      "#353535"),
+            self._t.get("input_border",      "#444444"),
+            self._t.get("text",              "#ddd"),
+            self._t.get("text_secondary",    "#888"),
+            self._t.get("primary",           "#0078d7"),
+            self._t.get("surface",           "#1e1e1e"),
+            self._t.get("border",            "#333"),
+            self._t.get("selection_background", "#1a3a5c"),
+            self._t.get("selection_text",    "#fff"),
+            self._t.get("text_disabled",     "#666"),
+        )
+
     def _build_ui(self):
+        # ── Fetch active theme for dynamic styling ──
+        (_btn_bg, _btn_hov, _btn_bdr, _btn_txt, _btn_stx, _pri,
+         _surf, _bdr, _sel_bg, _sel_txt, _txt_dis) = self._fetch_theme_vars()
+        self._tog_btns = []
+        self._fmt_widgets = []
+        self._bottom_widgets = []
+
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 8)
         root.setSpacing(6)
@@ -4905,11 +5031,11 @@ class WhisperEditor(QWidget):
             b.setFixedSize(28, 24)
             b.setToolTip(tip)
             b.setStyleSheet(
-                f"QPushButton{{background:#2a2a2a;border:1px solid #444;"
-                f"border-radius:3px;color:#aaa;}}"
+                f"QPushButton{{background:{_btn_bg};border:1px solid {_btn_bdr};"
+                f"border-radius:3px;color:{_btn_stx};}}"
                 f"QPushButton:checked{{background:{checked_bg};border-color:{checked_border};"
                 f"color:{checked_color};}}"
-                "QPushButton:hover{border-color:#0078d7;}")
+                f"QPushButton:hover{{border-color:{_pri};}}")
             return b
 
         # Three mutually-exclusive memory/clipboard toggles
@@ -4919,12 +5045,14 @@ class WhisperEditor(QWidget):
             "Preserves editor text when closed/hidden.\n"
             "On re-open via \"whisper edit\", new text appends below.\n"
             "Exclusive with the clipboard toggles.")
+        self._tog_btns.append(self.remember_toggle)
         self.clipboard_prefill_toggle = _toggle_btn(
             "📋",
             "Clipboard prefill\n"
             "Pre-populates editor with current clipboard on open.\n"
             "Exclusive with the other memory toggles.",
             checked_bg="#003a5a", checked_border="#0078d7", checked_color="#66bbff")
+        self._tog_btns.append(self.clipboard_prefill_toggle)
         self.clipboard_monitor_toggle = _toggle_btn(
             "👁",
             "Clipboard monitor (left-click = append to text area)\n"
@@ -4934,6 +5062,7 @@ class WhisperEditor(QWidget):
             "Only one mode is active at a time.\n"
             "Exclusive with the other memory toggles.",
             checked_bg="#003a1a", checked_border="#00aa44", checked_color="#66ee88")
+        self._tog_btns.append(self.clipboard_monitor_toggle)
         self.clipboard_monitor_toggle.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu)
         self.clipboard_monitor_toggle.customContextMenuRequested.connect(
@@ -5023,6 +5152,7 @@ class WhisperEditor(QWidget):
 
         # Grouped button definitions: (label, tip, hotkey_key, default_hk, slot)
         # Groups separated by None entries (rendered as vertical dividers)
+        # Inline styling buttons (first group)
         self._fmt_btns = [
             ("**B**", "Bold text",                          "editor_hk_bold",      "Ctrl+B",          self._fmt_bold),
             ("*I*",   "Italic text",                        "editor_hk_italic",    "Ctrl+I",          self._fmt_italic),
@@ -5035,20 +5165,14 @@ class WhisperEditor(QWidget):
                       "editor_hk_tagwrap",   "Ctrl+Shift+W",    self._fmt_tagwrap),
             ("🔗",    "Insert hyperlink\nLeft-click: [text](placeholder-url)\nRight-click: [text](clipboard url)",           
                       "editor_hk_link",      "Ctrl+K",          self._fmt_link),
-            None,  # ── group separator ──
-            ("H1",    "Heading level 1 (large)",            "editor_hk_h1",        "Ctrl+1",          lambda: self._fmt_heading(1)),
-            ("H2",    "Heading level 2 (medium)",            "editor_hk_h2",        "Ctrl+2",          lambda: self._fmt_heading(2)),
-            ("H3",    "Heading level 3 (small)",             "editor_hk_h3",        "Ctrl+3",          lambda: self._fmt_heading(3)),
-            None,  # ── group separator ──
-            ("•",     "Bullet/numbered list item",          "editor_hk_bullet",    "Ctrl+Shift+B",    self._fmt_bullet),
-            ("1.",    "Numbered list item",                 "editor_hk_numlist",   "Ctrl+Shift+N",    self._fmt_numlist),
-            ("☐",     "Task/checkbox item (- [ ])",          "editor_hk_tasklist",  "Ctrl+Shift+T",    self._fmt_tasklist),
-            ("▦",     "Insert table (rows x columns)",      "editor_hk_table",    "",                self._insert_table),
         ]
 
-        _btn_ss = ("QPushButton{background:#2a2a2a;border:1px solid #444;border-radius:3px;"
-                   "color:#ddd;font-size:10pt;}"
-                   "QPushButton:hover{background:#0078d7;border-color:#0078d7;color:#fff;}")
+        # Per-button widths: label → (width, 28)
+        _btn_widths = {"**B**": 42, "*I*": 38, "~~S~~": 44, "`C`": 44, "<kbd>": 48, "==H==": 46, "<>": 38, "🔗": 38}
+
+        _btn_ss = (f"QPushButton{{background:{_btn_bg};border:1px solid {_btn_bdr};border-radius:3px;"
+                   f"color:{_btn_txt};font-size:10pt;}}"
+                   f"QPushButton:hover{{background:{_pri};border-color:{_pri};color:#fff;}}")
 
         def _sep():
             ln = QFrame(); ln.setFrameShape(QFrame.Shape.VLine)
@@ -5063,10 +5187,11 @@ class WhisperEditor(QWidget):
             label, tip, hk_key, hk_default, slot = entry
             hotkey = hk(hk_key, hk_default)
             btn = QPushButton(label)
-            btn.setFixedSize(36, 28)
+            btn.setFixedSize(_btn_widths.get(label, 36), 28)
             btn.setToolTip(f"{tip}  [{hotkey}]")
             btn.clicked.connect(slot)
             btn.setStyleSheet(_btn_ss)
+            self._fmt_widgets.append(btn)
             if label == "🔗":
                 btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
                 btn.customContextMenuRequested.connect(
@@ -5077,16 +5202,47 @@ class WhisperEditor(QWidget):
                     lambda _: self._fmt_tagwrap(square=True))
             fmt_row.addWidget(btn)
 
-        # Write/Preview toggle
-        fmt_row.addSpacing(10)
-        # Preview toggle removed - broken implementation
-        # self._preview_toggle = QPushButton("👁 Preview")
-        # self._preview_toggle.setCheckable(True)
-        # self._preview_toggle.setFixedSize(70, 28)
-        # self._preview_toggle.clicked.connect(self._toggle_preview)
-        # self._preview_shortcut = QShortcut(QKeySequence("Ctrl+Shift+P"), self)
-        # self._preview_shortcut.activated.connect(self._toggle_preview)
-        # fmt_row.addWidget(self._preview_toggle)
+        # ── Heading dropdown (replaces H1/H2/H3 buttons) ──
+        fmt_row.addWidget(_sep())
+        fmt_row.addSpacing(2)
+        self._heading_btn = QPushButton("H#")
+        self._heading_btn.setFixedSize(54, 28)
+        self._heading_btn.setStyleSheet(_btn_ss)
+        self._fmt_widgets.append(self._heading_btn)
+        self._heading_menu = QMenu(self._heading_btn)
+        _heading_levels = [
+            ("H1  #", 1, "Ctrl+1"),
+            ("H2  ##", 2, "Ctrl+2"),
+            ("H3  ###", 3, "Ctrl+3"),
+            ("H4  ####", 4, ""),
+            ("H5  #####", 5, ""),
+        ]
+        for h_text, h_level, h_hk in _heading_levels:
+            act = self._heading_menu.addAction(f"{h_text}")
+            if h_hk:
+                act.setShortcut(QKeySequence(h_hk))
+            act.triggered.connect(lambda checked, lvl=h_level: self._fmt_heading(lvl))
+        self._heading_btn.setMenu(self._heading_menu)
+        fmt_row.addWidget(self._heading_btn)
+        fmt_row.addSpacing(2)
+        fmt_row.addWidget(_sep())
+
+        # ── List / table buttons ──
+        _list_btns = [
+            ("•",     "Bullet list item",                  "editor_hk_bullet",    "Ctrl+Shift+B",    self._fmt_bullet),
+            ("1.",    "Numbered list item",                 "editor_hk_numlist",   "Ctrl+Shift+N",    self._fmt_numlist),
+            ("☐",     "Task/checkbox item (- [ ])",          "editor_hk_tasklist",  "Ctrl+Shift+T",    self._fmt_tasklist),
+            ("▦",     "Insert table (rows x columns)",      "editor_hk_table",    "",                self._insert_table),
+        ]
+        for label, tip, hk_key, hk_default, slot in _list_btns:
+            hotkey = hk(hk_key, hk_default)
+            btn = QPushButton(label)
+            btn.setFixedSize(36, 28)
+            btn.setToolTip(f"{tip}  [{hotkey}]")
+            btn.clicked.connect(slot)
+            btn.setStyleSheet(_btn_ss)
+            self._fmt_widgets.append(btn)
+            fmt_row.addWidget(btn)
 
         fmt_row.addStretch()
 
@@ -5114,8 +5270,8 @@ class WhisperEditor(QWidget):
         from PyQt6.QtGui import QTextOption as _QTO
         self.editor.setWordWrapMode(_QTO.WrapMode.WordWrap)
         self.editor.setStyleSheet(
-            "QTextEdit{background:#111;color:#e0e0e0;border:1px solid #333;"
-            "border-radius:4px;padding:6px;font-family:Consolas,monospace;}")
+            f"QTextEdit{{background:{self._t.get('background','#111')};color:{_btn_txt};"
+            f"border:1px solid {_bdr};border-radius:4px;padding:6px;font-family:Consolas,monospace;}}")
         self.editor.textChanged.connect(self._update_stats)
         self.editor.textChanged.connect(self._autocorrect_terms)
         # Right-click context menu with lint corrections
@@ -5130,13 +5286,13 @@ class WhisperEditor(QWidget):
             menu = self.editor.createStandardContextMenu()
             # Force proper hover highlighting on the context menu
             menu.setStyleSheet(
-                "QMenu{background:#1e1e1e;color:#ddd;border:1px solid #444;}"
+                f"QMenu{{background:{_surf};color:{_btn_txt};border:1px solid {_btn_bdr};}}"
                 "QMenu::item{padding:4px 20px;}"
-                "QMenu::item:selected{background:#1a3a5c;}"
-                "QMenu::item:hover{background:#1a3a5c;}"
-                "QMenu::item:pressed{background:#0d2a4a;}"
-                "QMenu::separator{height:1px;background:#333;margin:2px 0;}"
-                "QMenu::item:disabled{color:#666;}")
+                f"QMenu::item:selected{{background:{_sel_bg};}}"
+                f"QMenu::item:hover{{background:{_sel_bg};}}"
+                f"QMenu::item:pressed{{background:{_btn_bg};}}"
+                f"QMenu::separator{{height:1px;background:{_bdr};margin:2px 0;}}"
+                f"QMenu::item:disabled{{color:{_txt_dis};}}")
             if lint_hit:
                 msg, suggestions = lint_hit
                 # Find the error span so we can highlight the word
@@ -5297,22 +5453,22 @@ class WhisperEditor(QWidget):
             b.setToolTip(tip)
             b.clicked.connect(slot)
             b.setStyleSheet(
-                "QPushButton{background:#2a2a2a;border:1px solid #444;padding:5px 10px;"
-                "border-radius:4px;color:#ddd;}"
-                "QPushButton:hover{background:#353535;border-color:#0078d7;}")
+                f"QPushButton{{background:{_btn_bg};border:1px solid {_btn_bdr};padding:5px 10px;"
+                f"border-radius:4px;color:{_btn_txt};}}"
+                f"QPushButton:hover{{background:{_btn_hov};border-color:{_pri};}}")
             return b
 
         # ── Menu bar ──────────────────────────────────────────────────────
         from PyQt6.QtWidgets import QMenuBar as _QMB
-        _menubar = _QMB(self)
-        _menubar.setStyleSheet(
-            "QMenuBar{background:#1e1e1e;color:#ddd;border-bottom:1px solid #333;}"
+        self._menubar = _QMB(self)
+        self._menubar.setStyleSheet(
+            f"QMenuBar{{background:{_surf};color:{_btn_txt};border-bottom:1px solid {_bdr};}}"
             "QMenuBar::item{padding:4px 10px;background:transparent;}"
-            "QMenuBar::item:selected{background:#2a2a2a;}"
-            "QMenu{background:#1e1e1e;color:#ddd;border:1px solid #444;}"
+            f"QMenuBar::item:selected{{background:{_btn_bg};}}"
+            f"QMenu{{background:{_surf};color:{_btn_txt};border:1px solid {_btn_bdr};}}"
             "QMenu::item{padding:4px 20px;}"
-            "QMenu::item:selected{background:#1a3a5c;}"
-            "QMenu::separator{height:1px;background:#333;margin:2px 0;}")
+            f"QMenu::item:selected{{background:{_sel_bg};}}"
+            f"QMenu::separator{{height:1px;background:{_bdr};margin:2px 0;}}")
 
         # Helper: create a QAction with optional shortcut and add to menu
         from PyQt6.QtGui import QAction as _QAct, QKeySequence as _QKS
@@ -5325,7 +5481,7 @@ class WhisperEditor(QWidget):
             return act
 
         # File menu
-        _m_file = _menubar.addMenu("File")
+        _m_file = self._menubar.addMenu("File")
         _ma(_m_file, "New Project",         self._new_project,      "Ctrl+N")
         _m_file.addSeparator()
         _ma(_m_file, "Load Project…",     self._load_project,     "Ctrl+O")
@@ -5335,7 +5491,7 @@ class WhisperEditor(QWidget):
         _ma(_m_file, "Export Text File…",  self._export_file)
 
         # Edit menu
-        _m_edit = _menubar.addMenu("Edit")
+        _m_edit = self._menubar.addMenu("Edit")
         _ma(_m_edit, "Copy All",             self._copy_all,         "Ctrl+Shift+C")
         _ma(_m_edit, "Find && Replace",      self._show_find_replace, "Ctrl+H")
         _m_edit.addSeparator()
@@ -5347,18 +5503,18 @@ class WhisperEditor(QWidget):
         _m_edit.addAction(self._harper_menu_act)
 
         # History menu (project version history — populated dynamically)
-        self._m_history = _menubar.addMenu("History")
+        self._m_history = self._menubar.addMenu("History")
         self._m_history.aboutToShow.connect(self._populate_history_menu)
 
         # Snapshots menu (app-state snapshots — populated dynamically)
-        self._m_snapshots = _menubar.addMenu("Snapshots")
+        self._m_snapshots = self._menubar.addMenu("Snapshots")
         self._m_snapshots.aboutToShow.connect(self._populate_snapshots_menu)
 
-        root.setMenuBar(_menubar)
+        root.setMenuBar(self._menubar)
 
-        _btn_ss = ("QPushButton{background:#2a2a2a;border:1px solid #444;padding:5px 10px;"
-                   "border-radius:4px;color:#ddd;}"
-                   "QPushButton:hover{background:#353535;border-color:#0078d7;}")
+        _btn_ss = (f"QPushButton{{background:{_btn_bg};border:1px solid {_btn_bdr};padding:5px 10px;"
+                   f"border-radius:4px;color:{_btn_txt};}}"
+                   f"QPushButton:hover{{background:{_btn_hov};border-color:{_pri};}}")
 
         def _dual_btn(label_l, tip_l, slot_l, tip_r, slot_r):
             b = QPushButton(label_l)
@@ -5367,6 +5523,7 @@ class WhisperEditor(QWidget):
             b.setStyleSheet(_btn_ss)
             b.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             b.customContextMenuRequested.connect(lambda _: slot_r())
+            self._bottom_widgets.append(b)
             return b
 
         def _btn(label, tip, slot):
@@ -5374,6 +5531,7 @@ class WhisperEditor(QWidget):
             b.setToolTip(tip)
             b.clicked.connect(slot)
             b.setStyleSheet(_btn_ss)
+            self._bottom_widgets.append(b)
             return b
 
         # ── New Project ────────────────────────────────────────────
@@ -5390,9 +5548,9 @@ class WhisperEditor(QWidget):
             "Insert a template into the current editor.\n"
             "Replaces content only if editor is empty (or on New project).")
         self._preset_combo.setStyleSheet(
-            "QComboBox{background:#2a2a2a;border:1px solid #444;"
-            "padding:4px 8px;color:#ddd;border-radius:4px;}"
-            "QComboBox:hover{border-color:#0078d7;}")
+            f"QComboBox{{background:{_btn_bg};border:1px solid {_btn_bdr};"
+            f"padding:4px 8px;color:{_btn_txt};border-radius:4px;}}"
+            f"QComboBox:hover{{border-color:{_pri};}}")
         self._preset_combo.currentTextChanged.connect(self._apply_preset)
         btn_row.addWidget(self._preset_combo)
 
@@ -5429,6 +5587,7 @@ class WhisperEditor(QWidget):
             "Show / hide the Notes panel\nRight-click: show / hide Cheatsheet\nKeyboard shortcuts: Ctrl+Shift+N (Notes), Ctrl+Shift+G (Cheatsheet)")
         self.btn_notes.setCheckable(True)
         self.btn_notes.setStyleSheet(_btn_ss)
+        self._bottom_widgets.append(self.btn_notes)
         self.btn_notes.clicked.connect(self._toggle_notes)
         self._notes_shortcut = QShortcut(QKeySequence("Ctrl+Shift+N"), self)
         self._notes_shortcut.activated.connect(self._toggle_notes)
@@ -5452,9 +5611,9 @@ class WhisperEditor(QWidget):
         _paste_sc.activated.connect(self._paste_to_app)
         self._hotkeys_active.append(_paste_sc)
         self.btn_paste_app.setStyleSheet(
-            "QPushButton{background:#0078d7;border:1px solid #005fa3;padding:5px 12px;"
-            "border-radius:4px;color:#fff;font-weight:bold;}"
-            "QPushButton:hover{background:#005fa3;}")
+            f"QPushButton{{background:{_pri};border:1px solid {_btn_bdr};padding:5px 12px;"
+            "border-radius:4px;color:#fff;font-weight:bold;}}"
+            f"QPushButton:hover{{background:{_btn_hov};border-color:{_pri};}}")
         btn_row.addWidget(self.btn_paste_app)
 
         # ── Harper spell-check indicator ────────────────────────────────
@@ -5464,13 +5623,73 @@ class WhisperEditor(QWidget):
             "Spell & grammar checking: initialising…\n"
             "Go to Settings → Optional Tools to install Harper.")
         self._harper_indicator.setStyleSheet(
-            "QPushButton{background:#2a2a2a;border:1px solid #444;"
-            "border-radius:4px;color:#666;font-size:13px;padding:2px 6px;}"
-            "QPushButton:hover{background:#353535;border-color:#888;}")
+            f"QPushButton{{background:{_btn_bg};border:1px solid {_btn_bdr};"
+            f"border-radius:4px;color:{_txt_dis};font-size:13px;padding:2px 6px;}}"
+            f"QPushButton:hover{{background:{_btn_hov};border-color:{_btn_stx};}}")
         self._harper_indicator.clicked.connect(self._toggle_harper)
         btn_row.addWidget(self._harper_indicator)
 
         root.addLayout(btn_row)
+
+
+    def _reapply_theme(self):
+        (_btn_bg, _btn_hov, _btn_bdr, _btn_txt, _btn_stx, _pri,
+         _surf, _bdr, _sel_bg, _sel_txt, _txt_dis) = self._fetch_theme_vars()
+
+        _fmt_ss = (f"QPushButton{{background:{_btn_bg};border:1px solid {_btn_bdr};border-radius:3px;"
+                   f"color:{_btn_txt};font-size:10pt;}}"
+                   f"QPushButton:hover{{background:{_pri};border-color:{_pri};color:#fff;}}")
+        for w in self._fmt_widgets:
+            w.setStyleSheet(_fmt_ss)
+
+        _btm_ss = (f"QPushButton{{background:{_btn_bg};border:1px solid {_btn_bdr};padding:5px 10px;"
+                   f"border-radius:4px;color:{_btn_txt};}}"
+                   f"QPushButton:hover{{background:{_btn_hov};border-color:{_pri};}}")
+        for w in self._bottom_widgets:
+            w.setStyleSheet(_btm_ss)
+
+        _tog_ss = (f"QPushButton{{background:{_btn_bg};border:1px solid {_btn_bdr};"
+                   f"border-radius:3px;color:{_btn_stx};}}"
+                   f"QPushButton:hover{{border-color:{_pri};}}")
+        for w in self._tog_btns:
+            ss = _tog_ss + (f"QPushButton:checked{{background:#5a3a00;border-color:#cc8800;color:#ffcc44;}}"
+                            if w is self.remember_toggle else
+                            f"QPushButton:checked{{background:#003a5a;border-color:#0078d7;color:#66bbff;}}"
+                            if w is self.clipboard_prefill_toggle else
+                            f"QPushButton:checked{{background:#003a1a;border-color:#00aa44;color:#66ee88;}}")
+            w.setStyleSheet(ss)
+
+        self.editor.setStyleSheet(
+            f"QTextEdit{{background:{self._t.get('background','#111')};color:{_btn_txt};"
+            f"border:1px solid {_bdr};border-radius:4px;padding:6px;font-family:Consolas,monospace;}}")
+
+        for lbl in (self.lbl_words, self.lbl_chars, self.lbl_remain):
+            lbl.setStyleSheet(f"color: {_btn_stx}; font-size: 9pt;")
+        self.lbl_voice.setStyleSheet(f"color:{_txt_dis};font-size:9pt;")
+
+        self._preset_combo.setStyleSheet(
+            f"QComboBox{{background:{_btn_bg};border:1px solid {_btn_bdr};"
+            f"padding:4px 8px;color:{_btn_txt};border-radius:4px;}}"
+            f"QComboBox:hover{{border-color:{_pri};}}")
+
+        self.btn_paste_app.setStyleSheet(
+            f"QPushButton{{background:{_pri};border:1px solid {_btn_bdr};padding:5px 12px;"
+            "border-radius:4px;color:#fff;font-weight:bold;}}"
+            f"QPushButton:hover{{background:{_btn_hov};border-color:{_pri};}}")
+
+        self._harper_indicator.setStyleSheet(
+            f"QPushButton{{background:{_btn_bg};border:1px solid {_btn_bdr};"
+            f"border-radius:4px;color:{_txt_dis};font-size:13px;padding:2px 6px;}}"
+            f"QPushButton:hover{{background:{_btn_hov};border-color:{_btn_stx};}}")
+
+        self._menubar.setStyleSheet(
+            f"QMenuBar{{background:{_surf};color:{_btn_txt};border-bottom:1px solid {_bdr};}}"
+            "QMenuBar::item{padding:4px 10px;background:transparent;}"
+            f"QMenuBar::item:selected{{background:{_btn_bg};}}"
+            f"QMenu{{background:{_surf};color:{_btn_txt};border:1px solid {_btn_bdr};}}"
+            "QMenu::item{padding:4px 20px;}"
+            f"QMenu::item:selected{{background:{_sel_bg};}}"
+            f"QMenu::separator{{height:1px;background:{_bdr};margin:2px 0;}}")
 
 
     # ── Positioning ───────────────────────────────────────────────────────────
@@ -5591,85 +5810,6 @@ class WhisperEditor(QWidget):
     def _fmt_code(self):      self._wrap_selection("`")
     def _fmt_kbd(self):       self._wrap_selection("<kbd>", "</kbd>")
     
-    def _toggle_preview(self):
-        """Toggle between Write and Preview modes"""
-        is_preview = self._preview_toggle.isChecked()
-        
-        # Update button text to show state
-        if is_preview:
-            self._preview_toggle.setText("✏️ Write")
-            # Create preview if not exists
-            if not hasattr(self, '_preview_label') or self._preview_label is None:
-                from PyQt6.QtWidgets import QScrollArea
-                self._preview_label = QLabel()
-                self._preview_label.setWordWrap(True)
-                self._preview_label.setTextFormat(Qt.TextFormat.RichText)
-                self._preview_scroll = QScrollArea()
-                self._preview_scroll.setWidget(self._preview_label)
-                self._preview_scroll.setWidgetResizable(True)
-                self._preview_scroll.setStyleSheet("background: #1e1e1e; border: none;")
-            # Render and show preview
-            self._render_preview()
-            self._preview_scroll.setVisible(True)
-            self.editor.setVisible(False)
-        else:
-            self._preview_toggle.setText("👁 Preview")
-            # Switch back to edit mode
-            if hasattr(self, '_preview_scroll'):
-                self._preview_scroll.setVisible(False)
-            self.editor.setVisible(True)
-    
-    def _render_preview(self):
-        """Render current editor content as HTML"""
-        import markdown
-        
-        text = self.editor.toPlainText()
-        
-        # Convert markdown to HTML
-        html = markdown.markdown(text, extensions=['extra', 'codehilite'])
-        
-        # Add styling
-        styled_html = f"""
-        <html>
-        <head>
-            <style>
-                body {{
-                    background-color: #1e1e1e;
-                    color: #ffffff;
-                    font-family: 'Segoe UI', sans-serif;
-                    font-size: 14px;
-                    line-height: 1.6;
-                    padding: 20px;
-                }}
-                h1, h2, h3 {{ color: #0078d7; margin-top: 20px; }}
-                code {{
-                    background: #2d2d2d;
-                    padding: 2px 6px;
-                    border-radius: 3px;
-                    font-family: Consolas, monospace;
-                }}
-                pre {{
-                    background: #2d2d2d;
-                    padding: 10px;
-                    border-radius: 5px;
-                }}
-                blockquote {{
-                    border-left: 4px solid #0078d7;
-                    margin: 0;
-                    padding-left: 16px;
-                    color: #aaa;
-                }}
-                a {{ color: #4da6ff; }}
-                ul, ol {{ padding-left: 24px; }}
-                table {{ border-collapse: collapse; width: 100%; }}
-                th, td {{ border: 1px solid #333; padding: 8px; }}
-            </style>
-        </head>
-        <body>{html}</body>
-        </html>
-        """
-        self._preview_label.setText(styled_html)
-
     def _autocorrect_terms(self):
         """Check if the last typed word matches a Term phrase; expand if so.
         Only fires for exact-match single-word terms (no spaces) to avoid
@@ -5933,6 +6073,8 @@ class WhisperEditor(QWidget):
             (cfg.get("editor_hk_h1",        "Ctrl+1"),          lambda: self._fmt_heading(1)),
             (cfg.get("editor_hk_h2",        "Ctrl+2"),          lambda: self._fmt_heading(2)),
             (cfg.get("editor_hk_h3",        "Ctrl+3"),          lambda: self._fmt_heading(3)),
+            (cfg.get("editor_hk_h4",        "Ctrl+4"),          lambda: self._fmt_heading(4)),
+            (cfg.get("editor_hk_h5",        "Ctrl+5"),          lambda: self._fmt_heading(5)),
             (cfg.get("editor_hk_emdash",    "Ctrl+Shift+Minus"),self._fmt_emdash),
             (cfg.get("editor_hk_bullet",    "Ctrl+Shift+B"),    self._fmt_bullet),
             (cfg.get("editor_hk_numlist",   "Ctrl+Shift+N"),    self._fmt_numlist),
@@ -12961,6 +13103,16 @@ class WhisperRApp(QMainWindow):
             """
             qapp.setStyleSheet(stylesheet)
             self.scratchpad.append(f"✓ Theme: Dark applied")
+
+        # Re-apply editor theme stylesheets (inline styles override global QSS)
+        _ed = getattr(self, "_editor", None)
+        if _ed:
+            _ed._reapply_theme()
+        # Also re-apply notes window theme
+        if _ed:
+            _nw = getattr(_ed, "_notes_win", None)
+            if _nw:
+                _nw._reapply_theme()
 
 
     def _on_model_not_found(self, model_name: str, dest_path: str, hf_url: str):

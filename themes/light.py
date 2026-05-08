@@ -56,15 +56,7 @@ THEME = {
     "code_background": "#f5f5f5",
     "code_text": "#333333",
     
-    # Markdown preview colors
-    "md_heading": "#0078d7",
-    "md_bold": "#1e1e1e",
-    "md_italic": "#333333",
-    "md_code": "#a31515",
-    "md_link": "#0078d7",
-    "md_blockquote": "#2e7d32",
-    "md_list": "#2e7d32",
-    
+
     # Diff colors
     "diff_added_background": "#d4edd4",
     "diff_added_text": "#155724",

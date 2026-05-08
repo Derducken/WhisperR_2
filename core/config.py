@@ -121,8 +121,14 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "editor_hk_highlight": "Ctrl+Shift+H",
     "editor_hk_code": "Ctrl+`",
     "editor_hk_h1": "Ctrl+1",
+
     "editor_hk_h2": "Ctrl+2",
+
     "editor_hk_h3": "Ctrl+3",
+
+    "editor_hk_h4": "Ctrl+4",
+
+    "editor_hk_h5": "Ctrl+5",
     "editor_hk_emdash": "Ctrl+Shift+Minus",
     "editor_hk_bullet": "Ctrl+Shift+B",
     "editor_hk_numlist": "Ctrl+Shift+N",

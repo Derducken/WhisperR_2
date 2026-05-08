@@ -53,18 +53,10 @@ THEME = {
     "scrollbar_handle_hover": "#444444",
     
     # Code/Monospace
-    "code_background": "#0d0d0d",
+    "code_background": "#141432",
     "code_text": "#b0b0b0",
     
-    # Markdown preview colors
-    "md_heading": "#0078d7",
-    "md_bold": "#ffffff",
-    "md_italic": "#a0a0a0",
-    "md_code": "#a87658",
-    "md_link": "#4da6ff",
-    "md_blockquote": "#5a7d45",
-    "md_list": "#b8b87a",
-    
+
     # Diff colors - adjusted for OLED
     "diff_added_background": "#0d1a0d",
     "diff_added_text": "#388e3c",

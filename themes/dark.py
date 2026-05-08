@@ -53,18 +53,10 @@ THEME = {
     "scrollbar_handle_hover": "#555555",
     
     # Code/Monospace
-    "code_background": "#2d2d2d",
+    "code_background": "#141432",
     "code_text": "#d4d4d4",
     
-    # Markdown preview colors (for rendered content)
-    "md_heading": "#0078d7",
-    "md_bold": "#ffffff",
-    "md_italic": "#d4d4d4",
-    "md_code": "#ce9178",
-    "md_link": "#4da6ff",
-    "md_blockquote": "#6a9955",
-    "md_list": "#dcdcaa",
-    
+
     # Diff colors
     "diff_added_background": "#1a3d1a",
     "diff_added_text": "#4caf50",
